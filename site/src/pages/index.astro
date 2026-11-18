@@ -1,0 +1,28 @@
+---
+import Footer from '../components/Footer.astro';
+import Header from '../components/Header.astro';
+import Hero from '../components/Hero.astro';
+import Highlights from '../components/Highlights.astro';
+import Install from '../components/Install.astro';
+import Privacy from '../components/Privacy.astro';
+import Showcase from '../components/Showcase.astro';
+import Uninstall from '../components/Uninstall.astro';
+import UpdateAnatomy from '../components/UpdateAnatomy.astro';
+import Layout from '../layouts/Layout.astro';
+---
+
+<Layout>
+  <Header />
+  <main>
+    <div class="wrap">
+      <Hero />
+      <Showcase />
+      <UpdateAnatomy />
+      <Highlights />
+      <Install />
+      <Privacy />
+      <Uninstall />
+      <Footer />
+    </div>
+  </main>
+</Layout>

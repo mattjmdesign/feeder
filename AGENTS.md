@@ -3,7 +3,8 @@
 Feeder is a macOS app (Rune UI) with a CLI and MCP server. The workspace has three crates:
 `feeder-core` (store, notebook, agent setup), `feeder-cli` (the `feeder` binary and `feeder mcp`),
 and `feeder-app` (the window, plus `updater.m` for Sparkle and `notify.m` for notifications).
-`crates/feeder-menubar` is one Swift file. `docs/` is the website (GitHub Pages).
+`crates/feeder-menubar` is one Swift file. `site/` is the Astro website (deployed to GitHub Pages
+via `.github/workflows/pages.yml`; check changes with `pnpm --dir site build`).
 
 This repo is public. Never commit personal data: no real project names, paths, emails, tokens or
 screenshots of real work. Site and README images come from `scripts/site/demo-data.sh`.

@@ -1,0 +1,235 @@
+<section>
+  <h2>What it includes</h2>
+  <p class="section-intro">
+    One desktop window, a menu bar status item, a CLI, and a local stdio MCP server.
+  </p>
+
+  <div class="bento">
+    <article class="bento-card">
+      <div class="bento-visual" aria-hidden="true">
+        <div class="orb-row-mini">
+          <div class="orb-item-mini is-working">
+            <span class="mini-orb orb-teal"></span>
+            <span>Orbit</span>
+            <small>Working</small>
+          </div>
+          <div class="orb-item-mini">
+            <span class="mini-orb orb-violet"></span>
+            <span>Lumen</span>
+            <span class="mini-pill">Needs you</span>
+          </div>
+          <div class="orb-item-mini">
+            <span class="mini-orb orb-amber"></span>
+            <span>Atlas</span>
+            <small>12m ago</small>
+          </div>
+        </div>
+      </div>
+      <div>
+        <h3>Project status</h3>
+        <p>
+          Active runs show a green ring around the project's orb. Posts starting with
+          <code>Decision needed:</code> or <code>Blocked:</code> show a Needs you tag until you
+          reply.
+        </p>
+      </div>
+    </article>
+
+    <article class="bento-card">
+      <div class="bento-visual" aria-hidden="true">
+        <div class="nb-mini-head"><span class="nb-mini-dot"></span>Pitfall · Rust</div>
+        <div class="nb-mini-title">SQLite returns SQLITE_BUSY under parallel writes</div>
+        <div class="nb-mini-takeaway">
+          Open every connection in WAL mode and set a busy timeout before the first write.
+        </div>
+      </div>
+      <div>
+        <h3>Shared notebook</h3>
+        <p>
+          Agents can save fixes, pitfalls, patterns, and decisions in one SQLite-backed notebook
+          and search it before debugging in another repo.
+        </p>
+      </div>
+    </article>
+
+    <article class="bento-card">
+      <div class="bento-visual" aria-hidden="true">
+        <div class="connect-list">
+          <div class="connect-row">
+            <span>Claude Code</span><span class="connect-state">Connected</span>
+          </div>
+          <div class="connect-row">
+            <span>Codex</span><span class="connect-state">Connected</span>
+          </div>
+          <div class="connect-row">
+            <span>Cursor</span><span class="connect-state idle">Connect</span>
+          </div>
+        </div>
+      </div>
+      <div>
+        <h3>Plug-and-play setup</h3>
+        <p>
+          Click Connect in Settings → Agents. Feeder adds its local MCP server and skills to each
+          tool's config and saves a <code>.feeder-backup</code> copy first.
+        </p>
+      </div>
+    </article>
+  </div>
+</section>
+
+<style>
+  .bento {
+    display: grid;
+    grid-template-columns: repeat(3, minmax(0, 1fr));
+    gap: 18px;
+  }
+  .bento-card {
+    background: var(--surface);
+    border: 1px solid var(--line);
+    border-radius: 18px;
+    padding: 22px;
+    box-shadow: var(--card-shadow);
+    display: flex;
+    flex-direction: column;
+    gap: 18px;
+  }
+  .bento-visual {
+    border-radius: 12px;
+    background: var(--bg);
+    border: 1px solid var(--line);
+    padding: 16px;
+    height: 158px;
+    display: flex;
+    flex-direction: column;
+    justify-content: center;
+  }
+  .bento-card h3 {
+    font-size: 17px;
+    font-weight: 620;
+    letter-spacing: -0.015em;
+    margin: 0 0 6px;
+  }
+  .bento-card p {
+    margin: 0;
+    font-size: 14.5px;
+    line-height: 1.5;
+    color: var(--text-2);
+  }
+  .orb-row-mini {
+    display: flex;
+    align-items: center;
+    justify-content: space-around;
+    gap: 10px;
+  }
+  .orb-item-mini {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    gap: 7px;
+    text-align: center;
+  }
+  .orb-item-mini .mini-orb {
+    width: 40px;
+    height: 40px;
+  }
+  .orb-item-mini .mini-orb::after {
+    top: 6px;
+    left: 8px;
+    width: 12px;
+    height: 7px;
+  }
+  .orb-item-mini.is-working .mini-orb {
+    box-shadow:
+      0 0 0 5px var(--green-soft),
+      inset -3px -4px 8px rgba(0, 0, 0, 0.25);
+  }
+  .orb-item-mini span {
+    font-size: 11.5px;
+    font-weight: 550;
+    color: var(--text);
+  }
+  .orb-item-mini small {
+    font-size: 10.5px;
+    color: var(--text-3);
+  }
+  .orb-item-mini .mini-pill {
+    font-size: 10px;
+    font-weight: 600;
+    padding: 2px 6px;
+    border-radius: 5px;
+    background: var(--amber-soft);
+    color: var(--amber);
+  }
+  .nb-mini-head {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    font-size: 11.5px;
+    font-weight: 600;
+    color: var(--red);
+    margin-bottom: 6px;
+  }
+  .nb-mini-dot {
+    width: 6px;
+    height: 6px;
+    border-radius: 50%;
+    background: currentColor;
+  }
+  .nb-mini-title {
+    font-size: 13.5px;
+    font-weight: 600;
+    letter-spacing: -0.01em;
+    margin-bottom: 10px;
+    color: var(--text);
+  }
+  .nb-mini-takeaway {
+    border-left: 2.5px solid var(--green);
+    background: var(--surface);
+    padding: 8px 10px;
+    border-radius: 0 8px 8px 0;
+    font-size: 12px;
+    line-height: 1.4;
+    color: var(--text-2);
+  }
+  .connect-list {
+    display: grid;
+    gap: 8px;
+  }
+  .connect-row {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    background: var(--surface);
+    border: 1px solid var(--line);
+    border-radius: 9px;
+    padding: 7px 11px;
+    font-size: 12.5px;
+    font-weight: 500;
+  }
+  .connect-state {
+    font-size: 11.5px;
+    font-weight: 550;
+    color: var(--green);
+  }
+  .connect-state.idle {
+    color: var(--text-2);
+    padding: 2px 8px;
+    border-radius: 6px;
+    border: 1px solid var(--line-strong);
+  }
+
+  @media (max-width: 900px) {
+    .bento {
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+    }
+    .bento-visual {
+      height: auto;
+      min-height: 144px;
+    }
+  }
+  @media (max-width: 640px) {
+    .bento {
+      grid-template-columns: minmax(0, 1fr);
+    }
+  }
+</style>

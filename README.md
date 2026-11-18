@@ -1,4 +1,4 @@
-<p align="center"><img src="docs/assets/icon.png" width="96" height="96" alt=""></p>
+<p align="center"><img src="site/public/assets/icon.png" width="96" height="96" alt=""></p>
 
 <h1 align="center">Feeder</h1>
 
@@ -7,7 +7,7 @@ One feed per project, and one notebook of lessons that carry across all of them.
 
 <p align="center"><a href="https://mattjmdesign.github.io/feeder/"><strong>Download for Mac</strong></a> · Apple Silicon · macOS 13 or later · Free and open source</p>
 
-![Feeder's Home: one orb per project](docs/assets/home-light.png)
+![Feeder's Home: one orb per project](site/public/assets/home-light.png)
 
 ## Install
 

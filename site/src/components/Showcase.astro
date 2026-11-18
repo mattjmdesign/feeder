@@ -1,0 +1,222 @@
+---
+import { asset } from '../lib/site';
+
+interface ViewTab {
+  id: 'home' | 'feed' | 'notebook';
+  label: string;
+  caption: string;
+  lightSrc: string;
+  darkSrc: string;
+  alt: string;
+  eager?: boolean;
+}
+
+const views: ViewTab[] = [
+  {
+    id: 'home',
+    label: 'Home',
+    caption: 'One orb per project. Green rings show active runs; amber tags mean an agent is waiting on a reply.',
+    lightSrc: asset('assets/home-light.png'),
+    darkSrc: asset('assets/home-dark.png'),
+    alt: 'Feeder Home view showing one glass orb per project, an active working halo, and a project tagged Needs you.',
+    eager: true,
+  },
+  {
+    id: 'feed',
+    label: 'Feed',
+    caption: 'Chronological updates across all repos, with branches, replies, and full-text search.',
+    lightSrc: asset('assets/feed-light.png'),
+    darkSrc: asset('assets/feed-dark.png'),
+    alt: 'Feeder Feed view showing three-part updates from multiple projects.',
+  },
+  {
+    id: 'notebook',
+    label: 'Notebook',
+    caption: 'Short notes on fixes, pitfalls, and decisions that agents can search from any repo.',
+    lightSrc: asset('assets/notebook-page-light.png'),
+    darkSrc: asset('assets/notebook-page-dark.png'),
+    alt: 'Feeder Notebook page showing topic, kind, tags, what happened, why, and the takeaway.',
+  },
+];
+---
+
+<div class="stage" id="overview">
+  <div class="stage-bar">
+    <div class="segmented" role="tablist" aria-label="Feeder views">
+      {
+        views.map((view, idx) => (
+          <button
+            type="button"
+            role="tab"
+            id={`tab-${view.id}`}
+            aria-selected={idx === 0 ? 'true' : 'false'}
+            aria-controls={`panel-${view.id}`}
+            tabindex={idx === 0 ? 0 : -1}
+            data-view={view.id}
+            data-caption={view.caption}
+          >
+            {view.label}
+          </button>
+        ))
+      }
+    </div>
+    <p class="stage-caption" id="stage-caption">{views[0].caption}</p>
+  </div>
+
+  <div class="stage-frame">
+    {
+      views.map((view, idx) => (
+        <figure
+          class:list={['stage-panel', { 'is-active': idx === 0 }]}
+          id={`panel-${view.id}`}
+          role="tabpanel"
+          aria-labelledby={`tab-${view.id}`}
+        >
+          <img
+            class="shot-light"
+            src={view.lightSrc}
+            width="1800"
+            height="1129"
+            alt={`${view.alt} (Light mode)`}
+            loading={view.eager ? 'eager' : 'lazy'}
+          />
+          <img
+            class="shot-dark"
+            src={view.darkSrc}
+            width="1800"
+            height="1129"
+            alt={`${view.alt} (Dark mode)`}
+            loading={view.eager ? 'eager' : 'lazy'}
+          />
+        </figure>
+      ))
+    }
+  </div>
+</div>
+
+<style>
+  .stage {
+    padding: 18px 0 0;
+    scroll-margin-top: 72px;
+  }
+  .stage-bar {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    justify-content: space-between;
+    gap: 12px;
+    max-width: 1012px;
+    margin: 0 auto 14px;
+  }
+  .segmented {
+    display: inline-flex;
+    align-items: center;
+    padding: 3px;
+    border-radius: 11px;
+    background: var(--surface-subtle);
+    border: 1px solid var(--line);
+    gap: 2px;
+  }
+  .segmented button {
+    appearance: none;
+    border: 0;
+    background: transparent;
+    color: var(--text-2);
+    font: inherit;
+    font-size: 13.5px;
+    font-weight: 500;
+    padding: 6px 15px;
+    border-radius: 8px;
+    cursor: pointer;
+    transition: background 150ms ease, color 150ms ease, box-shadow 150ms ease;
+  }
+  .segmented button:hover {
+    color: var(--text);
+  }
+  .segmented button[aria-selected='true'] {
+    background: var(--surface);
+    color: var(--text);
+    box-shadow: 0 1px 3px rgba(0, 0, 0, 0.1), 0 0 0 1px var(--line);
+  }
+  .stage-caption {
+    margin: 0;
+    font-size: 14px;
+    color: var(--text-2);
+    text-align: right;
+    flex: 1 1 280px;
+  }
+  .stage-frame {
+    position: relative;
+    max-width: 1012px;
+    margin: 0 auto;
+    border-radius: 16px;
+    overflow: hidden;
+    background: var(--surface);
+    border: 1px solid var(--line-strong);
+    box-shadow: var(--window-shadow);
+    aspect-ratio: 1800 / 1129;
+  }
+  .stage-panel {
+    position: absolute;
+    inset: 0;
+    margin: 0;
+    opacity: 0;
+    pointer-events: none;
+    transform: scale(0.994);
+    transition: opacity 200ms ease, transform 220ms ease;
+  }
+  .stage-panel.is-active {
+    opacity: 1;
+    pointer-events: auto;
+    transform: scale(1);
+  }
+  .stage-panel img {
+    display: block;
+    width: 100%;
+    height: 100%;
+    object-fit: cover;
+  }
+
+  @media (max-width: 900px) {
+    .stage-caption {
+      text-align: left;
+    }
+  }
+  @media (max-width: 640px) {
+    .stage-frame {
+      border-radius: 12px;
+    }
+  }
+</style>
+
+<script>
+  const tabs = Array.from(document.querySelectorAll<HTMLButtonElement>('[role="tab"][data-view]'));
+  const captionEl = document.getElementById('stage-caption');
+
+  function activate(view: string) {
+    tabs.forEach((tab) => {
+      const active = tab.dataset.view === view;
+      tab.setAttribute('aria-selected', active ? 'true' : 'false');
+      tab.tabIndex = active ? 0 : -1;
+      const panel = document.getElementById(`panel-${tab.dataset.view}`);
+      panel?.classList.toggle('is-active', active);
+      if (active && captionEl && tab.dataset.caption) {
+        captionEl.textContent = tab.dataset.caption;
+      }
+    });
+  }
+
+  tabs.forEach((tab, idx) => {
+    tab.addEventListener('click', () => {
+      if (tab.dataset.view) activate(tab.dataset.view);
+    });
+    tab.addEventListener('keydown', (event) => {
+      if (event.key === 'ArrowRight' || event.key === 'ArrowLeft') {
+        event.preventDefault();
+        const next = (idx + (event.key === 'ArrowRight' ? 1 : -1) + tabs.length) % tabs.length;
+        tabs[next].focus();
+        if (tabs[next].dataset.view) activate(tabs[next].dataset.view);
+      }
+    });
+  });
+</script>

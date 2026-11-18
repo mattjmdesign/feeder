@@ -10,6 +10,11 @@
 *.icns
 /dist/
 
+# Website (Astro)
+/site/node_modules/
+/site/dist/
+/site/.astro/
+
 # Local Feeder data, if FEEDER_HOME is ever pointed inside the repo
 feeder.db
 feeder.db-*

@@ -1,0 +1,33 @@
+---
+import { SITE_URL, asset } from '../lib/site';
+import '../styles/global.css';
+
+interface Props {
+  title?: string;
+  description?: string;
+}
+
+const {
+  title = 'Feeder — Local update feed for coding agents',
+  description = 'A local macOS app built with Rust and Rune from Anomaly. Coding agents post short updates and shared notebook notes to a SQLite database on your Mac. No accounts, no data collected.',
+} = Astro.props;
+---
+
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>{title}</title>
+    <meta name="description" content={description} />
+    <meta name="color-scheme" content="light dark" />
+    <link rel="icon" type="image/png" href={asset('assets/favicon.png')} />
+    <link rel="canonical" href={SITE_URL} />
+    <meta property="og:title" content="Feeder" />
+    <meta property="og:description" content={description} />
+    <meta property="og:image" content={`${SITE_URL}assets/home-light.png`} />
+  </head>
+  <body>
+    <slot />
+  </body>
+</html>
