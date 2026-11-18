@@ -1,0 +1,34 @@
+# Rust build output
+/target/
+**/*.rs.bk
+*.profraw
+*.profdata
+
+# Packaging scratch (scripts/mac-app.sh stages bundles in temp dirs; never commit built apps)
+*.app/
+*.iconset/
+*.icns
+/dist/
+
+# Local Feeder data, if FEEDER_HOME is ever pointed inside the repo
+feeder.db
+feeder.db-*
+/media/
+settings.json
+*.feeder-backup
+*.feeder-tmp
+
+# Headless snapshots and recordings made while developing
+/snaps/
+*.snap.png
+
+# Editors and OS
+.DS_Store
+.idea/
+.vscode/
+*.swp
+*~
+
+# Secrets
+.env
+.env.*

@@ -1,0 +1,21 @@
+//! The Dock icon, drawn by the app itself: one orb on a dark squircle, at macOS icon proportions
+//! (an 824 pt tile centred in 1024). `scripts/mac-app.sh` renders it with
+//! `--scene app-icon --size 1024x1024 --scale 1` and turns the PNG into an `.icns`.
+
+use feeder_core::{Orb, Pattern};
+use rune::{El, el};
+
+use crate::{orb, style};
+
+const ICON_ORB: Orb = Orb { seed: 0x5EED_F00D, hues: [292.0, 205.0, 350.0], chroma: 0.19, angle: 2.2, pattern: Pattern::Nebula };
+
+pub fn view() -> El {
+    let p = style::palette(true);
+    let tile = 824.0;
+    let sphere = 560.0;
+    el().key("icon")
+        .w_full()
+        .h_full()
+        .center()
+        .child(el().size(tile, tile).radius(tile * 0.225).fill(p.bg).border(2.0, p.hairline).center().child(orb::orb(&ICON_ORB, sphere)))
+}

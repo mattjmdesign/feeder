@@ -1,0 +1,19 @@
+[package]
+name = "feeder-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "feeder"
+path = "src/main.rs"
+
+[dependencies]
+feeder-core.workspace = true
+clap.workspace = true
+serde.workspace = true
+serde_json = { workspace = true, features = ["preserve_order"] }
+dirs.workspace = true
+
+[lints]
+workspace = true
