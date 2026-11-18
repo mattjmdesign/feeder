@@ -30,6 +30,13 @@ if gh release view "$TAG" --repo "$RELEASES_REPO" >/dev/null 2>&1; then
   echo "$TAG is already released. Bump the version in Cargo.toml first." >&2
   exit 1
 fi
+# notarytool keeps its credential in the data-protection keychain, which macOS seals while the
+# screen is locked. Check before a three-minute build rather than after it.
+if ! xcrun notarytool history --keychain-profile feeder >/dev/null 2>&1; then
+  echo "Can't read the 'feeder' notarization credential. Unlock this Mac (or run" >&2
+  echo "'xcrun notarytool store-credentials feeder') and try again." >&2
+  exit 1
+fi
 IDENTITY="$(security find-identity -v -p codesigning | sed -n 's/.*"\(Developer ID Application: .*\)"$/\1/p' | head -1)"
 if [[ -z "$IDENTITY" ]]; then
   echo "No Developer ID Application certificate in the keychain." >&2
