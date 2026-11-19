@@ -275,4 +275,314 @@
     gap: 13px;
     padding: 8px 0 5px;
   }
+
+  /* ── Multi-image carousel inside the lead update card ── */
+  .fd-carousel {
+    display: grid;
+    gap: 8px;
+  }
+
+  .fd-carousel__frame {
+    position: relative;
+    height: 214px;
+    overflow: hidden;
+    border: 1px solid rgb(0 0 0 / 0.08);
+    border-radius: 10px;
+    background: linear-gradient(155deg, #f3f4f8 0%, #e9ecf3 100%);
+  }
+
+  .ss-stage[data-theme='dark'] .fd-carousel__frame {
+    border-color: rgb(255 255 255 / 0.09);
+    background: linear-gradient(155deg, #13141a 0%, #0d0e13 100%);
+  }
+
+  .ss-stage[data-layout='compact'] .fd-carousel__frame {
+    height: 152px;
+  }
+
+  .fd-carousel__track {
+    display: flex;
+    width: 100%;
+    height: 100%;
+    transition: transform 0.55s cubic-bezier(0.22, 1, 0.36, 1);
+  }
+
+  .fd-slide {
+    flex: none;
+    width: 100%;
+    height: 100%;
+    display: grid;
+    grid-template-rows: auto 1fr;
+    padding: 14px 48px;
+    box-sizing: border-box;
+  }
+
+  .ss-stage[data-layout='compact'] .fd-slide {
+    padding: 10px 38px;
+  }
+
+  .fd-shot-bar {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    padding-bottom: 10px;
+    border-bottom: 1px solid rgb(0 0 0 / 0.06);
+  }
+
+  .ss-stage[data-theme='dark'] .fd-shot-bar {
+    border-bottom-color: rgb(255 255 255 / 0.07);
+  }
+
+  .fd-shot-dots {
+    display: inline-flex;
+    gap: 4px;
+  }
+
+  .fd-shot-dots i {
+    display: block;
+    width: 6px;
+    height: 6px;
+    border-radius: 50%;
+    background: rgb(0 0 0 / 0.16);
+  }
+
+  .ss-stage[data-theme='dark'] .fd-shot-dots i {
+    background: rgb(255 255 255 / 0.18);
+  }
+
+  .fd-shot-title {
+    color: var(--ss-text);
+    font-size: 11px;
+    font-weight: 500;
+  }
+
+  .fd-shot-welcome {
+    display: grid;
+    place-items: center;
+    align-content: center;
+    gap: 6px;
+    text-align: center;
+  }
+
+  .fd-shot-orb {
+    box-shadow: 0 8px 20px rgb(0 0 0 / 0.16);
+  }
+
+  .fd-shot-h {
+    color: var(--ss-text-strong);
+    font-size: 15px;
+    font-weight: 600;
+    letter-spacing: -0.015em;
+  }
+
+  .fd-shot-p {
+    color: var(--ss-text);
+    font-size: 12px;
+  }
+
+  .fd-shot-cta {
+    margin-top: 4px;
+    padding: 5px 14px;
+    border-radius: 999px;
+    background: #141418;
+    color: #ffffff;
+    font-size: 11.5px;
+    font-weight: 500;
+  }
+
+  .ss-stage[data-theme='dark'] .fd-shot-cta {
+    background: #f5f5f7;
+    color: #111114;
+  }
+
+  .fd-shot-list {
+    display: grid;
+    align-content: center;
+    gap: 7px;
+  }
+
+  .fd-shot-row {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    padding: 7px 11px;
+    border: 1px solid rgb(0 0 0 / 0.07);
+    border-radius: 8px;
+    background: rgb(255 255 255 / 0.82);
+  }
+
+  .ss-stage[data-theme='dark'] .fd-shot-row {
+    border-color: rgb(255 255 255 / 0.08);
+    background: rgb(255 255 255 / 0.04);
+  }
+
+  .fd-shot-tool {
+    display: inline-flex;
+    align-items: center;
+    gap: 7px;
+    color: var(--ss-text-strong);
+    font-size: 12px;
+    font-weight: 500;
+  }
+
+  .fd-shot-pill {
+    padding: 2px 8px;
+    border-radius: 999px;
+    border: 1px solid rgb(0 0 0 / 0.1);
+    color: var(--ss-text);
+    font-size: 10.5px;
+    font-weight: 500;
+  }
+
+  .ss-stage[data-theme='dark'] .fd-shot-pill {
+    border-color: rgb(255 255 255 / 0.12);
+  }
+
+  .fd-shot-pill--on {
+    border-color: rgb(22 163 74 / 0.28);
+    background: rgb(22 163 74 / 0.12);
+    color: #15803d;
+  }
+
+  .ss-stage[data-theme='dark'] .fd-shot-pill--on {
+    border-color: rgb(74 222 128 / 0.28);
+    background: rgb(74 222 128 / 0.12);
+    color: #86efac;
+  }
+
+  .fd-shot-ready {
+    display: grid;
+    align-content: center;
+    gap: 10px;
+  }
+
+  .fd-shot-kpis {
+    display: grid;
+    grid-template-columns: repeat(3, 1fr);
+    gap: 8px;
+  }
+
+  .fd-shot-kpi {
+    display: grid;
+    gap: 2px;
+    padding: 10px;
+    border: 1px solid rgb(0 0 0 / 0.07);
+    border-radius: 8px;
+    background: rgb(255 255 255 / 0.82);
+  }
+
+  .ss-stage[data-theme='dark'] .fd-shot-kpi {
+    border-color: rgb(255 255 255 / 0.08);
+    background: rgb(255 255 255 / 0.04);
+  }
+
+  .fd-shot-kpi__n {
+    color: var(--ss-text-strong);
+    font-size: 15px;
+    font-weight: 600;
+    font-variant-numeric: tabular-nums;
+  }
+
+  .fd-shot-kpi__l {
+    color: var(--ss-text);
+    font-size: 10.5px;
+  }
+
+  .fd-shot-banner {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    padding: 8px 11px;
+    border-radius: 8px;
+    border: 1px solid rgb(22 163 74 / 0.24);
+    background: rgb(22 163 74 / 0.09);
+    color: #15803d;
+    font-size: 11.5px;
+    font-weight: 500;
+  }
+
+  .ss-stage[data-theme='dark'] .fd-shot-banner {
+    border-color: rgb(74 222 128 / 0.24);
+    background: rgb(74 222 128 / 0.1);
+    color: #86efac;
+  }
+
+  .fd-shot-banner__dot {
+    width: 6px;
+    height: 6px;
+    border-radius: 50%;
+    background: currentColor;
+  }
+
+  .fd-carousel__count {
+    position: absolute;
+    top: 10px;
+    right: 10px;
+    padding: 2px 8px;
+    border-radius: 999px;
+    border: 1px solid rgb(255 255 255 / 0.18);
+    background: rgb(16 16 20 / 0.74);
+    color: #f5f5f7;
+    font-size: 11px;
+    font-weight: 500;
+    font-variant-numeric: tabular-nums;
+    backdrop-filter: blur(8px);
+  }
+
+  .fd-carousel__arrow {
+    position: absolute;
+    top: 50%;
+    transform: translateY(-50%);
+    width: 28px;
+    height: 28px;
+    display: grid;
+    place-items: center;
+    border-radius: 50%;
+    border: 1px solid rgb(255 255 255 / 0.2);
+    background: rgb(16 16 20 / 0.72);
+    color: #ffffff;
+    font-size: 15px;
+    line-height: 1;
+    transition: background 0.18s ease, transform 0.18s ease;
+  }
+
+  .fd-carousel__arrow--prev {
+    left: 10px;
+  }
+
+  .fd-carousel__arrow--next {
+    right: 10px;
+  }
+
+  .fd-carousel__arrow[data-hover] {
+    background: rgb(16 16 20 / 0.92);
+  }
+
+  .fd-carousel__arrow[data-pressed] {
+    transform: translateY(-50%) scale(0.92);
+  }
+
+  .fd-carousel__dots {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    gap: 5px;
+  }
+
+  .fd-carousel__dot {
+    width: 5px;
+    height: 5px;
+    border-radius: 999px;
+    background: rgb(0 0 0 / 0.2);
+    transition: width 0.28s cubic-bezier(0.22, 1, 0.36, 1), background 0.22s ease;
+  }
+
+  .ss-stage[data-theme='dark'] .fd-carousel__dot {
+    background: rgb(255 255 255 / 0.24);
+  }
+
+  .fd-carousel__dot[data-on] {
+    width: 16px;
+    background: var(--ss-text-strong);
+  }
 }

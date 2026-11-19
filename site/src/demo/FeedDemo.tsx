@@ -10,31 +10,112 @@ import { ToolLogo } from './ToolLogo'
 import { useSiteTheme } from './theme'
 import './feed-demo.css'
 
-// Feeder's Feed while an agent works. Beats: a Working pulse opens at the top
-// of the feed with a spinner; the agent posts, so the pulse closes as its
-// update drops in and pushes the older card down; the update's last block is
-// a decision, so its Needs you tag is part of the card from the start. The
-// result holds, then the new card closes the way it opened and the loop
-// starts again from the same feed.
+// Feeder's Feed with multi-image carousels. Beats:
+// 1. A Working pulse opens at the top of the feed with a spinner.
+// 2. The agent posts an update carrying 3 screenshots as an interactive carousel.
+// 3. The cursor glides to the next arrow and steps through slides 1/3 -> 2/3 -> 3/3
+//    while the counter pill and indicator dots update in sync.
+// 4. Holds on slide 3, then resets cleanly for the next loop.
 
-type S = { working: boolean; posted: boolean }
+type S = { working: boolean; posted: boolean; slide: number }
 
-const initial: S = { working: false, posted: false }
+const initial: S = { working: false, posted: false, slide: 0 }
 
 async function script(a: Act<S>) {
-  await a.wait(800)
+  await a.wait(650)
   a.mark('working')
-  a.put({ working: true })
-  await a.wait(2200)
+  a.put({ working: true, slide: 0 })
+  await a.wait(1600)
   a.mark('posted')
-  a.put({ working: false, posted: true })
-  await a.wait(4200)
-  a.put({ posted: false })
-  await a.wait(900)
+  await a.set({ working: false, posted: true, slide: 0 })
+  await a.wait(950)
+  await a.click('car-next')
+  a.mark('slide-2')
+  await a.set({ slide: 1 })
+  await a.wait(1350)
+  await a.click('car-next')
+  a.mark('slide-3')
+  await a.set({ slide: 2 })
+  await a.wait(2200)
+  await a.set({ posted: false, slide: 0 })
+  await a.wait(700)
 }
 
 function OrbDot({ orb, size = 22 }: { orb: Orb; size?: number }) {
   return <span className="fd-orb" style={{ width: size, height: size, background: orbBackground(orb) }} />
+}
+
+function SlideWelcome() {
+  return (
+    <div className="fd-slide fd-slide--welcome">
+      <div className="fd-shot-bar">
+        <span className="fd-shot-dots"><i /><i /><i /></span>
+        <span className="fd-shot-title">Orbit · Step 1 of 3</span>
+      </div>
+      <div className="fd-shot-welcome">
+        <span className="fd-orb fd-shot-orb" style={{ width: 42, height: 42, background: orbBackground(ORBS.orbit!) }} />
+        <div className="fd-shot-h">Welcome to Orbit</div>
+        <div className="fd-shot-p">Three quick steps to sync your workspace.</div>
+        <span className="fd-shot-cta">Continue</span>
+      </div>
+    </div>
+  )
+}
+
+function SlideConnect() {
+  return (
+    <div className="fd-slide fd-slide--connect">
+      <div className="fd-shot-bar">
+        <span className="fd-shot-dots"><i /><i /><i /></span>
+        <span className="fd-shot-title">Orbit · Connect tools</span>
+      </div>
+      <div className="fd-shot-list">
+        <div className="fd-shot-row">
+          <span className="fd-shot-tool"><ToolLogo tool="claude" size={13} />Claude Code</span>
+          <span className="fd-shot-pill fd-shot-pill--on">Connected</span>
+        </div>
+        <div className="fd-shot-row">
+          <span className="fd-shot-tool"><ToolLogo tool="codex" size={13} />Codex</span>
+          <span className="fd-shot-pill fd-shot-pill--on">Connected</span>
+        </div>
+        <div className="fd-shot-row">
+          <span className="fd-shot-tool"><ToolLogo tool="cursor" size={13} />Cursor</span>
+          <span className="fd-shot-pill">Connect</span>
+        </div>
+      </div>
+    </div>
+  )
+}
+
+function SlideReady() {
+  return (
+    <div className="fd-slide fd-slide--ready">
+      <div className="fd-shot-bar">
+        <span className="fd-shot-dots"><i /><i /><i /></span>
+        <span className="fd-shot-title">Orbit · Ready</span>
+      </div>
+      <div className="fd-shot-ready">
+        <div className="fd-shot-kpis">
+          <div className="fd-shot-kpi">
+            <span className="fd-shot-kpi__n">3</span>
+            <span className="fd-shot-kpi__l">Steps saved</span>
+          </div>
+          <div className="fd-shot-kpi">
+            <span className="fd-shot-kpi__n">42 ms</span>
+            <span className="fd-shot-kpi__l">Cold launch</span>
+          </div>
+          <div className="fd-shot-kpi">
+            <span className="fd-shot-kpi__n">100%</span>
+            <span className="fd-shot-kpi__l">Local state</span>
+          </div>
+        </div>
+        <div className="fd-shot-banner">
+          <span className="fd-shot-banner__dot" />
+          Progress saved automatically between launches
+        </div>
+      </div>
+    </div>
+  )
 }
 
 export default function FeedDemo() {
@@ -43,13 +124,14 @@ export default function FeedDemo() {
   return (
     <Stage<S>
       width={960}
-      height={540}
-      compact={{ below: 720, width: 358, height: 340 }}
+      height={580}
+      compact={{ below: 720, width: 358, height: 400 }}
       theme={theme}
       greys="cool"
       initial={initial}
-      poster={{ working: false, posted: true }}
+      poster={{ working: false, posted: true, slide: 0 }}
       script={script}
+      cursor={{ at: { wide: { x: 840, y: 470 }, compact: { x: 315, y: 340 } }, style: 'real' }}
       className="fd"
     >
       {(s, _rect, layout) => (
@@ -64,7 +146,7 @@ export default function FeedDemo() {
               </span>
               <span className="fd-chip" data-on>All</span>
               <span className="fd-chip"><Bar w={54} h={6} tone={2} /></span>
-              <span className="fd-chip"><Bar w={40} h={6} tone={2} /></span>
+              <span className="fd-chip">Media</span>
             </div>
             <div className="fd-day">
               <span>Today</span>
@@ -95,16 +177,35 @@ export default function FeedDemo() {
                     <span className="fd-card__when">just now</span>
                   </header>
                   <div className="fd-block">
-                    <div className="fd-label">Shipped</div>
-                    <p>The new onboarding flow: three screens instead of seven, with progress saved between launches.</p>
+                    <p>
+                      <strong>Shipped the three-screen onboarding flow</strong> with progress saved between launches.
+                      Keep the skip button on screen one, or drop it?
+                    </p>
                   </div>
-                  <div className="fd-block" data-why>
-                    <div className="fd-label">Why</div>
-                    <p>Most people who quit did it on screen four of the old flow.</p>
-                  </div>
-                  <div className="fd-block">
-                    <div className="fd-label">Decision needed</div>
-                    <p>Keep the skip button on screen one, or drop it?</p>
+
+                  <div className="fd-carousel">
+                    <div className="fd-carousel__frame">
+                      <div className="fd-carousel__track" style={{ transform: `translateX(-${s.slide * 100}%)` }}>
+                        <SlideWelcome />
+                        <SlideConnect />
+                        <SlideReady />
+                      </div>
+                      <span className="fd-carousel__count">{s.slide + 1} / 3</span>
+                      <span className="fd-carousel__arrow fd-carousel__arrow--prev" aria-hidden="true">‹</span>
+                      <span
+                        className="fd-carousel__arrow fd-carousel__arrow--next"
+                        data-target="car-next"
+                        data-cursor="pointer"
+                        aria-hidden="true"
+                      >
+                        ›
+                      </span>
+                    </div>
+                    <div className="fd-carousel__dots" aria-hidden="true">
+                      {[0, 1, 2].map(i => (
+                        <span key={i} className="fd-carousel__dot" data-on={s.slide === i || undefined} />
+                      ))}
+                    </div>
                   </div>
                 </article>
               </Collapse>
@@ -118,17 +219,7 @@ export default function FeedDemo() {
                   <span className="fd-card__when">2h ago</span>
                 </header>
                 <div className="fd-block">
-                  <div className="fd-label">Fixed</div>
-                  <span className="fd-lines">
-                    <Bar w="92%" h={7} r={3.5} tone={2} />
-                    <Bar w="64%" h={7} r={3.5} tone={2} />
-                  </span>
-                </div>
-                <div className="fd-block">
-                  <Bar w={34} h={6} tone={1} />
-                  <span className="fd-lines">
-                    <Bar w="78%" h={7} r={3.5} tone={2} />
-                  </span>
+                  <p>Rate-limit middleware runs before auth now so bad traffic never touches the session table.</p>
                 </div>
               </article>
             </div>
