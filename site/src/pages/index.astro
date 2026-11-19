@@ -1,28 +1,626 @@
 ---
-import Footer from '../components/Footer.astro';
-import Header from '../components/Header.astro';
-import Hero from '../components/Hero.astro';
-import Highlights from '../components/Highlights.astro';
-import Install from '../components/Install.astro';
-import Privacy from '../components/Privacy.astro';
-import Showcase from '../components/Showcase.astro';
-import Uninstall from '../components/Uninstall.astro';
-import UpdateAnatomy from '../components/UpdateAnatomy.astro';
+import { Check, Copy, Download } from 'lucide-react';
+import FeedDemo from '../demo/FeedDemo';
 import Layout from '../layouts/Layout.astro';
+import { ORBS, orbAccent, orbBackground } from '../lib/orb';
+import { DOWNLOAD_URL, REPO_URL } from '../lib/site';
+
+const hero = ORBS.hero!;
+const ballStyle = `background:${orbBackground(hero)}`;
+const glowStyle = `--glow:${orbAccent(hero, 0.5)};--glow-2:${orbAccent(hero, 0.18)}`;
+const markStyle = `background:${orbBackground(hero)}`;
+const year = new Date().getFullYear();
 ---
 
 <Layout>
-  <Header />
-  <main>
-    <div class="wrap">
-      <Hero />
-      <Showcase />
-      <UpdateAnatomy />
-      <Highlights />
-      <Install />
-      <Privacy />
-      <Uninstall />
-      <Footer />
-    </div>
-  </main>
+  <div class="page">
+    <header class="top">
+      <a class="brand" href="./" aria-label="Feeder home">
+        <span class="brand__orb" style={markStyle}></span>
+        <span>Feeder</span>
+      </a>
+      <a class="top__link" href={REPO_URL}>
+        <svg viewBox="0 0 24 24" width="16" height="16" aria-hidden="true"
+          ><path
+            fill="currentColor"
+            d="M12 .297c-6.63 0-12 5.373-12 12 0 5.303 3.438 9.8 8.205 11.385.6.113.82-.258.82-.577 0-.285-.01-1.04-.015-2.04-3.338.724-4.042-1.61-4.042-1.61C4.422 18.07 3.633 17.7 3.633 17.7c-1.087-.744.084-.729.084-.729 1.205.084 1.838 1.236 1.838 1.236 1.07 1.835 2.809 1.305 3.495.998.108-.776.417-1.305.76-1.605-2.665-.3-5.466-1.332-5.466-5.93 0-1.31.465-2.38 1.235-3.22-.135-.303-.54-1.523.105-3.176 0 0 1.005-.322 3.3 1.23.96-.267 1.98-.399 3-.405 1.02.006 2.04.138 3 .405 2.28-1.552 3.285-1.23 3.285-1.23.645 1.653.24 2.873.12 3.176.765.84 1.23 1.91 1.23 3.22 0 4.61-2.805 5.625-5.475 5.92.42.36.81 1.096.81 2.22 0 1.606-.015 2.896-.015 3.286 0 .315.21.69.825.57C20.565 22.092 24 17.592 24 12.297c0-6.627-5.373-12-12-12"
+          ></path></svg
+        >
+        GitHub
+      </a>
+    </header>
+
+    <main>
+      <section class="hero">
+        <button class="orb" type="button" aria-label="Show a new orb" style={glowStyle}>
+          <span class="orb__glow"></span>
+          <span class="orb__shadow"></span>
+          <span class="orb__ball" style={ballStyle}></span>
+        </button>
+        <p class="orb__hint">Every project gets its own orb. Click for another.</p>
+
+        <h1>Where every project left off.</h1>
+        <p class="lede">
+          A Mac app where your coding agents post short updates on what they did, why, and what’s next. Built in Rust on
+          <a href="https://github.com/anomalyco/rune">Rune</a>, so it opens instantly and stays small. Nothing leaves your Mac.
+        </p>
+
+        <div class="cta">
+          <a class="cta__main" href={DOWNLOAD_URL}>
+            <Download size={17} strokeWidth={2.2} aria-hidden="true" />
+            Download for Mac
+          </a>
+          <a class="cta__alt" href={REPO_URL}>Source on GitHub</a>
+        </div>
+        <p class="meta">Free and open source · Apple silicon · macOS 13 or later</p>
+      </section>
+
+      <section class="demo" aria-label="Feeder’s feed as an update arrives">
+        <div class="demo__slot"><FeedDemo client:only="react" /></div>
+        <p class="demo__caption">An agent shows as Working while it runs, then posts its update. This one ends with a decision, so the project is marked Needs you.</p>
+      </section>
+
+      <section class="section">
+        <h2 class="section__title">What it’s for</h2>
+        <div class="uses">
+          <div>
+            <h3>Coming back to a project</h3>
+            <p>Read the last update and you know what changed, why, and what to do next. No digging through commits or old chats.</p>
+          </div>
+          <div>
+            <h3>Running several agents</h3>
+            <p>Home shows every project at once: which agent touched it last, which one is working now, and which ones are waiting on you.</p>
+          </div>
+          <div>
+            <h3>Handing work to the next agent</h3>
+            <p>Agents read the feed before they start, so a new session picks up the plan instead of redoing or undoing the last one.</p>
+          </div>
+          <div>
+            <h3>Not solving the same bug twice</h3>
+            <p>When an agent fixes something tricky, it writes the fix to a shared notebook. Agents in your other projects search it before they start debugging.</p>
+          </div>
+        </div>
+      </section>
+
+      <section class="section">
+        <h2 class="section__title">Set it up</h2>
+        <ol class="steps">
+          <li>
+            <h3>Install</h3>
+            <p>Open <code>Feeder.dmg</code> and drag Feeder into Applications.</p>
+          </li>
+          <li>
+            <h3>Connect your tools</h3>
+            <p>In <strong>Settings → Agents</strong>, press Connect next to each tool, then restart it. Feeder adds its MCP server to that tool’s config and keeps a backup of the file.</p>
+          </li>
+          <li>
+            <h3>Ask for an update</h3>
+            <p>In any project, tell your agent:</p>
+            <div class="copy">
+              <code>post a Feeder update</code>
+              <button class="btn" type="button" data-copy="post a Feeder update" aria-label="Copy the prompt">
+                <Copy className="i-copy" size={15} strokeWidth={2} aria-hidden="true" />
+                <Check className="i-done" size={15} strokeWidth={2.2} aria-hidden="true" />
+              </button>
+            </div>
+          </li>
+        </ol>
+      </section>
+
+      <section class="section">
+        <h2 class="section__title">Good to know</h2>
+        <dl class="faq">
+          <div>
+            <dt>Which tools work with it?</dt>
+            <dd>Claude Code, Claude Desktop, Codex, Cursor, Antigravity, T3 Code and OpenCode connect with one click. Any other tool that supports MCP can use the config from <strong>Copy config</strong>.</dd>
+          </div>
+          <div>
+            <dt>Where are my updates saved?</dt>
+            <dd>In one file on your Mac, under <code>~/Library/Application Support/feeder</code>. There’s no account and nothing is collected. The app only goes online to check for new versions.</dd>
+          </div>
+          <div>
+            <dt>Can I post updates myself?</dt>
+            <dd>Yes. Press ⇧⌘N in the app, or run <code>feeder post "…"</code> in Terminal.</dd>
+          </div>
+          <div>
+            <dt>Why is it so quick?</dt>
+            <dd>It’s written in Rust on <a href="https://github.com/anomalyco/rune">Rune</a>, Anomaly’s GPU UI framework, not a web view, so it opens instantly and uses little memory.</dd>
+          </div>
+          <div>
+            <dt>How do I remove it?</dt>
+            <dd>In <strong>Settings → Uninstall</strong>, choose Remove Feeder from all tools, then move the app to the Trash.</dd>
+          </div>
+        </dl>
+      </section>
+    </main>
+
+    <footer class="foot">
+      <span>© {year} Feeder · MIT license</span>
+      <a href={`${REPO_URL}#uninstall`}>Uninstall</a>
+    </footer>
+  </div>
 </Layout>
+
+<script>
+  import { orbAccent, orbBackground, randomOrb } from '../lib/orb';
+
+  const orb = document.querySelector<HTMLButtonElement>('.orb');
+  const ball = orb?.querySelector<HTMLElement>('.orb__ball');
+  let hue = 292;
+  orb?.addEventListener('click', () => {
+    if (!ball) return;
+    const next = randomOrb(hue);
+    hue = next.hues[0];
+    ball.style.background = orbBackground(next);
+    orb.style.setProperty('--glow', orbAccent(next, 0.5));
+    orb.style.setProperty('--glow-2', orbAccent(next, 0.18));
+    orb.classList.remove('is-new');
+    void orb.offsetWidth;
+    orb.classList.add('is-new');
+  });
+
+  for (const btn of document.querySelectorAll<HTMLButtonElement>('[data-copy]')) {
+    btn.addEventListener('click', async () => {
+      try {
+        await navigator.clipboard.writeText(btn.dataset.copy ?? '');
+        btn.dataset.done = '';
+        setTimeout(() => delete btn.dataset.done, 1400);
+      } catch {
+        /* clipboard blocked: nothing to show */
+      }
+    });
+  }
+</script>
+
+<style>
+  .page {
+    display: grid;
+    grid-template-rows: auto 1fr auto;
+    min-height: 100dvh;
+  }
+
+  .top {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    padding: 28px clamp(16px, 4vw, 52px);
+  }
+
+  .brand {
+    display: inline-flex;
+    align-items: center;
+    gap: 10px;
+    font-size: 15px;
+    font-weight: 600;
+    letter-spacing: 0.01em;
+  }
+
+  .brand__orb {
+    width: 20px;
+    height: 20px;
+    border-radius: 50%;
+  }
+
+  .top__link {
+    display: inline-flex;
+    align-items: center;
+    gap: 8px;
+    color: var(--text-2);
+    font-size: 14px;
+    transition: color 0.2s;
+  }
+
+  .top__link:hover {
+    color: var(--text);
+  }
+
+  .hero {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    padding: clamp(24px, 6vh, 64px) 16px 0;
+    text-align: center;
+  }
+
+  /* The orb on its own: a glass sphere lit from the upper left, casting its color on the page */
+  .orb {
+    --size: clamp(160px, 26vw, 232px);
+    position: relative;
+    width: var(--size);
+    height: var(--size);
+    padding: 0;
+    border: 0;
+    border-radius: 50%;
+    background: none;
+    cursor: pointer;
+    animation: float 6s ease-in-out infinite;
+    transition: transform 0.4s var(--ease);
+  }
+
+  .orb__glow {
+    content: '';
+    position: absolute;
+    inset: -45%;
+    border-radius: 50%;
+    background: radial-gradient(closest-side, var(--glow), var(--glow-2) 55%, transparent);
+    filter: blur(24px);
+    opacity: 0.75;
+    transition: background 0.6s;
+  }
+
+  .orb__shadow {
+    content: '';
+    position: absolute;
+    left: 14%;
+    right: 14%;
+    bottom: -16%;
+    height: 10%;
+    border-radius: 50%;
+    background: radial-gradient(closest-side, rgb(0 0 0 / 0.85), transparent);
+    animation: shadow 6s ease-in-out infinite;
+  }
+
+  .orb__ball {
+    position: absolute;
+    inset: 0;
+    border-radius: 50%;
+  }
+
+  .orb:hover {
+    transform: scale(1.03);
+  }
+
+  .orb:active {
+    transform: scale(0.97);
+  }
+
+  .orb.is-new {
+    animation:
+      pop 0.5s var(--ease),
+      float 6s ease-in-out 0.5s infinite;
+  }
+
+  .orb__hint {
+    margin: 40px 0 0;
+    color: var(--text-3);
+    font-size: 13px;
+  }
+
+  @keyframes float {
+    0%,
+    100% {
+      translate: 0 0;
+    }
+    50% {
+      translate: 0 -8px;
+    }
+  }
+
+  @keyframes shadow {
+    0%,
+    100% {
+      scale: 1;
+      opacity: 1;
+    }
+    50% {
+      scale: 0.9;
+      opacity: 0.7;
+    }
+  }
+
+  @keyframes pop {
+    0% {
+      scale: 0.86;
+    }
+    60% {
+      scale: 1.04;
+    }
+    100% {
+      scale: 1;
+    }
+  }
+
+  h1 {
+    margin: clamp(28px, 5vh, 48px) 0 0;
+    font-size: clamp(40px, 7.4vw, 84px);
+    font-weight: 600;
+    letter-spacing: -0.045em;
+    line-height: 1;
+    text-wrap: balance;
+  }
+
+  .lede {
+    max-width: 34em;
+    margin: 24px 0 0;
+    color: var(--text-2);
+    font-size: clamp(16px, 1.6vw, 18px);
+    line-height: 1.6;
+    text-wrap: pretty;
+  }
+
+  .lede a {
+    color: var(--text);
+    text-decoration: underline;
+    text-decoration-color: rgb(255 255 255 / 0.3);
+    text-underline-offset: 3px;
+  }
+
+  .cta {
+    display: flex;
+    flex-wrap: wrap;
+    justify-content: center;
+    gap: 12px;
+    margin-top: 36px;
+  }
+
+  .cta__main,
+  .cta__alt {
+    display: inline-flex;
+    align-items: center;
+    gap: 9px;
+    height: 46px;
+    padding: 0 22px;
+    border-radius: 999px;
+    font-size: 15px;
+    font-weight: 600;
+    transition:
+      background 0.2s,
+      transform 0.15s var(--ease);
+  }
+
+  .cta__main {
+    background: #f4f4f1;
+    color: #0a0a0a;
+  }
+
+  .cta__main:hover {
+    background: #fff;
+  }
+
+  .cta__alt {
+    border: 1px solid var(--line-strong);
+    color: var(--text);
+  }
+
+  .cta__alt:hover {
+    background: rgb(255 255 255 / 0.06);
+  }
+
+  .cta__main:active,
+  .cta__alt:active {
+    transform: scale(0.97);
+  }
+
+  .meta {
+    margin: 16px 0 0;
+    color: var(--text-3);
+    font-size: 13px;
+  }
+
+  .btn {
+    display: grid;
+    place-items: center;
+    width: 36px;
+    height: 36px;
+    padding: 0;
+    border: 1px solid var(--line-strong);
+    border-radius: 9px;
+    background: transparent;
+    color: var(--text);
+    cursor: pointer;
+    transition:
+      background 0.2s,
+      transform 0.15s var(--ease);
+  }
+
+  .btn > :global(svg) {
+    grid-area: 1 / 1;
+    transition:
+      opacity 0.2s,
+      scale 0.2s var(--ease);
+  }
+
+  .btn:hover {
+    background: rgb(255 255 255 / 0.06);
+  }
+
+  .btn:active {
+    transform: scale(0.94);
+  }
+
+  .btn :global(.i-done) {
+    opacity: 0;
+    scale: 0.6;
+  }
+
+  .btn[data-done] :global(.i-copy) {
+    opacity: 0;
+    scale: 0.6;
+  }
+
+  .btn[data-done] :global(.i-done) {
+    opacity: 1;
+    scale: 1;
+  }
+
+  .demo {
+    width: min(100%, 1040px);
+    margin: clamp(72px, 12vh, 112px) auto 0;
+    padding: 0 16px;
+  }
+
+  .demo__slot {
+    mask-image: linear-gradient(to bottom, #000 72%, transparent);
+  }
+
+  .demo__slot {
+    aspect-ratio: 960 / 540;
+  }
+
+  @media (max-width: 751px) {
+    .demo__slot {
+      aspect-ratio: 358 / 340;
+    }
+  }
+
+  .demo__caption {
+    max-width: 36em;
+    margin: 20px auto 0;
+    color: var(--text-3);
+    font-size: 13.5px;
+    line-height: 1.55;
+    text-align: center;
+  }
+
+  .section {
+    width: min(100% - 32px, 960px);
+    margin: clamp(80px, 12vh, 120px) auto 0;
+  }
+
+  .section__title {
+    margin: 0 0 28px;
+    font-size: clamp(26px, 3.2vw, 34px);
+    font-weight: 600;
+    letter-spacing: -0.03em;
+  }
+
+  .section h3 {
+    margin: 0;
+    font-size: 15px;
+    font-weight: 600;
+  }
+
+  .section p,
+  .faq dd {
+    margin: 8px 0 0;
+    color: var(--text-2);
+    font-size: 14.5px;
+    line-height: 1.6;
+    text-wrap: pretty;
+  }
+
+  .section strong {
+    color: var(--text);
+    font-weight: 500;
+  }
+
+  .section a {
+    color: var(--text);
+    text-decoration: underline;
+    text-decoration-color: rgb(255 255 255 / 0.3);
+    text-underline-offset: 3px;
+  }
+
+  .uses {
+    display: grid;
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+    gap: 1px;
+    overflow: hidden;
+    border: 1px solid var(--line);
+    border-radius: 16px;
+    background: var(--line);
+  }
+
+  .uses > div {
+    padding: 24px 26px 26px;
+    background: var(--bg);
+  }
+
+  .steps {
+    display: grid;
+    grid-template-columns: repeat(3, minmax(0, 1fr));
+    gap: 32px;
+    margin: 0;
+    padding: 0;
+    list-style: none;
+    counter-reset: step;
+  }
+
+  .steps li {
+    counter-increment: step;
+  }
+
+  .steps li::before {
+    content: counter(step);
+    display: grid;
+    place-items: center;
+    width: 28px;
+    height: 28px;
+    margin-bottom: 16px;
+    border: 1px solid var(--line-strong);
+    border-radius: 50%;
+    color: var(--text-2);
+    font-size: 13px;
+    font-weight: 600;
+  }
+
+  .copy {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 12px;
+    margin-top: 12px;
+    padding: 6px 6px 6px 14px;
+    border: 1px solid var(--line-strong);
+    border-radius: 12px;
+    background: var(--panel);
+  }
+
+  .copy code {
+    color: var(--text);
+    font-size: 13.5px;
+  }
+
+  .faq {
+    display: grid;
+    margin: 0;
+    border-top: 1px solid var(--line);
+  }
+
+  .faq > div {
+    display: grid;
+    grid-template-columns: minmax(0, 1fr) minmax(0, 1.6fr);
+    gap: 24px;
+    padding: 22px 0;
+    border-bottom: 1px solid var(--line);
+  }
+
+  .faq dt {
+    font-size: 15px;
+    font-weight: 600;
+  }
+
+  .faq dd {
+    margin: 0;
+  }
+
+  @media (max-width: 760px) {
+    .uses,
+    .steps,
+    .faq > div {
+      grid-template-columns: 1fr;
+    }
+
+    .steps {
+      gap: 28px;
+    }
+
+    .faq > div {
+      gap: 6px;
+    }
+  }
+
+  .foot {
+    display: flex;
+    justify-content: space-between;
+    gap: 16px;
+    margin-top: 64px;
+    padding: 28px clamp(16px, 4vw, 52px);
+    color: var(--text-3);
+    font-size: 13px;
+  }
+
+  .foot a:hover {
+    color: var(--text);
+  }
+</style>

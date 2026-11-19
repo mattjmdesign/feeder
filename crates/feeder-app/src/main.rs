@@ -1336,9 +1336,22 @@ fn poll(s: &mut State, clock: f64, tx: &mut Tx) -> bool {
     changed
 }
 
+fn is_app_icon_scene() -> bool {
+    let mut args = std::env::args().skip(1);
+    while let Some(arg) = args.next() {
+        if arg == "--scene=app-icon" {
+            return true;
+        }
+        if arg == "--scene" && args.next().as_deref() == Some("app-icon") {
+            return true;
+        }
+    }
+    false
+}
+
 fn main() {
     rune::prewarm_gpu();
-    rune::App::new(AppSpec::<State> {
+    let mut app = rune::App::new(AppSpec::<State> {
         min_size: Some((640.0, 480.0)),
         scenes: &[
             ("app-icon", |s| s.icon = true),
@@ -1382,8 +1395,11 @@ fn main() {
             handle.open();
             handle.focus();
         }
-    })
-    .run();
+    });
+    if is_app_icon_scene() {
+        app = app.window_options(rune::WindowOptions { transparent: true, ..Default::default() });
+    }
+    app.run();
 }
 
 #[cfg(test)]
