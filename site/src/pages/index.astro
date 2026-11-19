@@ -1,164 +1,246 @@
 ---
-import { Check, Copy, Download } from 'lucide-react';
+import { Check, Copy, Download, Moon, Sun } from 'lucide-react';
 import FeedDemo from '../demo/FeedDemo';
 import Layout from '../layouts/Layout.astro';
-import { ORBS, orbAccent, orbBackground } from '../lib/orb';
-import { DOWNLOAD_URL, REPO_URL } from '../lib/site';
+import { ORBS, orbBackground } from '../lib/orb';
+import { DOWNLOAD_URL, RELEASES_URL, REPO_URL } from '../lib/site';
 
 const hero = ORBS.hero!;
 const ballStyle = `background:${orbBackground(hero)}`;
-const glowStyle = `--glow:${orbAccent(hero, 0.5)};--glow-2:${orbAccent(hero, 0.18)}`;
-const markStyle = `background:${orbBackground(hero)}`;
-const year = new Date().getFullYear();
 ---
 
 <Layout>
   <div class="page">
     <header class="top">
       <a class="brand" href="./" aria-label="Feeder home">
-        <span class="brand__orb" style={markStyle}></span>
+        <span class="brand__orb" id="brand-orb" style={ballStyle}></span>
         <span>Feeder</span>
       </a>
-      <a class="top__link" href={REPO_URL}>
-        <svg viewBox="0 0 24 24" width="16" height="16" aria-hidden="true"
-          ><path
-            fill="currentColor"
-            d="M12 .297c-6.63 0-12 5.373-12 12 0 5.303 3.438 9.8 8.205 11.385.6.113.82-.258.82-.577 0-.285-.01-1.04-.015-2.04-3.338.724-4.042-1.61-4.042-1.61C4.422 18.07 3.633 17.7 3.633 17.7c-1.087-.744.084-.729.084-.729 1.205.084 1.838 1.236 1.838 1.236 1.07 1.835 2.809 1.305 3.495.998.108-.776.417-1.305.76-1.605-2.665-.3-5.466-1.332-5.466-5.93 0-1.31.465-2.38 1.235-3.22-.135-.303-.54-1.523.105-3.176 0 0 1.005-.322 3.3 1.23.96-.267 1.98-.399 3-.405 1.02.006 2.04.138 3 .405 2.28-1.552 3.285-1.23 3.285-1.23.645 1.653.24 2.873.12 3.176.765.84 1.23 1.91 1.23 3.22 0 4.61-2.805 5.625-5.475 5.92.42.36.81 1.096.81 2.22 0 1.606-.015 2.896-.015 3.286 0 .315.21.69.825.57C20.565 22.092 24 17.592 24 12.297c0-6.627-5.373-12-12-12"
-          ></path></svg
+      <div class="top__right">
+        <a class="top__link" href="#setup">Setup</a>
+        <a class="top__link" href="#privacy">Privacy</a>
+        <a class="top__link" href={REPO_URL}>GitHub</a>
+        <button
+          class="theme-btn"
+          id="theme-toggle"
+          type="button"
+          aria-label="Switch color theme"
+          title="Switch light or dark theme"
         >
-        GitHub
-      </a>
+          <Sun className="theme-icon theme-icon--sun" size={15} strokeWidth={1.9} aria-hidden="true" />
+          <Moon className="theme-icon theme-icon--moon" size={15} strokeWidth={1.9} aria-hidden="true" />
+        </button>
+      </div>
     </header>
 
     <main>
       <section class="hero">
-        <button class="orb" type="button" aria-label="Show a new orb" style={glowStyle}>
-          <span class="orb__glow"></span>
-          <span class="orb__shadow"></span>
+        <button class="orb" type="button" aria-label="Feeder orb">
           <span class="orb__ball" style={ballStyle}></span>
         </button>
-        <p class="orb__hint">Every project gets its own orb. Click for another.</p>
 
-        <h1>Where every project left off.</h1>
+        <h1>A local feed for your coding agents</h1>
         <p class="lede">
-          A Mac app where your coding agents post short updates on what they did, why, and what’s next. Built in Rust on
-          <a href="https://github.com/anomalyco/rune">Rune</a>, so it opens instantly and stays small. Nothing leaves your Mac.
+          A Mac app where your agents post short updates on what changed, why, and what’s next, plus a shared notebook
+          across repos. Built in Rust on <a href="https://github.com/anomalyco/rune">Rune</a> from Anomaly for fast
+          response, small size, and low memory. Everything stays on your Mac.
         </p>
 
         <div class="cta">
           <a class="cta__main" href={DOWNLOAD_URL}>
-            <Download size={17} strokeWidth={2.2} aria-hidden="true" />
+            <Download size={16} strokeWidth={2.1} aria-hidden="true" />
             Download for Mac
           </a>
           <a class="cta__alt" href={REPO_URL}>Source on GitHub</a>
         </div>
-        <p class="meta">Free and open source · Apple silicon · macOS 13 or later</p>
+        <p class="meta">
+          <span id="version">Apple Silicon</span> · macOS 13 or later · MIT license
+        </p>
       </section>
 
       <section class="demo" aria-label="Feeder’s feed as an update arrives">
         <div class="demo__slot"><FeedDemo client:only="react" /></div>
-        <p class="demo__caption">An agent shows as Working while it runs, then posts its update. This one ends with a decision, so the project is marked Needs you.</p>
+        <p class="demo__caption">
+          An agent shows as Working while it runs, then drops in a three-part update. Posts ending in a decision get
+          tagged Needs you.
+        </p>
       </section>
 
       <section class="section">
-        <h2 class="section__title">What it’s for</h2>
-        <div class="uses">
-          <div>
-            <h3>Coming back to a project</h3>
-            <p>Read the last update and you know what changed, why, and what to do next. No digging through commits or old chats.</p>
+        <h2 class="section__title">What it does</h2>
+        <div class="features">
+          <div class="feature">
+            <h3>One feed per project</h3>
+            <p>
+              Each update has three short blocks: what changed, why, and what’s next, with an optional screenshot or
+              short clip.
+            </p>
           </div>
-          <div>
-            <h3>Running several agents</h3>
-            <p>Home shows every project at once: which agent touched it last, which one is working now, and which ones are waiting on you.</p>
+          <div class="feature">
+            <h3>Live status across repos</h3>
+            <p>
+              Home gives every project its own orb, shows which agents are currently working, and marks anything waiting
+              on your reply.
+            </p>
           </div>
-          <div>
-            <h3>Handing work to the next agent</h3>
-            <p>Agents read the feed before they start, so a new session picks up the plan instead of redoing or undoing the last one.</p>
+          <div class="feature">
+            <h3>Context for the next session</h3>
+            <p>
+              Agents read recent updates and your replies over local MCP before starting, so a new session picks up
+              where the last one stopped.
+            </p>
           </div>
-          <div>
-            <h3>Not solving the same bug twice</h3>
-            <p>When an agent fixes something tricky, it writes the fix to a shared notebook. Agents in your other projects search it before they start debugging.</p>
+          <div class="feature">
+            <h3>Shared notebook</h3>
+            <p>
+              When an agent tracks down a tricky bug or settles a design rule, it writes a short note that agents in
+              your other projects can search first.
+            </p>
           </div>
         </div>
       </section>
 
-      <section class="section">
-        <h2 class="section__title">Set it up</h2>
+      <section class="section" id="setup">
+        <h2 class="section__title">Setup</h2>
         <ol class="steps">
           <li>
-            <h3>Install</h3>
+            <span class="step__num">01</span>
+            <h3>Install the app</h3>
             <p>Open <code>Feeder.dmg</code> and drag Feeder into Applications.</p>
           </li>
           <li>
-            <h3>Connect your tools</h3>
-            <p>In <strong>Settings → Agents</strong>, press Connect next to each tool, then restart it. Feeder adds its MCP server to that tool’s config and keeps a backup of the file.</p>
+            <span class="step__num">02</span>
+            <h3>Connect your agents</h3>
+            <p>
+              Open <strong>Settings → Agents</strong>, click Connect on the tools you use, and restart them. Feeder
+              adds its local MCP entry and saves a <code>.feeder-backup</code> copy first.
+            </p>
           </li>
           <li>
-            <h3>Ask for an update</h3>
-            <p>In any project, tell your agent:</p>
+            <span class="step__num">03</span>
+            <h3>Post an update</h3>
+            <p>In any project, ask your agent:</p>
             <div class="copy">
               <code>post a Feeder update</code>
               <button class="btn" type="button" data-copy="post a Feeder update" aria-label="Copy the prompt">
-                <Copy className="i-copy" size={15} strokeWidth={2} aria-hidden="true" />
-                <Check className="i-done" size={15} strokeWidth={2.2} aria-hidden="true" />
+                <Copy className="i-copy" size={14} strokeWidth={2} aria-hidden="true" />
+                <Check className="i-done" size={14} strokeWidth={2.2} aria-hidden="true" />
               </button>
             </div>
           </li>
         </ol>
       </section>
 
-      <section class="section">
-        <h2 class="section__title">Good to know</h2>
-        <dl class="faq">
+      <section class="section" id="details">
+        <h2 class="section__title">Details</h2>
+        <dl class="specs">
           <div>
-            <dt>Which tools work with it?</dt>
-            <dd>Claude Code, Claude Desktop, Codex, Cursor, Antigravity, T3 Code and OpenCode connect with one click. Any other tool that supports MCP can use the config from <strong>Copy config</strong>.</dd>
+            <dt>Supported tools</dt>
+            <dd>
+              Claude Code, Claude Desktop, Codex, Cursor, Antigravity, T3 Code, and OpenCode connect in one click. Any
+              other MCP client can use the snippet from <strong>Copy config</strong>.
+            </dd>
+          </div>
+          <div id="privacy">
+            <dt>Storage &amp; privacy</dt>
+            <dd>
+              Projects, updates, screenshots, and notebook pages live in one local SQLite database under{' '}
+              <code>~/Library/Application Support/feeder</code>. No account, no cloud sync, and no data is collected or
+              sent anywhere. Agents run <code>feeder mcp</code> over local stdin/stdout with no open ports. The only
+              network request is checking GitHub Releases for app updates.
+            </dd>
           </div>
           <div>
-            <dt>Where are my updates saved?</dt>
-            <dd>In one file on your Mac, under <code>~/Library/Application Support/feeder</code>. There’s no account and nothing is collected. The app only goes online to check for new versions.</dd>
+            <dt>Rust &amp; Rune</dt>
+            <dd>
+              Built in Rust on <a href="https://github.com/anomalyco/rune">Rune</a> from Anomaly (GPU-rendered with
+              Metal, no Electron or WebView), so it opens immediately and keeps binary size and memory use low.
+            </dd>
           </div>
           <div>
-            <dt>Can I post updates myself?</dt>
-            <dd>Yes. Press ⇧⌘N in the app, or run <code>feeder post "…"</code> in Terminal.</dd>
+            <dt>Manual notes &amp; CLI</dt>
+            <dd>
+              Press <code>⇧⌘N</code> in the app or run <code>feeder post "…"</code> in Terminal to post yourself.{' '}
+              <code>⌘K</code> jumps across projects, updates, and notebook pages.
+            </dd>
           </div>
-          <div>
-            <dt>Why is it so quick?</dt>
-            <dd>It’s written in Rust on <a href="https://github.com/anomalyco/rune">Rune</a>, Anomaly’s GPU UI framework, not a web view, so it opens instantly and uses little memory.</dd>
-          </div>
-          <div>
-            <dt>How do I remove it?</dt>
-            <dd>In <strong>Settings → Uninstall</strong>, choose Remove Feeder from all tools, then move the app to the Trash.</dd>
+          <div id="uninstall">
+            <dt>Uninstall</dt>
+            <dd>
+              Open <strong>Settings → Uninstall</strong> and click <strong>Remove Feeder from all tools</strong>, then
+              move Feeder to the Trash. Delete <code>~/Library/Application Support/feeder</code> if you want to remove
+              your database too.
+            </dd>
           </div>
         </dl>
       </section>
     </main>
 
     <footer class="foot">
-      <span>© {year} Feeder · MIT license</span>
-      <a href={`${REPO_URL}#uninstall`}>Uninstall</a>
+      <span>Feeder · MIT license</span>
+      <div class="foot__links">
+        <a href={REPO_URL}>Source</a>
+        <a href={RELEASES_URL}>Releases</a>
+        <a href={`${REPO_URL}/blob/main/assets/ThirdPartyLicenses.html`}>Third-party licenses</a>
+      </div>
     </footer>
   </div>
 </Layout>
 
 <script>
-  import { orbAccent, orbBackground, randomOrb } from '../lib/orb';
+  import { orbBackground, randomOrb } from '../lib/orb';
 
+  // Interactive orb swap (quiet easter egg — no prompt needed)
   const orb = document.querySelector<HTMLButtonElement>('.orb');
   const ball = orb?.querySelector<HTMLElement>('.orb__ball');
+  const brandOrb = document.getElementById('brand-orb');
   let hue = 292;
+
   orb?.addEventListener('click', () => {
     if (!ball) return;
     const next = randomOrb(hue);
     hue = next.hues[0];
-    ball.style.background = orbBackground(next);
-    orb.style.setProperty('--glow', orbAccent(next, 0.5));
-    orb.style.setProperty('--glow-2', orbAccent(next, 0.18));
+    const bg = orbBackground(next);
+    ball.style.background = bg;
+    if (brandOrb) brandOrb.style.background = bg;
     orb.classList.remove('is-new');
     void orb.offsetWidth;
     orb.classList.add('is-new');
   });
 
+  // Theme switcher (defaults to OS preference, persists user toggle)
+  const root = document.documentElement;
+  const toggle = document.getElementById('theme-toggle');
+  const mq = window.matchMedia('(prefers-color-scheme: dark)');
+
+  function isDark(): boolean {
+    const explicit = root.dataset.theme;
+    if (explicit === 'dark') return true;
+    if (explicit === 'light') return false;
+    return mq.matches;
+  }
+
+  function syncThemeControl() {
+    if (!toggle) return;
+    const dark = isDark();
+    toggle.setAttribute('aria-label', dark ? 'Switch to light theme' : 'Switch to dark theme');
+  }
+
+  syncThemeControl();
+  mq.addEventListener('change', syncThemeControl);
+
+  toggle?.addEventListener('click', () => {
+    const next = isDark() ? 'light' : 'dark';
+    root.dataset.theme = next;
+    try {
+      localStorage.setItem('feeder-theme', next);
+    } catch {
+      /* storage unavailable */
+    }
+    syncThemeControl();
+  });
+
+  // Copy prompt button
   for (const btn of document.querySelectorAll<HTMLButtonElement>('[data-copy]')) {
     btn.addEventListener('click', async () => {
       try {
@@ -166,9 +248,22 @@ const year = new Date().getFullYear();
         btn.dataset.done = '';
         setTimeout(() => delete btn.dataset.done, 1400);
       } catch {
-        /* clipboard blocked: nothing to show */
+        /* clipboard blocked */
       }
     });
+  }
+
+  // Optional latest release version label
+  const versionEl = document.getElementById('version');
+  if (versionEl) {
+    fetch('https://api.github.com/repos/mattjmdesign/feeder/releases/latest')
+      .then((res) => (res.ok ? res.json() : null))
+      .then((release: { tag_name?: string } | null) => {
+        if (release?.tag_name) {
+          versionEl.textContent = `v${release.tag_name.replace(/^v/, '')} · Apple Silicon`;
+        }
+      })
+      .catch(() => {});
   }
 </script>
 
@@ -183,48 +278,111 @@ const year = new Date().getFullYear();
     display: flex;
     align-items: center;
     justify-content: space-between;
-    padding: 28px clamp(16px, 4vw, 52px);
+    gap: 16px;
+    width: min(100%, 1040px);
+    margin: 0 auto;
+    padding: 22px clamp(16px, 4vw, 32px);
   }
 
   .brand {
     display: inline-flex;
     align-items: center;
-    gap: 10px;
+    gap: 9px;
     font-size: 15px;
     font-weight: 600;
-    letter-spacing: 0.01em;
+    letter-spacing: -0.01em;
   }
 
   .brand__orb {
-    width: 20px;
-    height: 20px;
+    width: 19px;
+    height: 19px;
     border-radius: 50%;
+    box-shadow: var(--orb-ring);
+  }
+
+  .top__right {
+    display: flex;
+    align-items: center;
+    gap: 20px;
   }
 
   .top__link {
-    display: inline-flex;
-    align-items: center;
-    gap: 8px;
     color: var(--text-2);
     font-size: 14px;
-    transition: color 0.2s;
+    transition: color 0.16s ease;
   }
 
   .top__link:hover {
     color: var(--text);
   }
 
+  .theme-btn {
+    display: inline-grid;
+    place-items: center;
+    width: 32px;
+    height: 32px;
+    padding: 0;
+    border: 1px solid var(--line-strong);
+    border-radius: 999px;
+    background: var(--surface);
+    color: var(--text-2);
+    cursor: pointer;
+    transition:
+      color 0.16s ease,
+      background 0.16s ease,
+      border-color 0.16s ease,
+      transform 0.14s var(--ease);
+  }
+
+  .theme-btn:hover {
+    color: var(--text);
+    background: var(--hover-tint);
+  }
+
+  .theme-btn:active {
+    transform: scale(0.94);
+  }
+
+  .theme-btn :global(.theme-icon) {
+    grid-area: 1 / 1;
+  }
+
+  .theme-btn :global(.theme-icon--sun) {
+    display: none;
+  }
+
+  .theme-btn :global(.theme-icon--moon) {
+    display: block;
+  }
+
+  @media (prefers-color-scheme: dark) {
+    :global(:root:not([data-theme='light'])) .theme-btn :global(.theme-icon--sun) {
+      display: block;
+    }
+    :global(:root:not([data-theme='light'])) .theme-btn :global(.theme-icon--moon) {
+      display: none;
+    }
+  }
+
+  :global(:root[data-theme='dark']) .theme-btn :global(.theme-icon--sun) {
+    display: block;
+  }
+
+  :global(:root[data-theme='dark']) .theme-btn :global(.theme-icon--moon) {
+    display: none;
+  }
+
   .hero {
     display: flex;
     flex-direction: column;
     align-items: center;
-    padding: clamp(24px, 6vh, 64px) 16px 0;
+    padding: clamp(28px, 6vh, 60px) 16px 0;
     text-align: center;
   }
 
-  /* The orb on its own: a glass sphere lit from the upper left, casting its color on the page */
+  /* Crisp glass orb on its own — grounded physical shadow, no outer glow */
   .orb {
-    --size: clamp(160px, 26vw, 232px);
+    --size: clamp(118px, 16vw, 146px);
     position: relative;
     width: var(--size);
     height: var(--size);
@@ -233,37 +391,14 @@ const year = new Date().getFullYear();
     border-radius: 50%;
     background: none;
     cursor: pointer;
-    animation: float 6s ease-in-out infinite;
-    transition: transform 0.4s var(--ease);
-  }
-
-  .orb__glow {
-    content: '';
-    position: absolute;
-    inset: -45%;
-    border-radius: 50%;
-    background: radial-gradient(closest-side, var(--glow), var(--glow-2) 55%, transparent);
-    filter: blur(24px);
-    opacity: 0.75;
-    transition: background 0.6s;
-  }
-
-  .orb__shadow {
-    content: '';
-    position: absolute;
-    left: 14%;
-    right: 14%;
-    bottom: -16%;
-    height: 10%;
-    border-radius: 50%;
-    background: radial-gradient(closest-side, rgb(0 0 0 / 0.85), transparent);
-    animation: shadow 6s ease-in-out infinite;
+    transition: transform 0.24s var(--ease);
   }
 
   .orb__ball {
     position: absolute;
     inset: 0;
     border-radius: 50%;
+    box-shadow: var(--orb-ring), var(--orb-drop);
   }
 
   .orb:hover {
@@ -271,48 +406,18 @@ const year = new Date().getFullYear();
   }
 
   .orb:active {
-    transform: scale(0.97);
+    transform: scale(0.96);
   }
 
   .orb.is-new {
-    animation:
-      pop 0.5s var(--ease),
-      float 6s ease-in-out 0.5s infinite;
+    animation: orb-pop 0.36s var(--ease);
   }
 
-  .orb__hint {
-    margin: 40px 0 0;
-    color: var(--text-3);
-    font-size: 13px;
-  }
-
-  @keyframes float {
-    0%,
-    100% {
-      translate: 0 0;
-    }
-    50% {
-      translate: 0 -8px;
-    }
-  }
-
-  @keyframes shadow {
-    0%,
-    100% {
-      scale: 1;
-      opacity: 1;
-    }
-    50% {
-      scale: 0.9;
-      opacity: 0.7;
-    }
-  }
-
-  @keyframes pop {
+  @keyframes orb-pop {
     0% {
-      scale: 0.86;
+      scale: 0.9;
     }
-    60% {
+    55% {
       scale: 1.04;
     }
     100% {
@@ -321,69 +426,79 @@ const year = new Date().getFullYear();
   }
 
   h1 {
-    margin: clamp(28px, 5vh, 48px) 0 0;
-    font-size: clamp(40px, 7.4vw, 84px);
-    font-weight: 600;
-    letter-spacing: -0.045em;
-    line-height: 1;
+    margin: 28px 0 0;
+    max-width: 18em;
+    font-size: clamp(32px, 5vw, 50px);
+    font-weight: 620;
+    letter-spacing: -0.036em;
+    line-height: 1.08;
     text-wrap: balance;
   }
 
   .lede {
-    max-width: 34em;
-    margin: 24px 0 0;
+    max-width: 43em;
+    margin: 18px 0 0;
     color: var(--text-2);
-    font-size: clamp(16px, 1.6vw, 18px);
+    font-size: clamp(15.5px, 1.5vw, 17px);
     line-height: 1.6;
     text-wrap: pretty;
   }
 
-  .lede a {
+  .lede a,
+  .section a {
     color: var(--text);
     text-decoration: underline;
-    text-decoration-color: rgb(255 255 255 / 0.3);
+    text-decoration-color: var(--link-underline);
     text-underline-offset: 3px;
+  }
+
+  .lede a:hover,
+  .section a:hover {
+    text-decoration-color: var(--text);
   }
 
   .cta {
     display: flex;
     flex-wrap: wrap;
     justify-content: center;
-    gap: 12px;
-    margin-top: 36px;
+    gap: 10px;
+    margin-top: 28px;
   }
 
   .cta__main,
   .cta__alt {
     display: inline-flex;
     align-items: center;
-    gap: 9px;
-    height: 46px;
-    padding: 0 22px;
+    gap: 8px;
+    height: 42px;
+    padding: 0 20px;
     border-radius: 999px;
-    font-size: 15px;
-    font-weight: 600;
+    font-size: 14.5px;
+    font-weight: 560;
+    letter-spacing: -0.01em;
     transition:
-      background 0.2s,
-      transform 0.15s var(--ease);
+      background 0.16s ease,
+      border-color 0.16s ease,
+      transform 0.14s var(--ease);
   }
 
   .cta__main {
-    background: #f4f4f1;
-    color: #0a0a0a;
+    background: var(--btn-bg);
+    color: var(--btn-ink);
   }
 
   .cta__main:hover {
-    background: #fff;
+    background: var(--btn-bg-hover);
   }
 
   .cta__alt {
     border: 1px solid var(--line-strong);
+    background: var(--surface);
     color: var(--text);
   }
 
   .cta__alt:hover {
-    background: rgb(255 255 255 / 0.06);
+    background: var(--hover-tint);
   }
 
   .cta__main:active,
@@ -392,36 +507,155 @@ const year = new Date().getFullYear();
   }
 
   .meta {
-    margin: 16px 0 0;
+    margin: 14px 0 0;
     color: var(--text-3);
+    font-size: 13px;
+    font-variant-numeric: tabular-nums;
+  }
+
+  .demo {
+    width: min(100%, 1040px);
+    margin: clamp(44px, 7vh, 72px) auto 0;
+    padding: 0 16px;
+  }
+
+  .demo__slot {
+    aspect-ratio: 960 / 540;
+    mask-image: linear-gradient(to bottom, #000 76%, transparent);
+    -webkit-mask-image: linear-gradient(to bottom, #000 76%, transparent);
+  }
+
+  @media (max-width: 751px) {
+    .demo__slot {
+      aspect-ratio: 358 / 340;
+    }
+  }
+
+  .demo__caption {
+    max-width: 38em;
+    margin: 14px auto 0;
+    color: var(--text-3);
+    font-size: 13.5px;
+    line-height: 1.55;
+    text-align: center;
+  }
+
+  .section {
+    width: min(100% - 32px, 920px);
+    margin: clamp(72px, 10vh, 104px) auto 0;
+    scroll-margin-top: 28px;
+  }
+
+  .section__title {
+    margin: 0 0 24px;
+    font-size: clamp(22px, 2.6vw, 28px);
+    font-weight: 600;
+    letter-spacing: -0.028em;
+  }
+
+  .section h3 {
+    margin: 0;
+    font-size: 15px;
+    font-weight: 600;
+    letter-spacing: -0.01em;
+  }
+
+  .section p,
+  .specs dd {
+    margin: 7px 0 0;
+    color: var(--text-2);
+    font-size: 14.5px;
+    line-height: 1.6;
+    text-wrap: pretty;
+  }
+
+  .section strong {
+    color: var(--text);
+    font-weight: 560;
+  }
+
+  .section code {
+    padding: 1px 5px;
+    border-radius: 5px;
+    background: var(--surface-subtle);
+    color: var(--text);
+  }
+
+  .features {
+    display: grid;
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+    gap: 32px 48px;
+    padding-top: 24px;
+    border-top: 1px solid var(--line);
+  }
+
+  .steps {
+    display: grid;
+    grid-template-columns: repeat(3, minmax(0, 1fr));
+    gap: 28px 36px;
+    margin: 0;
+    padding: 0;
+    list-style: none;
+  }
+
+  .steps li {
+    padding-top: 18px;
+    border-top: 1px solid var(--line);
+  }
+
+  .step__num {
+    display: block;
+    margin-bottom: 10px;
+    color: var(--text-3);
+    font-family: ui-monospace, 'SF Mono', Menlo, monospace;
+    font-size: 12px;
+    font-weight: 550;
+  }
+
+  .copy {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 10px;
+    margin-top: 12px;
+    padding: 5px 5px 5px 12px;
+    border: 1px solid var(--line-strong);
+    border-radius: 10px;
+    background: var(--surface);
+  }
+
+  .copy code {
+    padding: 0;
+    background: none;
+    color: var(--text);
     font-size: 13px;
   }
 
   .btn {
     display: grid;
     place-items: center;
-    width: 36px;
-    height: 36px;
+    width: 32px;
+    height: 32px;
     padding: 0;
     border: 1px solid var(--line-strong);
-    border-radius: 9px;
+    border-radius: 7px;
     background: transparent;
     color: var(--text);
     cursor: pointer;
     transition:
-      background 0.2s,
-      transform 0.15s var(--ease);
+      background 0.16s ease,
+      transform 0.14s var(--ease);
   }
 
   .btn > :global(svg) {
     grid-area: 1 / 1;
     transition:
-      opacity 0.2s,
-      scale 0.2s var(--ease);
+      opacity 0.18s ease,
+      scale 0.18s var(--ease);
   }
 
   .btn:hover {
-    background: rgb(255 255 255 / 0.06);
+    background: var(--hover-tint);
   }
 
   .btn:active {
@@ -443,184 +677,81 @@ const year = new Date().getFullYear();
     scale: 1;
   }
 
-  .demo {
-    width: min(100%, 1040px);
-    margin: clamp(72px, 12vh, 112px) auto 0;
-    padding: 0 16px;
-  }
-
-  .demo__slot {
-    mask-image: linear-gradient(to bottom, #000 72%, transparent);
-  }
-
-  .demo__slot {
-    aspect-ratio: 960 / 540;
-  }
-
-  @media (max-width: 751px) {
-    .demo__slot {
-      aspect-ratio: 358 / 340;
-    }
-  }
-
-  .demo__caption {
-    max-width: 36em;
-    margin: 20px auto 0;
-    color: var(--text-3);
-    font-size: 13.5px;
-    line-height: 1.55;
-    text-align: center;
-  }
-
-  .section {
-    width: min(100% - 32px, 960px);
-    margin: clamp(80px, 12vh, 120px) auto 0;
-  }
-
-  .section__title {
-    margin: 0 0 28px;
-    font-size: clamp(26px, 3.2vw, 34px);
-    font-weight: 600;
-    letter-spacing: -0.03em;
-  }
-
-  .section h3 {
-    margin: 0;
-    font-size: 15px;
-    font-weight: 600;
-  }
-
-  .section p,
-  .faq dd {
-    margin: 8px 0 0;
-    color: var(--text-2);
-    font-size: 14.5px;
-    line-height: 1.6;
-    text-wrap: pretty;
-  }
-
-  .section strong {
-    color: var(--text);
-    font-weight: 500;
-  }
-
-  .section a {
-    color: var(--text);
-    text-decoration: underline;
-    text-decoration-color: rgb(255 255 255 / 0.3);
-    text-underline-offset: 3px;
-  }
-
-  .uses {
-    display: grid;
-    grid-template-columns: repeat(2, minmax(0, 1fr));
-    gap: 1px;
-    overflow: hidden;
-    border: 1px solid var(--line);
-    border-radius: 16px;
-    background: var(--line);
-  }
-
-  .uses > div {
-    padding: 24px 26px 26px;
-    background: var(--bg);
-  }
-
-  .steps {
-    display: grid;
-    grid-template-columns: repeat(3, minmax(0, 1fr));
-    gap: 32px;
-    margin: 0;
-    padding: 0;
-    list-style: none;
-    counter-reset: step;
-  }
-
-  .steps li {
-    counter-increment: step;
-  }
-
-  .steps li::before {
-    content: counter(step);
-    display: grid;
-    place-items: center;
-    width: 28px;
-    height: 28px;
-    margin-bottom: 16px;
-    border: 1px solid var(--line-strong);
-    border-radius: 50%;
-    color: var(--text-2);
-    font-size: 13px;
-    font-weight: 600;
-  }
-
-  .copy {
-    display: flex;
-    align-items: center;
-    justify-content: space-between;
-    gap: 12px;
-    margin-top: 12px;
-    padding: 6px 6px 6px 14px;
-    border: 1px solid var(--line-strong);
-    border-radius: 12px;
-    background: var(--panel);
-  }
-
-  .copy code {
-    color: var(--text);
-    font-size: 13.5px;
-  }
-
-  .faq {
+  .specs {
     display: grid;
     margin: 0;
     border-top: 1px solid var(--line);
   }
 
-  .faq > div {
+  .specs > div {
     display: grid;
-    grid-template-columns: minmax(0, 1fr) minmax(0, 1.6fr);
+    grid-template-columns: minmax(0, 1fr) minmax(0, 2fr);
     gap: 24px;
-    padding: 22px 0;
+    padding: 20px 0;
     border-bottom: 1px solid var(--line);
+    scroll-margin-top: 28px;
   }
 
-  .faq dt {
-    font-size: 15px;
-    font-weight: 600;
+  .specs dt {
+    font-size: 14.5px;
+    font-weight: 560;
   }
 
-  .faq dd {
+  .specs dd {
     margin: 0;
-  }
-
-  @media (max-width: 760px) {
-    .uses,
-    .steps,
-    .faq > div {
-      grid-template-columns: 1fr;
-    }
-
-    .steps {
-      gap: 28px;
-    }
-
-    .faq > div {
-      gap: 6px;
-    }
   }
 
   .foot {
     display: flex;
+    flex-wrap: wrap;
+    align-items: center;
     justify-content: space-between;
     gap: 16px;
-    margin-top: 64px;
-    padding: 28px clamp(16px, 4vw, 52px);
+    width: min(100%, 1040px);
+    margin: 72px auto 0;
+    padding: 24px clamp(16px, 4vw, 32px) 40px;
+    border-top: 1px solid var(--line);
     color: var(--text-3);
     font-size: 13px;
   }
 
+  .foot__links {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 20px;
+  }
+
   .foot a:hover {
     color: var(--text);
+  }
+
+  @media (max-width: 760px) {
+    .features,
+    .steps,
+    .specs > div {
+      grid-template-columns: 1fr;
+    }
+
+    .features {
+      gap: 24px;
+    }
+
+    .steps {
+      gap: 24px;
+    }
+
+    .specs > div {
+      gap: 6px;
+    }
+  }
+
+  @media (max-width: 520px) {
+    .top__right {
+      gap: 14px;
+    }
+
+    .top__link:not(:last-of-type) {
+      display: none;
+    }
   }
 </style>

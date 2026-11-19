@@ -3,9 +3,9 @@ import '@fontsource-variable/inter';
 import { SITE_URL, asset } from '../lib/site';
 import '../styles/global.css';
 
-const title = 'Feeder';
+const title = 'Feeder — Local feed for your coding agents';
 const description =
-  'A local Mac app where your coding agents leave short updates on what they did, why, and what’s next. Built in Rust on Rune. Nothing leaves your Mac.';
+  'A local Mac app built in Rust on Rune from Anomaly. Coding agents post short updates and shared notebook notes to a SQLite database on your Mac. No accounts, no data collected.';
 ---
 
 <!doctype html>
@@ -15,13 +15,24 @@ const description =
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <title>{title}</title>
     <meta name="description" content={description} />
-    <meta name="color-scheme" content="dark" />
-    <meta name="theme-color" content="#070707" />
+    <meta name="color-scheme" content="light dark" />
+    <meta name="theme-color" content="#fafafa" media="(prefers-color-scheme: light)" />
+    <meta name="theme-color" content="#0b0b0d" media="(prefers-color-scheme: dark)" />
     <link rel="icon" type="image/png" href={asset('assets/favicon.png')} />
     <link rel="canonical" href={SITE_URL} />
-    <meta property="og:title" content={title} />
+    <meta property="og:title" content="Feeder" />
     <meta property="og:description" content={description} />
-    <meta property="og:image" content={`${SITE_URL}assets/home-dark.png`} />
+    <meta property="og:image" content={`${SITE_URL}assets/home-light.png`} />
+    <script is:inline>
+      (() => {
+        try {
+          const saved = localStorage.getItem('feeder-theme');
+          if (saved === 'light' || saved === 'dark') {
+            document.documentElement.dataset.theme = saved;
+          }
+        } catch {}
+      })();
+    </script>
   </head>
   <body>
     <slot />

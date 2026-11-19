@@ -1,3 +1,4 @@
+import { useEffect, useState } from 'react'
 import { Stage } from '../stageshow/kit/stage'
 import type { Act } from '../stageshow/kit/act'
 import { Bar, Window } from '../stageshow/kit/window'
@@ -14,10 +15,6 @@ import './feed-demo.css'
 // a decision, so its Needs you tag is part of the card from the start. The
 // result holds, then the new card closes the way it opened and the loop
 // starts again from the same feed.
-//
-// Real strings: the two project names, the agent, the pulse, the three
-// blocks of the new update and the older card's heading. Everything else is
-// placeholder.
 
 type S = { working: boolean; posted: boolean }
 
@@ -35,17 +32,45 @@ async function script(a: Act<S>) {
   await a.wait(900)
 }
 
+function resolveTheme(): 'light' | 'dark' {
+  if (typeof document === 'undefined') return 'dark'
+  const explicit = document.documentElement.dataset.theme
+  if (explicit === 'light' || explicit === 'dark') return explicit
+  return window.matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light'
+}
+
+function useSiteTheme(): 'light' | 'dark' {
+  const [theme, setTheme] = useState<'light' | 'dark'>(resolveTheme)
+
+  useEffect(() => {
+    const sync = () => setTheme(resolveTheme())
+    const mq = window.matchMedia('(prefers-color-scheme: dark)')
+    mq.addEventListener('change', sync)
+    const mo = new MutationObserver(sync)
+    mo.observe(document.documentElement, { attributes: true, attributeFilter: ['data-theme'] })
+    return () => {
+      mq.removeEventListener('change', sync)
+      mo.disconnect()
+    }
+  }, [])
+
+  return theme
+}
+
 function OrbDot({ orb, size = 22 }: { orb: Orb; size?: number }) {
   return <span className="fd-orb" style={{ width: size, height: size, background: orbBackground(orb) }} />
 }
 
 export default function FeedDemo() {
+  const theme = useSiteTheme()
+
   return (
     <Stage<S>
       width={960}
       height={540}
       compact={{ below: 720, width: 358, height: 340 }}
-      theme="dark"
+      theme={theme}
+      greys="cool"
       initial={initial}
       poster={{ working: false, posted: true }}
       script={script}
