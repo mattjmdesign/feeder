@@ -28,6 +28,7 @@ enum Msg {
     SetPinned(i64, bool),
     MarkSeen(i64),
     MarkAllSeen,
+    SetAttentionDismissed(i64, bool),
     EditUpdate(i64, String),
     DeleteUpdate(i64),
     AddReply(i64, String),
@@ -41,6 +42,14 @@ enum Msg {
     Notebook(NotebookOp),
     /// Load the timeline's first `n` posts.
     Timeline(usize),
+}
+
+/// A failed text write whose draft should be restored in the UI so the user never loses typing.
+#[derive(Clone, Debug)]
+pub enum FailedWrite {
+    Reply { update_id: i64, body: String },
+    EditUpdate { update_id: i64, body: String },
+    Brief { project_id: i64, body: Option<String> },
 }
 
 /// A change to the notebook made in the app; the user is the author.
@@ -64,12 +73,13 @@ pub struct Snapshot {
     pub replies: HashMap<i64, Vec<Reply>>,
     pub search_query: String,
     pub search_hits: Vec<FeedUpdate>,
-    /// Every notebook page, archived ones included, the most recently revised first.
-    pub pages: Vec<Page>,
+    /// Every notebook page, archived ones included, when the notebook changed since the last snapshot.
+    pub pages: Option<Vec<Page>>,
     /// Agents without a logo whose app is installed, with the app to take the icon from.
     pub agent_apps: Vec<(String, PathBuf)>,
     pub error: Option<String>,
     pub mutation_error: Option<String>,
+    pub failed_writes: Vec<FailedWrite>,
 }
 
 enum TodoOp {
@@ -101,6 +111,7 @@ impl Watcher {
                 let mut timeline_limit = TIMELINE_PAGE;
                 let mut apps: HashMap<String, Option<PathBuf>> = Default::default();
                 let mut seen: Option<i64> = None;
+                let mut last_notebook_stamp: Option<(i64, i64, i64)> = None;
                 let mut next_pulse_expiry: Option<i64> = None;
                 let mut dirty = true;
                 loop {
@@ -110,12 +121,14 @@ impl Watcher {
                     let mut pins = Vec::new();
                     let mut seens = Vec::new();
                     let mut mark_all = false;
+                    let mut dismissals = Vec::new();
                     let mut edits = Vec::new();
                     let mut deletes = Vec::new();
                     let mut new_replies = Vec::new();
                     let mut todo_ops = Vec::new();
                     let mut notebook_ops = Vec::new();
                     let mut mutation_error: Option<String> = None;
+                    let mut failed_writes = Vec::new();
                     match rx.recv_timeout(Duration::from_millis(400)) {
                         Ok(first) => {
                             for msg in std::iter::once(first).chain(rx.try_iter()) {
@@ -129,6 +142,7 @@ impl Watcher {
                                     Msg::SetPinned(id, pinned) => pins.push((id, pinned)),
                                     Msg::MarkSeen(id) => seens.push(id),
                                     Msg::MarkAllSeen => mark_all = true,
+                                    Msg::SetAttentionDismissed(id, dismissed) => dismissals.push((id, dismissed)),
                                     Msg::EditUpdate(id, body) => edits.push((id, body)),
                                     Msg::DeleteUpdate(id) => deletes.push(id),
                                     Msg::AddReply(update_id, body) => new_replies.push((update_id, body)),
@@ -155,6 +169,15 @@ impl Watcher {
                         match Store::open_default() {
                             Ok(s) => store = Some(s),
                             Err(e) => {
+                                for (project_id, body) in briefs {
+                                    failed_writes.push(FailedWrite::Brief { project_id, body });
+                                }
+                                for (update_id, body) in edits {
+                                    failed_writes.push(FailedWrite::EditUpdate { update_id, body });
+                                }
+                                for (update_id, body) in new_replies {
+                                    failed_writes.push(FailedWrite::Reply { update_id, body });
+                                }
                                 publish(
                                     &slot,
                                     &wake,
@@ -168,10 +191,11 @@ impl Watcher {
                                         replies: HashMap::new(),
                                         search_query: search_query.clone(),
                                         search_hits: vec![],
-                                        pages: vec![],
+                                        pages: None,
                                         agent_apps: vec![],
                                         error: Some(e.to_string()),
                                         mutation_error,
+                                        failed_writes,
                                     },
                                 );
                                 std::thread::sleep(Duration::from_secs(2));
@@ -188,6 +212,7 @@ impl Watcher {
                     for (id, brief) in briefs {
                         if let Err(e) = s.set_project_brief(id, brief.as_deref()) {
                             mutation_error = Some(format!("Brief update failed: {e}"));
+                            failed_writes.push(FailedWrite::Brief { project_id: id, body: brief });
                         }
                     }
                     for (id, archived) in archives {
@@ -211,9 +236,16 @@ impl Watcher {
                             }
                         }
                     }
+                    for (id, dismissed) in dismissals {
+                        let res = if dismissed { s.dismiss_attention(id) } else { s.undismiss_attention(id) };
+                        if let Err(e) = res {
+                            mutation_error = Some(format!("Dismiss failed: {e}"));
+                        }
+                    }
                     for (id, body) in edits {
                         if let Err(e) = s.edit_update(id, &body) {
                             mutation_error = Some(format!("Edit failed: {e}"));
+                            failed_writes.push(FailedWrite::EditUpdate { update_id: id, body });
                         }
                     }
                     for id in deletes {
@@ -224,6 +256,7 @@ impl Watcher {
                     for (update_id, body) in new_replies {
                         if let Err(e) = s.add_reply(update_id, "You", true, &body) {
                             mutation_error = Some(format!("Reply failed: {e}"));
+                            failed_writes.push(FailedWrite::Reply { update_id, body });
                         }
                     }
                     for op in todo_ops {
@@ -261,6 +294,8 @@ impl Watcher {
                     }
                     seen = version;
                     dirty = false;
+                    let nb_stamp = s.notebook_stamp().ok();
+                    let need_pages = nb_stamp.is_none() || nb_stamp != last_notebook_stamp;
                     let loaded = s.projects().and_then(|projects| {
                         let (feed, todos) = match want.project {
                             Some(id) => (s.feed(id, want.limit, None)?, s.todos(id)?),
@@ -277,17 +312,21 @@ impl Watcher {
                         for r in flat_replies {
                             replies.entry(r.update_id).or_default().push(r);
                         }
-                        let pages = s.pages(&PageFilter { include_archived: true, ..PageFilter::default() })?;
+                        let pages =
+                            if need_pages { Some(s.pages(&PageFilter { include_archived: true, ..PageFilter::default() })?) } else { None };
                         Ok((projects, feed, todos, timeline, replies, search_hits, pages))
                     });
                     let snapshot = match loaded {
                         Ok((projects, feed, todos, timeline, replies, search_hits, pages)) => {
+                            if pages.is_some() {
+                                last_notebook_stamp = nb_stamp;
+                            }
                             next_pulse_expiry = projects.iter().filter_map(|p| p.active_pulse.as_ref().map(|pu| pu.expires_at)).min();
                             let agents = projects
                                 .iter()
                                 .filter_map(|p| p.last_agent.clone())
                                 .chain(feed.iter().chain(&timeline).chain(&search_hits).map(|u| u.agent.clone()))
-                                .chain(pages.iter().map(|pg| pg.agent.clone()));
+                                .chain(pages.iter().flatten().map(|pg| pg.agent.clone()));
                             for agent in agents {
                                 apps.entry(agent.clone()).or_insert_with(|| {
                                     if crate::agents::has_logo(&agent) {
@@ -311,6 +350,7 @@ impl Watcher {
                                 agent_apps,
                                 error: None,
                                 mutation_error,
+                                failed_writes,
                             }
                         }
                         Err(e) => {
@@ -325,10 +365,11 @@ impl Watcher {
                                 replies: HashMap::new(),
                                 search_query: search_query.clone(),
                                 search_hits: vec![],
-                                pages: vec![],
+                                pages: None,
                                 agent_apps: vec![],
                                 error: Some(e.to_string()),
                                 mutation_error,
+                                failed_writes,
                             }
                         }
                     };
@@ -370,6 +411,14 @@ impl Watcher {
 
     pub fn mark_all_seen(&self) {
         self.tx.send(Msg::MarkAllSeen).ok();
+    }
+
+    pub fn dismiss_attention(&self, update_id: i64) {
+        self.tx.send(Msg::SetAttentionDismissed(update_id, true)).ok();
+    }
+
+    pub fn undismiss_attention(&self, update_id: i64) {
+        self.tx.send(Msg::SetAttentionDismissed(update_id, false)).ok();
     }
 
     pub fn edit_update(&self, id: i64, body: String) {

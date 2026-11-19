@@ -4,13 +4,14 @@
 //! the agent's project folder for stdio servers. The agent defaults to the client's own name from
 //! `initialize` (`claude-code` shows as "Claude Code").
 
+use std::cell::{Ref, RefCell};
 use std::collections::HashMap;
 use std::io::{BufRead, Write};
 use std::path::{Path, PathBuf};
 
 use feeder_core::{
-    FeedUpdate, GUIDE, MAX_CHARS, MAX_PARAGRAPHS, NOTEBOOK_GUIDE, NewUpdate, Project, Reply, Store, agent_display_name, agent_from_env,
-    ago, detect_git_meta, detect_project, now_ms, parse_attention,
+    FeedUpdate, GUIDE, MAX_CHARS, MAX_PARAGRAPHS, NOTEBOOK_GUIDE, NewUpdate, PageFilter, Project, Reply, Store, agent_display_name,
+    agent_from_env, ago, detect_git_meta, detect_project, now_ms, parse_attention,
 };
 use serde_json::{Value, json};
 
@@ -21,11 +22,13 @@ mod notebook;
 const PROTOCOL_VERSIONS: [&str; 4] = ["2025-11-25", "2025-06-18", "2025-03-26", "2024-11-05"];
 const MAX_INLINE_SCREENSHOTS: usize = 3;
 const MAX_INLINE_SCREENSHOT_BYTES: u64 = 5 * 1024 * 1024;
+const MAX_RPC_LINE_BYTES: usize = 16 * 1024 * 1024;
 
 struct Server {
     client: Option<String>,
     cwd: PathBuf,
     store_dir: Option<PathBuf>,
+    store: RefCell<Option<Store>>,
 }
 
 struct ToolOutput {
@@ -46,21 +49,32 @@ impl ToolOutput {
 }
 
 pub fn serve() -> Result<(), String> {
-    let mut server = Server { client: None, cwd: std::env::current_dir().map_err(|e| e.to_string())?, store_dir: None };
+    let mut server = Server::new(None, std::env::current_dir().map_err(|e| e.to_string())?, None);
     let stdin = std::io::stdin();
+    let mut reader = stdin.lock();
     let mut stdout = std::io::stdout().lock();
-    for line in stdin.lock().lines() {
-        let line = line.map_err(|e| e.to_string())?;
-        if line.trim().is_empty() {
-            continue;
+    let mut buf = Vec::new();
+    loop {
+        buf.clear();
+        let n = read_line_capped(&mut reader, &mut buf, MAX_RPC_LINE_BYTES).map_err(|e| e.to_string())?;
+        if n == 0 {
+            break;
         }
-        let reply = match serde_json::from_str::<Value>(&line) {
-            Ok(Value::Array(batch)) => {
-                let replies: Vec<Value> = batch.iter().filter_map(|m| server.handle(m)).collect();
-                (!replies.is_empty()).then_some(Value::Array(replies))
+        let reply = if buf.len() > MAX_RPC_LINE_BYTES {
+            Some(error(Value::Null, -32600, "request exceeds maximum size"))
+        } else {
+            let line = String::from_utf8_lossy(&buf);
+            if line.trim().is_empty() {
+                continue;
             }
-            Ok(msg) => server.handle(&msg),
-            Err(e) => Some(error(Value::Null, -32700, &format!("parse error: {e}"))),
+            match serde_json::from_str::<Value>(&line) {
+                Ok(Value::Array(batch)) => {
+                    let replies: Vec<Value> = batch.iter().filter_map(|m| server.handle(m)).collect();
+                    (!replies.is_empty()).then_some(Value::Array(replies))
+                }
+                Ok(msg) => server.handle(&msg),
+                Err(e) => Some(error(Value::Null, -32700, &format!("parse error: {e}"))),
+            }
         };
         if let Some(reply) = reply {
             writeln!(stdout, "{reply}").map_err(|e| e.to_string())?;
@@ -70,13 +84,44 @@ pub fn serve() -> Result<(), String> {
     Ok(())
 }
 
-impl Server {
-    fn open_store(&self) -> Result<Store, String> {
-        match &self.store_dir {
-            Some(dir) => Store::open(dir),
-            None => Store::open_default(),
+fn read_line_capped<R: BufRead>(reader: &mut R, out: &mut Vec<u8>, max_bytes: usize) -> std::io::Result<usize> {
+    let mut total = 0usize;
+    loop {
+        let available = reader.fill_buf()?;
+        if available.is_empty() {
+            return Ok(total);
         }
-        .map_err(|e| e.to_string())
+        let (consume, done) = match available.iter().position(|&b| b == b'\n') {
+            Some(pos) => (pos + 1, true),
+            None => (available.len(), false),
+        };
+        if out.len() <= max_bytes {
+            let keep = consume.min(max_bytes + 1 - out.len());
+            out.extend_from_slice(&available[..keep]);
+        }
+        reader.consume(consume);
+        total += consume;
+        if done {
+            return Ok(total);
+        }
+    }
+}
+
+impl Server {
+    fn new(client: Option<String>, cwd: PathBuf, store_dir: Option<PathBuf>) -> Self {
+        Self { client, cwd, store_dir, store: RefCell::new(None) }
+    }
+
+    fn open_store(&self) -> Result<Ref<'_, Store>, String> {
+        if self.store.borrow().is_none() {
+            let opened = match &self.store_dir {
+                Some(dir) => Store::open(dir),
+                None => Store::open_default(),
+            }
+            .map_err(|e| e.to_string())?;
+            *self.store.borrow_mut() = Some(opened);
+        }
+        Ok(Ref::map(self.store.borrow(), |opt| opt.as_ref().expect("store initialized")))
     }
 
     fn resolve_agent(&self, args: &Value) -> String {
@@ -104,6 +149,11 @@ impl Server {
                     "uriTemplate": "feeder://project/{slug}/feed",
                     "name": "Project feed",
                     "description": "Latest updates for a Feeder project in Markdown.",
+                    "mimeType": "text/markdown"
+                }, {
+                    "uriTemplate": "feeder://notebook/{id}",
+                    "name": "Notebook page",
+                    "description": "A single Feeder notebook lesson in Markdown.",
                     "mimeType": "text/markdown"
                 }]
             })),
@@ -165,6 +215,7 @@ impl Server {
             "list_projects" => self.list_projects(&args),
             "reply_to_update" => self.reply_to_update(&args),
             "get_pending_decisions" => self.get_pending_decisions(&args),
+            "dismiss_attention" => self.dismiss_attention(&args),
             "mark_replies_read" => self.mark_replies_read(&args),
             "set_project_brief" => self.set_project_brief(&args),
             "pulse" => self.pulse(&args),
@@ -190,12 +241,20 @@ impl Server {
     fn resources_list(&self) -> Result<Value, String> {
         let store = self.open_store()?;
         let projects = store.projects().map_err(|e| e.to_string())?;
-        let mut resources = vec![json!({
-            "uri": "feeder://projects",
-            "name": "Projects",
-            "description": "All Feeder projects with update counts, attention status, active pulses, and last activity (JSON).",
-            "mimeType": "application/json"
-        })];
+        let mut resources = vec![
+            json!({
+                "uri": "feeder://projects",
+                "name": "Projects",
+                "description": "All Feeder projects with update counts, attention status, active pulses, and last activity (JSON).",
+                "mimeType": "application/json"
+            }),
+            json!({
+                "uri": "feeder://notebook",
+                "name": "Notebook",
+                "description": "Shared index of current Feeder notebook lessons across all projects (Markdown).",
+                "mimeType": "text/markdown"
+            }),
+        ];
         for sum in projects {
             if sum.project.archived {
                 continue;
@@ -243,6 +302,24 @@ impl Server {
                 .collect();
             let text = serde_json::to_string_pretty(&list).map_err(|e| (-32603, e.to_string()))?;
             return Ok(json!({ "contents": [{ "uri": uri, "mimeType": "application/json", "text": text }] }));
+        }
+        if uri == "feeder://notebook" {
+            let pages = store.pages(&PageFilter::default()).map_err(|e| (-32603, e.to_string()))?;
+            let mut md = String::from("# Feeder Notebook\n");
+            if pages.is_empty() {
+                md.push_str("\nNo notebook pages yet.\n");
+            } else {
+                for p in &pages {
+                    md.push_str(&format!("\n- {}\n", p.summary_line()));
+                }
+            }
+            return Ok(json!({ "contents": [{ "uri": uri, "mimeType": "text/markdown", "text": md }] }));
+        }
+        if let Some(id_str) = uri.strip_prefix("feeder://notebook/") {
+            let id = id_str.parse::<i64>().map_err(|_| (-32002, format!("resource not found: {uri}")))?;
+            let page = store.page(id).map_err(|e| (-32603, e.to_string()))?.ok_or((-32002, format!("notebook page not found: {id}")))?;
+            let md = page.to_markdown(crate::notebook::project_name(&store, &page).as_deref(), now_ms());
+            return Ok(json!({ "contents": [{ "uri": uri, "mimeType": "text/markdown", "text": md }] }));
         }
         if let Some(rest) = uri.strip_prefix("feeder://project/")
             && let Some(slug) = rest.strip_suffix("/feed")
@@ -362,11 +439,19 @@ impl Server {
             store.mark_replies_read(&rids).map_err(|e| e.to_string())?;
         }
         let now = now_ms();
+        let needs_you = feed.first().is_some_and(|u| {
+            u.attention_dismissed_at.is_none()
+                && parse_attention(&u.body).is_some()
+                && !replies.iter().any(|r| r.update_id == u.id && r.from_human)
+        });
         let mut text = if feed.is_empty() {
             format!("{} has no updates yet.", project.name)
         } else {
             format!("Latest {} update(s) for {}, newest first:", feed.len(), project.name)
         };
+        if needs_you && let Some(latest) = feed.first() {
+            text.push_str(&format!("\n\nStatus: Needs you (open attention on update #{}).", latest.id));
+        }
         if let Some(brief) = &project.brief {
             text.push_str(&format!("\n\nPinned brief:\n{brief}"));
         }
@@ -402,6 +487,7 @@ impl Server {
             text,
             data: json!({
                 "project": project_json(&project),
+                "needs_you": needs_you,
                 "todos": todos_json,
                 "updates": updates,
                 "unread_replies": unread_json,
@@ -535,18 +621,9 @@ impl Server {
         let names: HashMap<i64, String> = summaries.iter().map(|s| (s.project.id, s.project.name.clone())).collect();
         let needs_you: Vec<_> =
             summaries.into_iter().filter(|s| !s.project.archived && s.needs_you && pid.is_none_or(|id| s.project.id == id)).collect();
-        let mut flagged_updates = Vec::new();
-        for s in &needs_you {
-            if let Ok(feed) = store.feed(s.project.id, 1, None)
-                && let Some(u) = feed.into_iter().next()
-                && parse_attention(&u.body).is_some()
-            {
-                flagged_updates.push((s.project.name.clone(), u));
-            }
-        }
         let now = now_ms();
         let mut text = String::new();
-        if unread.is_empty() && flagged_updates.is_empty() {
+        if unread.is_empty() && needs_you.is_empty() {
             text.push_str("No pending decisions or unread replies.");
         } else {
             if !unread.is_empty() {
@@ -562,13 +639,16 @@ impl Server {
                     ));
                 }
             }
-            if !flagged_updates.is_empty() {
+            if !needs_you.is_empty() {
                 if !text.is_empty() {
                     text.push_str("\n\n");
                 }
-                text.push_str(&format!("Open Decision/Blocked cards ({}):", flagged_updates.len()));
-                for (pname, u) in &flagged_updates {
-                    text.push_str(&format!("\n- {pname} #{} ({}): {}", u.id, ago(u.created_at, now), u.body));
+                text.push_str(&format!("Open Decision/Blocked cards ({}):", needs_you.len()));
+                for s in &needs_you {
+                    let uid = s.last_update_id.unwrap_or(0);
+                    let when = s.last_at.map(|t| ago(t, now)).unwrap_or_else(|| "recently".into());
+                    let body = s.last_body.as_deref().unwrap_or("");
+                    text.push_str(&format!("\n- {} #{uid} ({when}): {body}", s.project.name));
                 }
             }
         }
@@ -580,15 +660,41 @@ impl Server {
                 v
             })
             .collect();
-        let flagged_json: Vec<_> = flagged_updates
+        let flagged_json: Vec<_> = needs_you
             .iter()
-            .map(|(pname, u)| {
-                let mut v = update_json(u);
-                v["project"] = json!(pname);
-                v
+            .filter_map(|s| {
+                let id = s.last_update_id?;
+                let body = s.last_body.as_deref()?;
+                let created_at = s.last_at?;
+                Some(json!({
+                    "id": id,
+                    "project_id": s.project.id,
+                    "project": s.project.name,
+                    "agent": s.last_agent,
+                    "body": body,
+                    "created_at": created_at,
+                }))
             })
             .collect();
         Ok(ToolOutput::text(text, json!({ "unread_replies": unread_json, "needs_you_updates": flagged_json })))
+    }
+
+    fn dismiss_attention(&self, args: &Value) -> Result<ToolOutput, String> {
+        let store = self.open_store()?;
+        if let Some(id) = args.get("id").and_then(Value::as_i64) {
+            store.dismiss_attention(id).map_err(|e| e.to_string())?;
+            return Ok(ToolOutput::text(format!("Dismissed Needs you on update #{id}."), json!({ "dismissed_id": id })));
+        }
+        let Some(project) = self.project(&store, args, false)? else {
+            return Err("no matching project found; pass `id` or a valid `project`/`project_path`".into());
+        };
+        let dismissed = store.dismiss_project_attention(project.id).map_err(|e| e.to_string())?;
+        let text = if dismissed {
+            format!("Dismissed Needs you for {}.", project.name)
+        } else {
+            format!("{} has no updates to dismiss.", project.name)
+        };
+        Ok(ToolOutput::text(text, json!({ "project": project_json(&project), "dismissed": dismissed })))
     }
 
     fn mark_replies_read(&self, args: &Value) -> Result<ToolOutput, String> {
@@ -883,7 +989,7 @@ fn tools() -> Value {
         {
             "name": "get_feed",
             "title": "Read a project's feed",
-            "description": "Read the latest updates, pinned brief, optional to-dos, and any unread human replies in this project's Feeder feed, newest first.",
+            "description": "Read the latest updates, pinned brief, optional to-dos, open attention status, and any unread human replies in this project's Feeder feed, newest first.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -893,8 +999,7 @@ fn tools() -> Value {
                     "include_screenshots": { "type": "boolean", "description": "When true, include up to 3 attached screenshots as base64 image blocks." },
                     "mark_replies_read": { "type": "boolean", "description": "When true, mark returned unread human replies for this project as read." }
                 }
-            },
-            "annotations": { "readOnlyHint": true }
+            }
         },
         {
             "name": "get_recent_activity",
@@ -962,8 +1067,21 @@ fn tools() -> Value {
                     "project_path": project_path,
                     "mark_read": { "type": "boolean", "description": "When true, mark the returned unread human replies as read." }
                 }
+            }
+        },
+        {
+            "name": "dismiss_attention",
+            "title": "Dismiss an open Needs you flag",
+            "description": "Clear an open `Needs you` badge on a specific update id or on the latest update for a project without posting a reply.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "id": { "type": "integer", "description": "Specific update id to dismiss. Omit to dismiss the project's latest update." },
+                    "project": project,
+                    "project_path": project_path
+                }
             },
-            "annotations": { "readOnlyHint": true }
+            "annotations": { "idempotentHint": true }
         },
         {
             "name": "mark_replies_read",
@@ -1094,7 +1212,7 @@ mod tests {
         let shot = work_dir.join("shot.png");
         std::fs::write(&shot, [0x89, b'P', b'N', b'G', 0x0d, 0x0a, 0x1a, 0x0a, 1, 2, 3]).unwrap();
 
-        let mut server = Server { client: None, cwd: work_dir.clone(), store_dir: Some(store_dir.clone()) };
+        let mut server = Server::new(None, work_dir.clone(), Some(store_dir.clone()));
         let init = server
             .handle(&json!({
                 "jsonrpc": "2.0",
@@ -1198,7 +1316,7 @@ mod tests {
     fn mcp_replies_brief_and_pulse_roundtrip() {
         let store_dir = temp_dir("store2");
         let work_dir = temp_dir("work2");
-        let mut server = Server { client: Some("codex".into()), cwd: work_dir.clone(), store_dir: Some(store_dir.clone()) };
+        let mut server = Server::new(Some("codex".into()), work_dir.clone(), Some(store_dir.clone()));
 
         let brief = server
             .handle(&json!({
@@ -1293,7 +1411,7 @@ mod tests {
     fn mcp_todos_roundtrip_and_feed_integration() {
         let store_dir = temp_dir("store-todos");
         let work_dir = temp_dir("work-todos");
-        let mut server = Server { client: Some("codex".into()), cwd: work_dir.clone(), store_dir: Some(store_dir.clone()) };
+        let mut server = Server::new(Some("codex".into()), work_dir.clone(), Some(store_dir.clone()));
 
         let added1 = server
             .handle(&json!({
@@ -1382,6 +1500,103 @@ mod tests {
             }))
             .unwrap();
         assert_eq!(deleted.pointer("/result/structuredContent/deleted"), Some(&json!(tid1)));
+
+        let _ = std::fs::remove_dir_all(store_dir);
+        let _ = std::fs::remove_dir_all(work_dir);
+    }
+
+    #[test]
+    fn mcp_dismiss_attention_and_notebook_resources() {
+        let store_dir = temp_dir("store-dismiss-nb");
+        let work_dir = temp_dir("work-dismiss-nb");
+        let mut server = Server::new(Some("codex".into()), work_dir.clone(), Some(store_dir.clone()));
+
+        let posted = server
+            .handle(&json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "tools/call",
+                "params": {
+                    "name": "post_update",
+                    "arguments": { "project": "Delta", "summary": "Done: built API.\n\nDecision needed: keep v1?" }
+                }
+            }))
+            .unwrap();
+        let uid = posted.pointer("/result/structuredContent/update/id").and_then(Value::as_i64).unwrap();
+
+        let feed_before = server
+            .handle(&json!({
+                "jsonrpc": "2.0",
+                "id": 2,
+                "method": "tools/call",
+                "params": { "name": "get_feed", "arguments": { "project": "Delta" } }
+            }))
+            .unwrap();
+        assert_eq!(feed_before.pointer("/result/structuredContent/needs_you"), Some(&json!(true)));
+
+        let dismissed = server
+            .handle(&json!({
+                "jsonrpc": "2.0",
+                "id": 3,
+                "method": "tools/call",
+                "params": { "name": "dismiss_attention", "arguments": { "id": uid } }
+            }))
+            .unwrap();
+        assert_eq!(dismissed.pointer("/result/isError"), Some(&json!(false)));
+
+        let feed_after = server
+            .handle(&json!({
+                "jsonrpc": "2.0",
+                "id": 4,
+                "method": "tools/call",
+                "params": { "name": "get_feed", "arguments": { "project": "Delta" } }
+            }))
+            .unwrap();
+        assert_eq!(feed_after.pointer("/result/structuredContent/needs_you"), Some(&json!(false)));
+
+        let wrote = server
+            .handle(&json!({
+                "jsonrpc": "2.0",
+                "id": 5,
+                "method": "tools/call",
+                "params": {
+                    "name": "write_page",
+                    "arguments": {
+                        "kind": "fix",
+                        "topic": "data",
+                        "title": "SQLite WAL checkpoints need busy timeout",
+                        "tags": ["sqlite", "locks"],
+                        "what_happened": "Concurrent reads threw SQLITE_BUSY under write bursts.",
+                        "why": "Default busy_timeout was zero on the reader connection.",
+                        "do_this": "Set PRAGMA busy_timeout = 3000 on every connection."
+                    }
+                }
+            }))
+            .unwrap();
+        assert_eq!(wrote.pointer("/result/isError"), Some(&json!(false)));
+        let pid = wrote.pointer("/result/structuredContent/id").and_then(Value::as_i64).unwrap();
+
+        let index = server
+            .handle(&json!({
+                "jsonrpc": "2.0",
+                "id": 6,
+                "method": "resources/read",
+                "params": { "uri": "feeder://notebook" }
+            }))
+            .unwrap();
+        let index_md = index.pointer("/result/contents/0/text").and_then(Value::as_str).unwrap();
+        assert!(index_md.contains("SQLite WAL checkpoints need busy timeout"));
+
+        let page_res = server
+            .handle(&json!({
+                "jsonrpc": "2.0",
+                "id": 7,
+                "method": "resources/read",
+                "params": { "uri": format!("feeder://notebook/{pid}") }
+            }))
+            .unwrap();
+        let page_md = page_res.pointer("/result/contents/0/text").and_then(Value::as_str).unwrap();
+        assert!(page_md.contains("PRAGMA busy_timeout = 3000"));
 
         let _ = std::fs::remove_dir_all(store_dir);
         let _ = std::fs::remove_dir_all(work_dir);

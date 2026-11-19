@@ -20,7 +20,7 @@ pub use detect::{
 pub use guide::{GUIDE, NOTEBOOK_GUIDE, notebook_skill_markdown, skill_markdown};
 pub use notebook::{
     CANONICAL_TOPICS, CONTEXT_CHARS, Kind, MAX_CAUSE_CHARS, OnSimilar, Page, PageDraft, PageFilter, RULE_CHARS, Standing, TAG_COUNT,
-    TITLE_CHARS, TOPIC_MAX_CHARS, TagCount, TopicSpec, TopicSummary, infer_topic, normalize_tags, normalize_topic, tag_counts,
+    TITLE_CHARS, TOPIC_MAX_CHARS, TagCount, TopicSpec, TopicSummary, infer_topic, normalize_tags, normalize_topic, secret_in, tag_counts,
     topic_counts, topic_label,
 };
 pub use orb::{Orb, Pattern};

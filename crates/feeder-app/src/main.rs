@@ -87,6 +87,7 @@ pub enum FeedFilter {
 pub enum ToastKind {
     Info,
     UndoArchive { project_id: i64, was_archived: bool },
+    UndoDismiss { update_id: i64 },
     Error,
 }
 
@@ -95,6 +96,16 @@ pub struct ToastItem {
     pub title: String,
     pub description: Option<String>,
     pub kind: ToastKind,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CopyTarget {
+    McpConfig,
+    ProjectContext,
+    LightboxImage,
+    Update(i64),
+    Reply(i64),
+    NotebookPage(i64),
 }
 
 pub struct State {
@@ -125,6 +136,8 @@ pub struct State {
     pub feed_selected: Option<i64>,
     pub timeline_selected: Option<i64>,
     pub branch_filter: Option<String>,
+    pub project_search_open: bool,
+    pub project_search: TextEdit,
     pub project_gallery: bool,
     pub now: i64,
     pub clock: f64,
@@ -170,7 +183,6 @@ pub struct State {
     pub lightbox_compare: Option<i64>,
     /// Split fraction `0.02..=0.98` for Before/After compare divider.
     pub lightbox_split: f32,
-    pub image_copied_at: Option<i64>,
     /// Quick Jump (`⌘K`) command palette state.
     pub palette_open: bool,
     pub palette_query: TextEdit,
@@ -185,15 +197,12 @@ pub struct State {
     pub search_hits: Vec<FeedUpdate>,
     /// Update id awaiting delete confirmation.
     pub delete_confirm: Option<i64>,
-    /// `(update_id, copied_at_ms)` for per-card "Copied" feedback.
-    pub update_copied: Option<(i64, i64)>,
-    /// When the MCP command was last copied, for the button's "Copied".
-    pub copied_at: Option<i64>,
-    /// When project handoff context was last copied, for the button's "Copied".
-    pub context_copied_at: Option<i64>,
+    /// Unified `(target, copied_at_ms)` for transient "Copied" button labels.
+    pub copy_feedback: Option<(CopyTarget, i64)>,
     /// Bottom-right toast notifications (undo archive, copy image, watcher errors).
     pub toasts: ToastStack<ToastItem>,
     pub pending_url: Option<String>,
+    pub pending_scroll: Option<String>,
     last_badge: Option<usize>,
     watcher: Option<Watcher>,
     wake: Option<Waker>,
@@ -238,6 +247,8 @@ impl State {
             feed_selected: None,
             timeline_selected: None,
             branch_filter: None,
+            project_search_open: false,
+            project_search: TextEdit::new(""),
             project_gallery: false,
             now: now_ms(),
             clock: 0.0,
@@ -269,7 +280,6 @@ impl State {
             lightbox_zoom: ImageZoom::new(),
             lightbox_compare: None,
             lightbox_split: 0.5,
-            image_copied_at: None,
             palette_open: false,
             palette_query: TextEdit::new(""),
             palette_index: 0,
@@ -280,11 +290,10 @@ impl State {
             search_snapshot_query: String::new(),
             search_hits: vec![],
             delete_confirm: None,
-            update_copied: None,
-            copied_at: None,
-            context_copied_at: None,
+            copy_feedback: None,
             toasts: ToastStack::default(),
             pending_url: None,
+            pending_scroll: None,
             last_badge: None,
             watcher: None,
             wake: None,
@@ -309,6 +318,7 @@ impl State {
             || self.replying_to.is_some()
             || self.palette_open
             || self.feed_search.focused
+            || self.project_search.focused
             || self.notebook.is_typing()
     }
 
@@ -324,6 +334,8 @@ impl State {
         self.palette_open = false;
         self.delete_confirm = None;
         self.branch_filter = None;
+        self.project_search_open = false;
+        self.project_search = TextEdit::new("");
         self.project_gallery = false;
         self.brief_editing = None;
         self.todo_open = None;
@@ -333,6 +345,7 @@ impl State {
         self.editing_update = None;
         self.replying_to = None;
         self.feed_selected = None;
+        self.pending_scroll = None;
         self.limit = PAGE;
         // Pre-seed synchronously from timeline updates so Frame 0 renders cards & cached shots
         // immediately without waiting on the Watcher background round-trip.
@@ -369,8 +382,11 @@ impl State {
         self.editing_update = None;
         self.replying_to = None;
         self.branch_filter = None;
+        self.project_search_open = false;
+        self.project_search = TextEdit::new("");
         self.project_gallery = false;
         self.feed_selected = None;
+        self.pending_scroll = None;
         self.close_lightbox();
         self.delete_confirm = None;
         self.ask();
@@ -381,7 +397,7 @@ impl State {
         self.lightbox_zoom.reset();
         self.lightbox_compare = None;
         self.lightbox_split = 0.5;
-        self.image_copied_at = None;
+        self.clear_copied(CopyTarget::LightboxImage);
         tx.focus_when_shown(rune_kit::image_zoom::KEY, false);
     }
 
@@ -389,7 +405,7 @@ impl State {
         self.lightbox = None;
         self.lightbox_zoom.reset();
         self.lightbox_compare = None;
-        self.image_copied_at = None;
+        self.clear_copied(CopyTarget::LightboxImage);
     }
 
     pub fn toggle_lightbox_compare(&mut self) {
@@ -660,9 +676,68 @@ impl State {
             created_at: now_ms(),
             read_at: None,
         });
+        if let Some(sum) = self.projects.iter_mut().find(|p| p.project.id == project_id && p.last_update_id == Some(uid)) {
+            sum.needs_you = false;
+        }
         if let Some(w) = &self.watcher {
             w.add_reply(uid, text);
         }
+    }
+
+    pub fn dismiss_attention(&mut self, uid: i64) {
+        let now = now_ms();
+        for u in self.feed.iter_mut().chain(&mut self.timeline).chain(&mut self.search_hits) {
+            if u.id == uid {
+                u.attention_dismissed_at = Some(now);
+            }
+        }
+        for sum in &mut self.projects {
+            if sum.last_update_id == Some(uid) {
+                sum.needs_you = false;
+            }
+        }
+        if let Some(w) = &self.watcher {
+            w.dismiss_attention(uid);
+        }
+        self.push_toast(
+            format!("dismiss-{uid}"),
+            ToastItem { title: "Dismissed Needs you".into(), description: None, kind: ToastKind::UndoDismiss { update_id: uid } },
+            Some(5.0),
+        );
+    }
+
+    pub fn undismiss_attention(&mut self, uid: i64) {
+        let mut has_attention = false;
+        for u in self.feed.iter_mut().chain(&mut self.timeline).chain(&mut self.search_hits) {
+            if u.id == uid {
+                u.attention_dismissed_at = None;
+                if parse_attention(&u.body).is_some() {
+                    has_attention = true;
+                }
+            }
+        }
+        let answered = self.has_human_reply(uid);
+        if !answered {
+            for sum in &mut self.projects {
+                if sum.last_update_id == Some(uid) && (has_attention || sum.last_body.as_deref().and_then(parse_attention).is_some()) {
+                    sum.needs_you = true;
+                }
+            }
+        }
+        if let Some(w) = &self.watcher {
+            w.undismiss_attention(uid);
+        }
+    }
+
+    pub fn has_human_reply(&self, uid: i64) -> bool {
+        self.replies.get(&uid).is_some_and(|rs| rs.iter().any(|r| r.from_human))
+    }
+
+    pub fn is_open_attention(&self, u: &FeedUpdate) -> bool {
+        u.attention_dismissed_at.is_none()
+            && parse_attention(&u.body).is_some()
+            && !self.has_human_reply(u.id)
+            && self.summary(u.project_id).is_some_and(|sum| sum.needs_you && sum.last_update_id == Some(u.id))
     }
 
     pub fn toggle_branch_filter(&mut self, branch: &str) {
@@ -854,20 +929,18 @@ impl State {
         self.toasts.step(ToastEvent::Dismissed { id: Some(id), now: self.clock });
     }
 
-    pub fn copied_recently(&self) -> bool {
-        self.copied_at.is_some_and(|t| now_ms() - t < 2_000)
+    pub fn mark_copied(&mut self, target: CopyTarget) {
+        self.copy_feedback = Some((target, now_ms()));
     }
 
-    pub fn context_copied_recently(&self) -> bool {
-        self.context_copied_at.is_some_and(|t| now_ms() - t < 2_000)
+    pub fn is_copied(&self, target: CopyTarget) -> bool {
+        self.copy_feedback.is_some_and(|(t, at)| t == target && now_ms() - at < 2_000)
     }
 
-    pub fn image_copied_recently(&self) -> bool {
-        self.image_copied_at.is_some_and(|t| now_ms() - t < 2_000)
-    }
-
-    pub fn update_copied_recently(&self, id: i64) -> bool {
-        self.update_copied.is_some_and(|(uid, at)| uid == id && now_ms() - at < 2_000)
+    pub fn clear_copied(&mut self, target: CopyTarget) {
+        if self.copy_feedback.is_some_and(|(t, _)| t == target) {
+            self.copy_feedback = None;
+        }
     }
 
     pub fn unseen_count(&self) -> usize {
@@ -898,7 +971,7 @@ impl State {
         let Some(rest) = url.strip_prefix("feeder://") else {
             return false;
         };
-        let rest = rest.trim_matches('/');
+        let rest = rest.split(['?', '#']).next().unwrap_or("").trim_matches('/');
         if rest == "home" {
             self.close_project();
             self.tab = Tab::Home;
@@ -909,14 +982,27 @@ impl State {
             self.tab = Tab::Feed;
             return true;
         }
+        if rest == "settings" {
+            self.menu_open = false;
+            self.orb_menu = None;
+            self.palette_open = false;
+            self.close_lightbox();
+            self.settings_open = true;
+            return true;
+        }
         if let Some(page) = rest.strip_prefix("notebook") {
             self.close_project();
             self.tab = Tab::Notebook;
             self.notebook.open = page.trim_start_matches('/').parse().ok();
             return true;
         }
-        if let Some(slug) = rest.strip_prefix("project/") {
-            let slug = slug.split(['/', '?', '#']).next().unwrap_or("");
+        if let Some(after) = rest.strip_prefix("project/") {
+            let mut segs = after.split('/').filter(|s| !s.is_empty());
+            let slug = segs.next().unwrap_or("");
+            let update_id = match (segs.next(), segs.next()) {
+                (Some("update"), Some(id)) => id.parse::<i64>().ok(),
+                _ => None,
+            };
             if !self.loaded {
                 self.pending_url = Some(url.to_string());
                 return true;
@@ -926,6 +1012,10 @@ impl State {
             {
                 let id = sum.project.id;
                 self.open_project(id);
+                if let Some(uid) = update_id {
+                    self.feed_selected = Some(uid);
+                    self.pending_scroll = Some(format!("u-{uid}"));
+                }
             } else {
                 self.push_toast(
                     "missing-project-url",
@@ -949,9 +1039,9 @@ impl State {
                 let sum = self.summary(u.project_id).filter(|sum| !sum.project.archived)?;
                 match self.feed_filter {
                     FeedFilter::All => {}
-                    FeedFilter::NeedsYou if !sum.needs_you || parse_attention(&u.body).is_none() => return None,
+                    FeedFilter::NeedsYou if !self.is_open_attention(u) => return None,
                     FeedFilter::NeedsYou => {}
-                    FeedFilter::Unread if !sum.unseen() => return None,
+                    FeedFilter::Unread if !sum.unseen() || !sum.project.seen_at.is_none_or(|seen| u.created_at > seen) => return None,
                     FeedFilter::Unread => {}
                     FeedFilter::Shots if u.screenshot.is_none() => return None,
                     FeedFilter::Shots => {}
@@ -1008,7 +1098,7 @@ impl State {
         self.lightbox = Some(ids[next]);
         self.lightbox_zoom.reset();
         self.lightbox_compare = None;
-        self.image_copied_at = None;
+        self.clear_copied(CopyTarget::LightboxImage);
     }
 
     pub fn dark(&self, system_dark: bool) -> bool {
@@ -1196,7 +1286,8 @@ fn poll(s: &mut State, clock: f64, tx: &mut Tx) -> bool {
             {
                 let project = snap.projects.iter().find(|p| p.project.id == newest.project_id).map(|p| &p.project);
                 let name = project.map_or("Feeder", |p| p.name.as_str());
-                let link = project.map_or_else(|| "feeder://feed".to_string(), |p| format!("feeder://project/{}", p.slug));
+                let link =
+                    project.map_or_else(|| "feeder://feed".to_string(), |p| format!("feeder://project/{}/update/{}", p.slug, newest.id));
                 #[cfg(target_os = "macos")]
                 notify::post(&format!("{name} · {}", newest.agent), &newest.body, &link);
             }
@@ -1207,9 +1298,11 @@ fn poll(s: &mut State, clock: f64, tx: &mut Tx) -> bool {
         s.projects = snap.projects;
         s.timeline = snap.timeline;
         s.timeline_limit = snap.timeline_limit;
-        s.notebook.set_pages(snap.pages);
-        if s.notebook.open.is_some_and(|id| s.notebook.page(id).is_none()) {
-            s.notebook.open = None; // deleted from another client
+        if let Some(pages) = snap.pages {
+            s.notebook.set_pages(pages);
+            if s.notebook.open.is_some_and(|id| s.notebook.page(id).is_none()) {
+                s.notebook.open = None; // deleted from another client
+            }
         }
         s.replies = snap.replies;
         s.search_snapshot_query = snap.search_query;
@@ -1222,6 +1315,37 @@ fn poll(s: &mut State, clock: f64, tx: &mut Tx) -> bool {
                 ToastItem { title: "Action failed".into(), description: Some(err), kind: ToastKind::Error },
                 Some(5.0),
             );
+        }
+        for failed in snap.failed_writes {
+            match failed {
+                watch::FailedWrite::Reply { update_id, body } => {
+                    if s.replying_to.is_none() {
+                        let mut edit = TextEdit::new(&body);
+                        edit.focused = true;
+                        s.reply_draft = edit;
+                        s.replying_to = Some(update_id);
+                        tx.focus_when_shown(format!("reply-input-{update_id}"), false);
+                    }
+                }
+                watch::FailedWrite::EditUpdate { update_id, body } => {
+                    if s.editing_update.is_none() {
+                        let mut edit = TextEdit::new(&body);
+                        edit.focused = true;
+                        s.edit_update_body = edit;
+                        s.editing_update = Some(update_id);
+                        tx.focus_when_shown(format!("edit-body-{update_id}"), false);
+                    }
+                }
+                watch::FailedWrite::Brief { project_id, body } => {
+                    if s.brief_editing.is_none() {
+                        let mut edit = TextEdit::new(body.as_deref().unwrap_or(""));
+                        edit.focused = true;
+                        s.brief_draft = edit;
+                        s.brief_editing = Some(project_id);
+                        tx.focus_when_shown("brief-input", false);
+                    }
+                }
+            }
         }
         if let Some(url) = s.pending_url.take() {
             s.open_feeder_url(&url);
@@ -1260,6 +1384,14 @@ fn poll(s: &mut State, clock: f64, tx: &mut Tx) -> bool {
         changed = true;
     }
 
+    if s.open.is_some()
+        && s.feed_for == s.open
+        && s.pending_scroll.as_deref().is_some_and(|target| s.feed.iter().any(|u| format!("u-{}", u.id) == target))
+        && let Some(target) = s.pending_scroll.take()
+    {
+        tx.scroll_into_view(target);
+    }
+
     let unseen = s.unseen_count();
     if s.loaded
         && s.last_badge != Some(unseen)
@@ -1287,34 +1419,18 @@ fn poll(s: &mut State, clock: f64, tx: &mut Tx) -> bool {
         s.shots_ready = ready;
         changed = true;
     }
-    if s.copied_at.is_some() && !s.copied_recently() {
-        s.copied_at = None;
-        changed = true;
-    } else if s.copied_at.is_some() {
-        tx.wake_after(Duration::from_millis(2_100));
-    }
-    if s.context_copied_at.is_some() && !s.context_copied_recently() {
-        s.context_copied_at = None;
-        changed = true;
-    } else if s.context_copied_at.is_some() {
-        tx.wake_after(Duration::from_millis(2_100));
-    }
-    if s.image_copied_at.is_some() && !s.image_copied_recently() {
-        s.image_copied_at = None;
-        changed = true;
-    } else if s.image_copied_at.is_some() {
-        tx.wake_after(Duration::from_millis(2_100));
-    }
-    if let Some((uid, _)) = s.update_copied {
-        if !s.update_copied_recently(uid) {
-            s.update_copied = None;
+    let now = now_ms();
+    if let Some((_, copied_at)) = s.copy_feedback {
+        let elapsed = now.saturating_sub(copied_at);
+        if elapsed >= 2_000 {
+            s.copy_feedback = None;
             changed = true;
         } else {
-            tx.wake_after(Duration::from_millis(2_100));
+            let remaining = u64::try_from((2_000 - elapsed).max(50)).unwrap_or(2_000);
+            tx.wake_after(Duration::from_millis(remaining + 50));
         }
     }
     // Keep "2m ago" honest.
-    let now = now_ms();
     if now - s.now >= 30_000 {
         s.now = now;
         changed = true;
@@ -1409,6 +1525,7 @@ mod tests {
                 brief: None,
             },
             updates: 1,
+            last_update_id: Some(99),
             last_at: Some(2_000),
             last_agent: Some("Codex".into()),
             last_body: Some("Changed: hello".into()),
@@ -1432,6 +1549,7 @@ mod tests {
             diff_stat: Some("1 file changed, +4 -1".into()),
             commit_sha: Some("abc1234".into()),
             created_at: 1_500,
+            attention_dismissed_at: None,
         }
     }
 
@@ -1446,12 +1564,17 @@ mod tests {
         assert_eq!(s.tab, Tab::Feed);
         assert_eq!(s.open, None);
 
+        assert!(s.open_feeder_url("feeder://settings"));
+        assert!(s.settings_open);
+
         assert!(s.open_feeder_url("feeder://notebook/3"));
         assert_eq!(s.tab, Tab::Notebook);
         assert_eq!(s.notebook.open, Some(3));
 
-        assert!(s.open_feeder_url("feeder://project/alpha"));
+        assert!(s.open_feeder_url("feeder://project/alpha/update/42"));
         assert_eq!(s.open, Some(7));
+        assert_eq!(s.feed_selected, Some(42));
+        assert_eq!(s.pending_scroll.as_deref(), Some("u-42"));
 
         assert!(s.open_feeder_url("feeder://home"));
         assert_eq!(s.tab, Tab::Home);
@@ -1491,21 +1614,55 @@ mod tests {
         let mut s = State::new();
         let mut sum = sample_summary(1, "alpha", "Alpha");
         sum.needs_you = true;
+        sum.last_update_id = Some(99);
         s.projects.push(sum);
         s.feed_search = TextEdit::new("fts5");
         s.search_snapshot_query = "fts5".into();
         s.search_hits.push(sample_update(99, 1, "Done: fixed search.\n\nDecision needed: keep legacy?"));
+        // Older decision card should NOT show up under NeedsYou.
+        s.search_hits.push(sample_update(50, 1, "Done: earlier.\n\nDecision needed: old question?"));
         let visible = s.filtered_timeline();
-        assert_eq!(visible.len(), 1);
-        assert_eq!(visible[0].0.id, 99);
+        assert_eq!(visible.len(), 2);
 
         s.feed_filter = FeedFilter::NeedsYou;
-        assert_eq!(s.filtered_timeline().len(), 1);
+        let needs = s.filtered_timeline();
+        assert_eq!(needs.len(), 1);
+        assert_eq!(needs[0].0.id, 99);
 
         s.toggle_branch_filter("feat/other");
         assert!(s.filtered_timeline().is_empty());
         s.toggle_branch_filter("feat/search");
         assert_eq!(s.filtered_timeline().len(), 1);
+
+        // Dismissing clears NeedsYou optimistically and pushes an Undo toast.
+        s.dismiss_attention(99);
+        assert!(!s.projects[0].needs_you);
+        assert!(s.filtered_timeline().is_empty());
+        assert_eq!(s.toasts.front().unwrap().options.kind, ToastKind::UndoDismiss { update_id: 99 });
+
+        // Undoing restores NeedsYou cleanly.
+        s.undismiss_attention(99);
+        assert!(s.projects[0].needs_you);
+        assert_eq!(s.filtered_timeline().len(), 1);
+    }
+
+    #[test]
+    fn unread_filter_hides_updates_at_or_before_seen_at() {
+        let mut s = State::new();
+        let mut sum = sample_summary(1, "alpha", "Alpha");
+        sum.project.seen_at = Some(1_500);
+        sum.last_at = Some(2_000);
+        s.projects.push(sum);
+        let mut newer = sample_update(10, 1, "Done: new.");
+        newer.created_at = 2_000;
+        let mut older = sample_update(9, 1, "Done: already read.");
+        older.created_at = 1_500;
+        s.timeline = vec![newer, older];
+
+        s.feed_filter = FeedFilter::Unread;
+        let unread = s.filtered_timeline();
+        assert_eq!(unread.len(), 1);
+        assert_eq!(unread[0].0.id, 10);
     }
 
     #[test]

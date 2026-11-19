@@ -4,9 +4,7 @@
 
 use std::collections::HashMap;
 
-use feeder_core::{
-    CANONICAL_TOPICS, Kind, Page, PageDraft, Standing, ago, infer_topic, normalize_topic, now_ms, topic_counts, topic_label,
-};
+use feeder_core::{CANONICAL_TOPICS, Kind, Page, PageDraft, Standing, ago, infer_topic, normalize_topic, topic_counts, topic_label};
 use rune::{
     Color, Cursor, El, Icon, Key, KeyEvent, Link, LinkPaint, ScrollSpec, TextEdit, Transition, Tx, col, el, icon, oklch, row, text,
 };
@@ -19,7 +17,7 @@ use rune_kit::{
 
 use crate::style::{self, Palette};
 use crate::watch::NotebookOp;
-use crate::{State, ToastItem, ToastKind, agents, chrome, feed, orb};
+use crate::{CopyTarget, State, ToastItem, ToastKind, agents, chrome, feed, orb};
 
 /// Keeps index rows and document prose comfortably scannable.
 /// How far a list row's hover surface reaches past the text column on each side.
@@ -77,8 +75,6 @@ pub struct Notebook {
     pub editor: Option<Editor>,
     pub delete_confirm: Option<i64>,
     pub action_menu_open: bool,
-    /// `(page id, when)` for the Copy button's "Copied" feedback.
-    pub copied: Option<(i64, i64)>,
     /// Opens the first current page once snapshots arrive (used by `--scene notebook-page`).
     pub auto_open_first: bool,
 }
@@ -96,7 +92,6 @@ impl Default for Notebook {
             editor: None,
             delete_confirm: None,
             action_menu_open: false,
-            copied: None,
             auto_open_first: false,
         }
     }
@@ -787,7 +782,7 @@ fn page_view(s: &State, page: &Page, p: &Palette, k: &Kit, layer: &mut Vec<El>) 
     let md = feed::markdown_style(p, k).body_font(style::PROSE);
     let project = page.project_id.and_then(|pid| s.summary(pid)).map(|sum| sum.project.name.clone());
     let markdown = page.to_markdown(project.as_deref(), s.now);
-    let copied = s.notebook.copied.is_some_and(|(pid, at)| pid == id && now_ms() - at < 2_000);
+    let copied = s.is_copied(CopyTarget::NotebookPage(id));
 
     let back_a11y = if page.is_archived() { "Back to Archived".to_string() } else { format!("Back to {}", topic_label(&page.topic)) };
     let back_shelf = if page.is_archived() { Shelf::Archived } else { Shelf::Topic(page.topic.clone()) };
@@ -798,7 +793,7 @@ fn page_view(s: &State, page: &Page, p: &Palette, k: &Kit, layer: &mut Vec<El>) 
         .help("Copy page as Markdown")
         .on_press_tx(move |s: &mut State, tx: &mut Tx| {
             tx.copy(markdown.clone());
-            s.notebook.copied = Some((id, now_ms()));
+            s.mark_copied(CopyTarget::NotebookPage(id));
         })
         .build(k)
         .key("nb-copy");

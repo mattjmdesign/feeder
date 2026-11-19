@@ -40,7 +40,12 @@ pub fn on_key(s: &mut State, e: &KeyEvent, tx: &mut Tx) -> bool {
         s.palette_open = false;
         s.close_lightbox();
         s.settings_open = false;
-        s.open = None;
+        if s.open.is_some() {
+            s.project_search_open = true;
+            s.project_search.focused = true;
+            tx.focus_when_shown("project-search", false);
+            return true;
+        }
         s.tab = Tab::Feed;
         s.feed_search.focused = true;
         tx.focus_when_shown("feed-search", false);
@@ -159,6 +164,15 @@ pub fn on_key(s: &mut State, e: &KeyEvent, tx: &mut Tx) -> bool {
     }
     if matches!(e.key, Key::Escape) && s.editing.is_some() {
         s.cancel_rename();
+        return true;
+    }
+    if matches!(e.key, Key::Escape) && s.open.is_some() && (s.project_search_open || !s.project_search.text.is_empty()) {
+        if !s.project_search.text.is_empty() {
+            s.project_search.text.clear();
+        } else {
+            s.project_search_open = false;
+            s.project_search.focused = false;
+        }
         return true;
     }
     if matches!(e.key, Key::Escape) && s.open.is_some() {

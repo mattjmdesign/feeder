@@ -63,7 +63,7 @@ export default function ReplyDemo() {
             <span className="rd-spacer" />
             <span className="demo-fade">
               <Badge tone="warning" dot data-on={!s.sent || undefined}>Needs you</Badge>
-              <Badge tone="success" dot data-on={s.sent || undefined}>Replied</Badge>
+              <Badge tone="success" dot data-on={s.sent || undefined}>Answered</Badge>
             </span>
           </header>
           <div className="rd-label">Decision needed</div>

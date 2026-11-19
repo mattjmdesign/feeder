@@ -139,6 +139,7 @@ const ballStyle = `background:${orbBackground(hero)}`;
             </p>
             <ul class="tools" aria-label="Supported tools">
               <li><ToolLogo tool="claude" size={16} /><span>Claude Code</span></li>
+              <li><ToolLogo tool="claude" size={16} /><span>Claude Desktop</span></li>
               <li><ToolLogo tool="codex" size={16} /><span>Codex</span></li>
               <li><ToolLogo tool="cursor" size={16} /><span>Cursor</span></li>
               <li><ToolLogo tool="t3code" size={16} /><span>T3 Code</span></li>
@@ -198,23 +199,24 @@ const ballStyle = `background:${orbBackground(hero)}`;
             </dd>
           </div>
           <div>
-            <dt>Manual posts &amp; CLI</dt>
+            <dt>Manual posts &amp; shortcuts</dt>
             <dd>
-              Press <code>⇧⌘N</code> in the app or run <code>feeder post "…"</code> in Terminal to post yourself.
-              Press <code>⌘K</code> to jump across projects, updates, and notes.
+              Run <code>feeder post "…"</code> in Terminal to post yourself, or <code>feeder dismiss</code> to clear an
+              open attention badge. In the app, press <code>⌘K</code> to jump across projects, updates, and notes, and{' '}
+              <code>⌘F</code> to filter the current view.
             </dd>
           </div>
           <div>
             <dt>Other MCP tools</dt>
             <dd>
-              Any tool that supports MCP can use the snippet from <strong>Copy config</strong> in{' '}
+              Any tool that supports MCP can use the snippet from <strong>Copy Config</strong> in{' '}
               <strong>Settings → Agents</strong>.
             </dd>
           </div>
           <div id="uninstall">
             <dt>Uninstall</dt>
             <dd>
-              Open <strong>Settings → Uninstall</strong>, click <strong>Remove Feeder from all tools</strong>, and move
+              Open <strong>Settings → Uninstall</strong>, click <strong>Remove Feeder from All Tools</strong>, and move
               Feeder to the Trash.
             </dd>
           </div>

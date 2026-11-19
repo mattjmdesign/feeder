@@ -2,7 +2,16 @@
 #import <Sparkle/Sparkle.h>
 
 typedef enum : uint32_t {
-    Idle, Checking, Available, Downloading, Preparing, Ready, Installing, Current, Problem, Informational
+    Idle = 0,
+    Checking = 1,
+    Available = 2,
+    Downloading = 3,
+    Preparing = 4,
+    Ready = 5,
+    Installing = 6,
+    Current = 7,
+    Problem = 8,
+    Informational = 9,
 } Phase;
 
 typedef struct {
@@ -151,7 +160,7 @@ static void (*wakeFeeder)(void);
 @end
 
 void feeder_start_updater(void (*wake)(void)) {
-    if (driver != nil) {
+    if (!NSThread.isMainThread || driver != nil) {
         return;
     }
 
@@ -178,6 +187,10 @@ void feeder_start_updater(void (*wake)(void)) {
 }
 
 UpdateSnapshot feeder_update_snapshot(void) {
+    if (!NSThread.isMainThread || driver == nil) {
+        UpdateSnapshot empty = { Idle, -1.0, NULL, NULL, NULL, false };
+        return empty;
+    }
     UpdateSnapshot snapshot = { driver.phase, driver.progress, driver.version.UTF8String, driver.notes.UTF8String,
                                 driver.message.UTF8String, driver.reveal };
     driver.reveal = NO;
@@ -185,6 +198,9 @@ UpdateSnapshot feeder_update_snapshot(void) {
 }
 
 void feeder_update_advance(void) {
+    if (!NSThread.isMainThread || driver == nil) {
+        return;
+    }
     void (^action)(void) = driver.action;
     driver.action = nil;
     if (action != nil) {

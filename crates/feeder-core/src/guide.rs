@@ -34,7 +34,7 @@ Example:
 - **Bold** sparingly for the key takeaway, blocker, or decision needed.
 - `code` for files, branches, commands, commits, versions, and ticket IDs.
 - Use concrete numbers (`44/44 tests pass`, `14 ms -> 3 ms`, `3 of 5 screens done`).
-- Avoid `#` headings, tables, long code blocks, logs, secrets, or repeating the project name.
+- Avoid `#` headings, tables, long code blocks, logs, secrets (updates, replies, and briefs refuse tokens/keys), or repeating the project name.
 
 ## Media: attach one screenshot or short clip when the work is visible
 - Attach **one** screenshot (`png`/`jpg`/`webp`/`gif`) or short clip (`mp4`/`mov`/`webm`) via `screenshot_path` / `--screenshot` whenever the change affects something visible: UI, layout, chart, motion, or rendered output.
@@ -43,7 +43,8 @@ Example:
 
 ## Collaborating with the user
 - Read recent updates, open project to-dos, and any unread human replies first with `get_feed` (or `feeder feed -n 3`).
-- Use `Decision needed:` or `Blocked:` in block 3 whenever you want the user to answer or unblock something; Feeder highlights those cards so they can reply inline.
+- Use `Decision needed:` or `Blocked:` in block 3 whenever you want the user to answer or unblock something (bare `Decision:` does not flag **Needs you**); Feeder highlights open cards so the user can reply inline or dismiss them.
+- If a flagged decision or blocker was resolved out-of-band without a new update, clear the badge with `dismiss_attention` (or `feeder dismiss`).
 - When a project has open to-dos you completed (or want to track), check them off via `toggle_todo` (or `feeder todo done <id>`).
 - Emit a brief `pulse` while working on a longer task so the project's orb shows live activity.
 

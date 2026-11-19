@@ -20,6 +20,14 @@ final class MenuBarController: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private var parentPid: pid_t?
     private var cachedRows: [ProjectRow] = []
 
+    // Owned exclusively by `dbQueue`.
+    private let dbQueue = DispatchQueue(label: "com.feeder.menubar.db", qos: .utility)
+    private var dbHandle: OpaquePointer?
+    private var dbHandlePath: String?
+    private var lastDataVersion: Int64?
+    private var earliestPulseExpiry: Int64?
+    private var refreshInFlight = false
+
     init(parentPid: pid_t?) {
         self.parentPid = parentPid
         super.init()
@@ -34,7 +42,7 @@ final class MenuBarController: NSObject, NSApplicationDelegate, NSMenuDelegate {
         // missing, locked or mid-migration.
         updateBadge()
 
-        refresh()
+        scheduleRefresh(force: true)
 
         Timer.scheduledTimer(withTimeInterval: 2.0, repeats: true) { [weak self] _ in
             guard let self else { return }
@@ -44,13 +52,19 @@ final class MenuBarController: NSObject, NSApplicationDelegate, NSMenuDelegate {
                     return
                 }
             }
-            self.refresh()
+            self.scheduleRefresh(force: false)
+        }
+    }
+
+    func applicationWillTerminate(_ notification: Notification) {
+        dbQueue.sync {
+            self.closeDb()
         }
     }
 
     func menuWillOpen(_ menu: NSMenu) {
-        refresh()
         rebuildMenu()
+        scheduleRefresh(force: false, rebuildMenuIfOpen: true)
     }
 
     private func dbPath() -> String {
@@ -91,8 +105,6 @@ final class MenuBarController: NSObject, NSApplicationDelegate, NSMenuDelegate {
                 let lower = clean.lowercased()
                 if lower.hasPrefix("decision needed:")
                     || lower.hasPrefix("decision needed**")
-                    || lower.hasPrefix("decision:")
-                    || lower.hasPrefix("decision**")
                     || lower.hasPrefix("blocked:")
                     || lower.hasPrefix("blocked**")
                 {
@@ -103,85 +115,151 @@ final class MenuBarController: NSObject, NSApplicationDelegate, NSMenuDelegate {
         return false
     }
 
-    private func refresh() {
-        let path = dbPath()
-        guard FileManager.default.fileExists(atPath: path) else {
-            cachedRows = []
-            updateBadge()
-            return
+    private func closeDb() {
+        if let db = dbHandle {
+            sqlite3_close(db)
+            dbHandle = nil
         }
+        dbHandlePath = nil
+        lastDataVersion = nil
+        earliestPulseExpiry = nil
+    }
 
-        // A failed read keeps the last rows and icon rather than blanking the item.
-        var db: OpaquePointer?
-        if sqlite3_open_v2(path, &db, SQLITE_OPEN_READONLY | SQLITE_OPEN_NOMUTEX, nil) != SQLITE_OK {
-            if db != nil { sqlite3_close(db) }
-            return
-        }
-        defer { sqlite3_close(db) }
-        sqlite3_busy_timeout(db, 500)
-
-        let sql = """
-        SELECT
-            p.id,
-            p.slug,
-            p.name,
-            p.seen_at,
-            (SELECT u.created_at FROM updates u WHERE u.project_id = p.id ORDER BY u.created_at DESC, u.id DESC LIMIT 1) AS last_at,
-            (SELECT u.agent FROM updates u WHERE u.project_id = p.id ORDER BY u.created_at DESC, u.id DESC LIMIT 1) AS last_agent,
-            (SELECT u.body FROM updates u WHERE u.project_id = p.id ORDER BY u.created_at DESC, u.id DESC LIMIT 1) AS last_body,
-            (SELECT COUNT(*) FROM replies r
-              WHERE r.project_id = p.id AND r.from_human = 1
-                AND r.created_at >= COALESCE(
-                    (SELECT u.created_at FROM updates u WHERE u.project_id = p.id ORDER BY u.created_at DESC, u.id DESC LIMIT 1),
-                    0
-                )) AS last_answered,
-            (SELECT pu.status FROM pulses pu WHERE pu.project_id = p.id AND pu.expires_at > ?1 ORDER BY pu.updated_at DESC LIMIT 1) AS pulse_status,
-            (SELECT pu.agent FROM pulses pu WHERE pu.project_id = p.id AND pu.expires_at > ?1 ORDER BY pu.updated_at DESC LIMIT 1) AS pulse_agent
-        FROM projects p
-        WHERE p.archived = 0
-        ORDER BY p.pinned DESC, COALESCE(last_at, p.created_at) DESC
-        """
-
+    private func queryDataVersion(_ db: OpaquePointer?) -> Int64? {
         var stmt: OpaquePointer?
-        var rows: [ProjectRow] = []
-        guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK else { return }
+        guard sqlite3_prepare_v2(db, "PRAGMA data_version", -1, &stmt, nil) == SQLITE_OK else { return nil }
         defer { sqlite3_finalize(stmt) }
-        sqlite3_bind_int64(stmt, 1, nowMs())
-        var result = sqlite3_step(stmt)
-        while result == SQLITE_ROW {
-            let id = sqlite3_column_int64(stmt, 0)
-            let slug = readSqlString(stmt, 1) ?? ""
-            let name = readSqlString(stmt, 2) ?? slug
-            let seenAt = readSqlInt64(stmt, 3)
-            let lastAt = readSqlInt64(stmt, 4)
-            let lastAgent = readSqlString(stmt, 5)
-            let lastBody = readSqlString(stmt, 6)
-            let lastAnswered = sqlite3_column_int64(stmt, 7)
-            let pulseStatus = readSqlString(stmt, 8)
-            let pulseAgent = readSqlString(stmt, 9)
-            let unseen: Bool
-            if let lastAt {
-                unseen = seenAt.map { lastAt > $0 } ?? true
-            } else {
-                unseen = false
+        guard sqlite3_step(stmt) == SQLITE_ROW else { return nil }
+        return sqlite3_column_int64(stmt, 0)
+    }
+
+    private func scheduleRefresh(force: Bool, rebuildMenuIfOpen: Bool = false) {
+        let path = dbPath()
+        dbQueue.async { [weak self] in
+            guard let self else { return }
+            if self.refreshInFlight && !force { return }
+            self.refreshInFlight = true
+            defer { self.refreshInFlight = false }
+
+            guard FileManager.default.fileExists(atPath: path) else {
+                self.closeDb()
+                DispatchQueue.main.async {
+                    self.cachedRows = []
+                    self.updateBadge()
+                    if rebuildMenuIfOpen { self.rebuildMenu() }
+                }
+                return
             }
-            let needsYou = lastAnswered == 0 && parseAttention(lastBody)
-            rows.append(ProjectRow(
-                id: id,
-                slug: slug,
-                name: name,
-                unseen: unseen,
-                needsYou: needsYou,
-                pulseStatus: pulseStatus,
-                pulseAgent: pulseAgent,
-                lastAgent: lastAgent,
-                lastAt: lastAt
-            ))
-            result = sqlite3_step(stmt)
+
+            if self.dbHandle == nil || self.dbHandlePath != path {
+                self.closeDb()
+                var db: OpaquePointer?
+                if sqlite3_open_v2(path, &db, SQLITE_OPEN_READONLY | SQLITE_OPEN_NOMUTEX, nil) != SQLITE_OK {
+                    if db != nil { sqlite3_close(db) }
+                    return
+                }
+                sqlite3_busy_timeout(db, 500)
+                self.dbHandle = db
+                self.dbHandlePath = path
+            }
+
+            guard let db = self.dbHandle else { return }
+            let now = self.nowMs()
+            let pulseExpired = self.earliestPulseExpiry.map { $0 <= now } ?? false
+            let version = self.queryDataVersion(db)
+            if !force && !pulseExpired, let version, version == self.lastDataVersion {
+                return
+            }
+
+            let sql = """
+            WITH latest AS (
+                SELECT u.id, u.project_id, u.created_at, u.agent, u.body, u.attention_dismissed_at,
+                       ROW_NUMBER() OVER (PARTITION BY u.project_id ORDER BY u.created_at DESC, u.id DESC) AS rn
+                FROM updates u
+            )
+            SELECT
+                p.id,
+                p.slug,
+                p.name,
+                p.seen_at,
+                l.created_at,
+                l.agent,
+                l.body,
+                l.attention_dismissed_at,
+                CASE WHEN l.id IS NOT NULL AND EXISTS(
+                    SELECT 1 FROM replies r WHERE r.update_id = l.id AND r.from_human = 1
+                ) THEN 1 ELSE 0 END AS last_answered,
+                (SELECT pu.status FROM pulses pu WHERE pu.project_id = p.id AND pu.expires_at > ?1 ORDER BY pu.updated_at DESC LIMIT 1) AS pulse_status,
+                (SELECT pu.agent FROM pulses pu WHERE pu.project_id = p.id AND pu.expires_at > ?1 ORDER BY pu.updated_at DESC LIMIT 1) AS pulse_agent,
+                (SELECT MIN(pu.expires_at) FROM pulses pu WHERE pu.project_id = p.id AND pu.expires_at > ?1) AS next_pulse_expiry
+            FROM projects p
+            LEFT JOIN latest l ON l.project_id = p.id AND l.rn = 1
+            WHERE p.archived = 0
+            ORDER BY p.pinned DESC, COALESCE(l.created_at, p.created_at) DESC
+            """
+
+            var stmt: OpaquePointer?
+            guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK else {
+                // Schema may have changed or db was replaced; reconnect next tick.
+                self.closeDb()
+                return
+            }
+            defer { sqlite3_finalize(stmt) }
+            sqlite3_bind_int64(stmt, 1, now)
+
+            var rows: [ProjectRow] = []
+            var nextExpiry: Int64?
+            var result = sqlite3_step(stmt)
+            while result == SQLITE_ROW {
+                let id = sqlite3_column_int64(stmt, 0)
+                let slug = self.readSqlString(stmt, 1) ?? ""
+                let name = self.readSqlString(stmt, 2) ?? slug
+                let seenAt = self.readSqlInt64(stmt, 3)
+                let lastAt = self.readSqlInt64(stmt, 4)
+                let lastAgent = self.readSqlString(stmt, 5)
+                let lastBody = self.readSqlString(stmt, 6)
+                let dismissedAt = self.readSqlInt64(stmt, 7)
+                let lastAnswered = sqlite3_column_int64(stmt, 8)
+                let pulseStatus = self.readSqlString(stmt, 9)
+                let pulseAgent = self.readSqlString(stmt, 10)
+                if let exp = self.readSqlInt64(stmt, 11) {
+                    nextExpiry = nextExpiry.map { min($0, exp) } ?? exp
+                }
+                let unseen: Bool
+                if let lastAt {
+                    unseen = seenAt.map { lastAt > $0 } ?? true
+                } else {
+                    unseen = false
+                }
+                let needsYou = dismissedAt == nil && lastAnswered == 0 && self.parseAttention(lastBody)
+                rows.append(ProjectRow(
+                    id: id,
+                    slug: slug,
+                    name: name,
+                    unseen: unseen,
+                    needsYou: needsYou,
+                    pulseStatus: pulseStatus,
+                    pulseAgent: pulseAgent,
+                    lastAgent: lastAgent,
+                    lastAt: lastAt
+                ))
+                result = sqlite3_step(stmt)
+            }
+            guard result == SQLITE_DONE else {
+                self.closeDb()
+                return
+            }
+            self.lastDataVersion = version
+            self.earliestPulseExpiry = nextExpiry
+
+            DispatchQueue.main.async {
+                self.cachedRows = rows
+                self.updateBadge()
+                if rebuildMenuIfOpen {
+                    self.rebuildMenu()
+                }
+            }
         }
-        guard result == SQLITE_DONE else { return }
-        cachedRows = rows
-        updateBadge()
     }
 
     private func updateBadge() {
@@ -350,12 +428,14 @@ final class MenuBarController: NSObject, NSApplicationDelegate, NSMenuDelegate {
         candidates.append(homeBin)
 
         guard let bin = candidates.first(where: { FileManager.default.isExecutableFile(atPath: $0) }) else { return }
-        let task = Process()
-        task.executableURL = URL(fileURLWithPath: bin)
-        task.arguments = ["seen", "--all"]
-        try? task.run()
-        task.waitUntilExit()
-        refresh()
+        dbQueue.async { [weak self] in
+            let task = Process()
+            task.executableURL = URL(fileURLWithPath: bin)
+            task.arguments = ["seen", "--all"]
+            try? task.run()
+            task.waitUntilExit()
+            self?.scheduleRefresh(force: true)
+        }
     }
 }
 

@@ -60,11 +60,7 @@ pub fn parse_attention(body: &str) -> Option<AttentionKind> {
             let trimmed = line.trim().trim_start_matches(['-', '*', ' ']);
             let clean = trimmed.trim_start_matches("**");
             let lower = clean.to_ascii_lowercase();
-            if lower.starts_with("decision needed:")
-                || lower.starts_with("decision needed**")
-                || lower.starts_with("decision:")
-                || lower.starts_with("decision**")
-            {
+            if lower.starts_with("decision needed:") || lower.starts_with("decision needed**") {
                 return Some(AttentionKind::DecisionNeeded);
             }
             if lower.starts_with("blocked:") || lower.starts_with("blocked**") {
@@ -162,6 +158,7 @@ mod tests {
         let blocked = "Done: ran integration suite.\n\n**Blocked:** waiting on staging DB credentials.";
         assert_eq!(parse_attention(blocked), Some(AttentionKind::Blocked));
         assert_eq!(parse_attention("Done: all green.\n\nNext: deploy."), None);
+        assert_eq!(parse_attention("Done: shipped.\n\nDecision: went with SQLite for local storage."), None);
     }
 
     #[test]
@@ -190,6 +187,7 @@ mod tests {
             created_at: 1_000,
             diff_stat: None,
             commit_sha: None,
+            attention_dismissed_at: None,
         };
         let replies = vec![crate::Reply {
             id: 2,

@@ -41,19 +41,40 @@ extern "C" fn wake() {
     }
 }
 
+#[repr(u32)]
 #[derive(Clone, Copy, Default, PartialEq, Eq)]
 enum Phase {
     #[default]
-    Idle,
-    Checking,
-    Available,
-    Downloading,
-    Preparing,
-    Ready,
-    Installing,
-    Current,
-    Problem,
-    Informational,
+    Idle = 0,
+    Checking = 1,
+    Available = 2,
+    Downloading = 3,
+    Preparing = 4,
+    Ready = 5,
+    Installing = 6,
+    Current = 7,
+    Problem = 8,
+    Informational = 9,
+}
+
+impl TryFrom<u32> for Phase {
+    type Error = u32;
+
+    fn try_from(raw: u32) -> Result<Self, Self::Error> {
+        match raw {
+            0 => Ok(Self::Idle),
+            1 => Ok(Self::Checking),
+            2 => Ok(Self::Available),
+            3 => Ok(Self::Downloading),
+            4 => Ok(Self::Preparing),
+            5 => Ok(Self::Ready),
+            6 => Ok(Self::Installing),
+            7 => Ok(Self::Current),
+            8 => Ok(Self::Problem),
+            9 => Ok(Self::Informational),
+            other => Err(other),
+        }
+    }
 }
 
 impl Phase {
@@ -95,18 +116,7 @@ pub fn poll(s: &mut State) -> bool {
         let strings = [copy(native.version), copy(native.notes), copy(native.message)];
         (native, strings)
     };
-    let phase = match native.phase {
-        1 => Phase::Checking,
-        2 => Phase::Available,
-        3 => Phase::Downloading,
-        4 => Phase::Preparing,
-        5 => Phase::Ready,
-        6 => Phase::Installing,
-        7 => Phase::Current,
-        8 => Phase::Problem,
-        9 => Phase::Informational,
-        _ => Phase::Idle,
-    };
+    let phase = Phase::try_from(native.phase).unwrap_or(Phase::Idle);
     let snapshot =
         Snapshot { phase, progress: (0.0..=1.0).contains(&native.progress).then_some(native.progress as f32), version, notes, message };
     let changed = snapshot != s.updates.snapshot || native.reveal;

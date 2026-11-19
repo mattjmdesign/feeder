@@ -6,7 +6,7 @@ use std::collections::BTreeSet;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
-use feeder_core::{FeedUpdate, ProjectSummary, ago, day_key, day_label, parse_attention};
+use feeder_core::{FeedUpdate, ProjectSummary, ago, day_key, day_label};
 use rune::tok::motion;
 use rune::{Cursor, El, Key, KeyEvent, ScrollPos, ScrollSpec, Transition, Tx, col, el, row, text, text_input};
 use rune_kit::{Kit, MarkdownStyle, scroll_bar};
@@ -240,8 +240,8 @@ fn post(s: &State, p: &Palette, k: &Kit, md: &MarkdownStyle, u: &FeedUpdate, sum
         tags = tags.child(diff);
         has_tags = true;
     }
-    if let Some(kind) = parse_attention(&u.body) {
-        tags = tags.child(feed::attention_badge(p, Some(kind)));
+    for badge in feed::card_attention_tags(s, p, u) {
+        tags = tags.child(badge);
         has_tags = true;
     }
 

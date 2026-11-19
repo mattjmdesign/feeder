@@ -1,26 +1,35 @@
 //! One project's feed: the orb & brief up top, then every update newest first along a
 //! timeline (or contact-sheet Gallery), plus inline edit, two-way replies, and video playback.
 
-use feeder_core::{AttentionKind, FeedUpdate, Orb, ProjectSummary, ago, day_key, day_label, now_ms, parse_attention};
+use feeder_core::{AttentionKind, FeedUpdate, Orb, ProjectSummary, ago, day_key, day_label, parse_attention};
 use rune::tok::motion;
 use rune::{
     Cursor, DragItem, El, Key, KeyEvent, ScrollSpec, Spring, SurfaceFit, Transition, Tx, auto_grow, col, el, row, text, text_input,
 };
+use rune_kit::search::Fold;
 use rune_kit::{Button, ButtonVariant, Checkbox, Kit, Markdown, MarkdownStyle, scroll_bar};
 
 use crate::style::{self, Palette};
-use crate::{State, Tab, agents, chrome, orb, prose};
+use crate::{CopyTarget, State, Tab, agents, chrome, orb, prose};
 
 const ORB: f32 = 84.0;
 const COLUMN: f32 = 660.0;
 const SHOT_MAX_H: f32 = 520.0;
 
 pub fn visible_feed(s: &State) -> Vec<&FeedUpdate> {
+    let query = s.project_search.text.trim();
+    let fold = Fold::default();
     s.feed
         .iter()
         .filter(|u| match &s.branch_filter {
             Some(b) => u.branch.as_deref() == Some(b.as_str()),
             None => true,
+        })
+        .filter(|u| {
+            query.is_empty()
+                || fold.contains(&u.body, query)
+                || fold.contains(&u.agent, query)
+                || u.branch.as_deref().is_some_and(|b| fold.contains(b, query))
         })
         .collect()
 }
@@ -54,11 +63,11 @@ pub fn bar_chrome(s: &State, id: i64, p: &Palette) -> (El, Option<El>) {
             .on_press_tx(move |s: &mut State, tx: &mut Tx| s.open_todo_editor(id, tx)),
     );
     if s.feed_for == Some(id) && !s.feed.is_empty() {
-        let context_label = if s.context_copied_recently() { "Copied" } else { "Copy Context" };
+        let context_label = if s.is_copied(CopyTarget::ProjectContext) { "Copied" } else { "Copy Context" };
         let payload = handoff_markdown(summary, &s.feed, s.now);
         actions = actions.child(chrome::bar_button("copy-context", context_label, p).on_press_tx(move |s: &mut State, tx: &mut Tx| {
             tx.copy(payload.clone());
-            s.context_copied_at = Some(now_ms());
+            s.mark_copied(CopyTarget::ProjectContext);
         }));
     }
     actions = actions
@@ -139,7 +148,8 @@ pub fn view(s: &State, id: i64, p: &Palette, k: &Kit, reduced_motion: bool) -> E
     let mut timeline = col().key("timeline").w_full();
     if s.feed_for == Some(id) {
         let has_media = s.feed.iter().any(|u| u.screenshot.is_some());
-        if has_media || s.branch_filter.is_some() {
+        let search_active = s.project_search_open || !s.project_search.text.is_empty();
+        if has_media || s.branch_filter.is_some() || search_active {
             timeline = timeline.child(project_toolbar(s, p, has_media));
         }
 
@@ -159,14 +169,20 @@ pub fn view(s: &State, id: i64, p: &Palette, k: &Kit, reduced_motion: bool) -> E
                 timeline = timeline.child(entry(s, (p, k, &md), u, &summary.project.orb, i == 0, !same_next));
             }
             if n == 0 {
-                let empty_msg = if s.branch_filter.is_some() {
+                let empty_msg = if !s.project_search.text.trim().is_empty() {
+                    "No updates match this filter."
+                } else if s.branch_filter.is_some() {
                     "No updates on this branch."
                 } else {
                     "No updates yet. Ask an agent in this project to post a Feeder update."
                 };
                 timeline = timeline.child(text(empty_msg).font(style::META).color(p.text_3).self_center().py(16.0));
             }
-            if s.branch_filter.is_none() && s.feed.len() >= s.limit && (s.feed.len() as i64) < summary.updates {
+            if s.branch_filter.is_none()
+                && s.project_search.text.trim().is_empty()
+                && s.feed.len() >= s.limit
+                && (s.feed.len() as i64) < summary.updates
+            {
                 timeline = timeline.child(
                     chrome::bar_button("older", "Show Older", p)
                         .self_center()
@@ -481,7 +497,59 @@ fn project_toolbar(s: &State, p: &Palette, has_media: bool) -> El {
             .child(text(label.to_string()).font(style::META).color(if active { p.text } else { p.text_3 }))
     };
 
-    let mut bar = row().key("project-toolbar").w_full().pb(14.0).gap(6.0).center_y();
+    let mut bar = row().key("project-toolbar").w_full().pb(14.0).gap(6.0).center_y().flex_wrap();
+    if s.project_search_open || !s.project_search.text.is_empty() {
+        let search = text_input(&s.project_search, style::META)
+            .key("project-search")
+            .label("Filter updates in this project")
+            .single_line()
+            .grow(1.0)
+            .min_w(0.0)
+            .color(p.text)
+            .caret(p.text, p.selection)
+            .placeholder("Filter updates in this project…  ⌘F", p.text_3)
+            .on_edit(|s: &mut State| &mut s.project_search)
+            .on_input_key(|s: &mut State, e: &KeyEvent, _tx: &mut Tx| {
+                if matches!(e.key, Key::Escape) {
+                    if !s.project_search.text.is_empty() {
+                        s.project_search.text.clear();
+                    } else {
+                        s.project_search_open = false;
+                        s.project_search.focused = false;
+                    }
+                    return true;
+                }
+                false
+            });
+        let clear = row()
+            .key("clear-project-search")
+            .role("button")
+            .label("Close project search")
+            .size(18.0, 18.0)
+            .center()
+            .radius(5.0)
+            .hover(p.hover)
+            .cursor(Cursor::Pointer)
+            .on_press(|s: &mut State| {
+                s.project_search.text.clear();
+                s.project_search_open = false;
+                s.project_search.focused = false;
+            })
+            .child(text("×").font(style::META).color(p.text_3));
+        let search_box = row()
+            .grow(1.0)
+            .min_w(160.0)
+            .h(26.0)
+            .px(10.0)
+            .gap(6.0)
+            .center_y()
+            .radius(8.0)
+            .fill(p.card)
+            .border(1.0, p.hairline)
+            .child(search)
+            .child(clear);
+        bar = bar.child(search_box);
+    }
     if has_media {
         bar = bar
             .child(chip("pv-all", "Updates", !s.project_gallery).on_press(|s: &mut State| s.project_gallery = false))
@@ -682,10 +750,42 @@ pub fn attention_badge(p: &Palette, kind: Option<AttentionKind>) -> El {
         .child(text(label).font(style::META).color(p.amber))
 }
 
+/// Renders the attention status for a card:
+/// - open (latest update, unanswered, not dismissed): amber badge + one-click Dismiss button
+/// - answered by a human reply: quiet muted "Answered" pill
+/// - dismissed or superseded by a newer update: nothing
+pub fn card_attention_tags(s: &State, p: &Palette, u: &FeedUpdate) -> Vec<El> {
+    let Some(kind) = parse_attention(&u.body) else {
+        return vec![];
+    };
+    if s.is_open_attention(u) {
+        let uid = u.id;
+        let dismiss = row()
+            .key(format!("dismiss-u-{uid}"))
+            .role("button")
+            .label("Dismiss needs you")
+            .focusable(true)
+            .px(7.0)
+            .py(1.5)
+            .radius(5.0)
+            .center_y()
+            .border(1.0, p.hairline)
+            .hover(p.hover)
+            .cursor(Cursor::Pointer)
+            .on_press(move |s: &mut State| s.dismiss_attention(uid))
+            .child(text("Dismiss").font(style::META).color(p.text_3));
+        return vec![attention_badge(p, Some(kind)), dismiss];
+    }
+    if s.has_human_reply(u.id) {
+        return vec![el().px(6.0).py(1.5).radius(5.0).border(1.0, p.hairline).child(text("Answered").font(style::META).color(p.text_3))];
+    }
+    vec![]
+}
+
 pub fn card_actions(s: &State, p: &Palette, u: &FeedUpdate) -> El {
     let uid = u.id;
     let body = u.body.clone();
-    let copy_label = if s.update_copied_recently(uid) { "Copied" } else { "Copy" };
+    let copy_label = if s.is_copied(CopyTarget::Update(uid)) { "Copied" } else { "Copy" };
     let small_btn = |key: String, label: &str, a11y: &str| {
         row()
             .key(key)
@@ -703,7 +803,7 @@ pub fn card_actions(s: &State, p: &Palette, u: &FeedUpdate) -> El {
 
     let copy_btn = small_btn(format!("copy-u-{uid}"), copy_label, "Copy update").on_press_tx(move |s: &mut State, tx: &mut Tx| {
         tx.copy(body.clone());
-        s.update_copied = Some((uid, now_ms()));
+        s.mark_copied(CopyTarget::Update(uid));
     });
     let edit_btn = small_btn(format!("edit-u-{uid}"), if s.editing_update == Some(uid) { "Editing" } else { "Edit" }, "Edit update")
         .on_press_tx(move |s: &mut State, tx: &mut Tx| s.start_edit_update(uid, tx));
@@ -747,8 +847,8 @@ fn entry(s: &State, (p, k, md): (&Palette, &Kit, &MarkdownStyle), u: &FeedUpdate
         tags = tags.child(diff);
         has_tags = true;
     }
-    if let Some(kind) = parse_attention(&u.body) {
-        tags = tags.child(attention_badge(p, Some(kind)));
+    for badge in card_attention_tags(s, p, u) {
+        tags = tags.child(badge);
         has_tags = true;
     }
 
@@ -862,6 +962,8 @@ pub fn replies_section(s: &State, p: &Palette, k: &Kit, u: &FeedUpdate) -> Optio
 
     let mut box_el = col().w_full().gap(8.0).pt(6.0).child(rune::rule(1.0, p.hairline));
     for r in replies {
+        let rid = r.id;
+        let reply_body = r.body.clone();
         let mut meta = row().w_full().gap(6.0).center_y().child(text(r.author.clone()).font(style::AGENT).color(if r.from_human {
             p.text
         } else {
@@ -872,7 +974,29 @@ pub fn replies_section(s: &State, p: &Palette, k: &Kit, u: &FeedUpdate) -> Optio
                 el().px(5.0).py(1.0).radius(4.0).fill(p.amber.alpha(0.14)).child(text("Waiting on agent").font(style::META).color(p.amber)),
             );
         }
-        meta = meta.child(rune::spacer()).child(text(ago(r.created_at, s.now)).font(style::META).color(p.text_3));
+        meta = meta.child(rune::spacer());
+        if r.from_human {
+            let copy_label = if s.is_copied(CopyTarget::Reply(rid)) { "Copied" } else { "Copy" };
+            meta = meta.child(
+                row()
+                    .key(format!("copy-r-{rid}"))
+                    .role("button")
+                    .label("Copy reply")
+                    .focusable(true)
+                    .h(20.0)
+                    .px(6.0)
+                    .center_y()
+                    .radius(5.0)
+                    .hover(p.bg)
+                    .cursor(Cursor::Pointer)
+                    .on_press_tx(move |s: &mut State, tx: &mut Tx| {
+                        tx.copy(reply_body.clone());
+                        s.mark_copied(CopyTarget::Reply(rid));
+                    })
+                    .child(text(copy_label).font(style::META).color(p.text_3)),
+            );
+        }
+        meta = meta.child(text(ago(r.created_at, s.now)).font(style::META).color(p.text_3));
         box_el = box_el.child(
             col()
                 .w_full()

@@ -689,7 +689,7 @@ fn jaccard(a: &HashSet<String>, b: &HashSet<String>) -> f32 {
 }
 
 /// What kind of secret `text` seems to hold, if any.
-fn secret_in(text: &str) -> Option<&'static str> {
+pub fn secret_in(text: &str) -> Option<&'static str> {
     if text.contains("-----BEGIN") && text.contains("PRIVATE KEY") {
         return Some("a private key");
     }

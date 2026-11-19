@@ -14,17 +14,21 @@ pick up within an hour.
 
 These are the parts worth checking when you review it:
 
-- **Data.** Everything lives in `~/Library/Application Support/feeder`: a SQLite database, copied
-  screenshots, and `settings.json`. Nothing is uploaded.
+- **Data.** Everything lives in `~/Library/Application Support/feeder` (`0700` permissions): a
+  SQLite database, copied media (symlinks are refused and image/video headers are validated), and
+  `settings.json`. Updates, replies, project briefs, and notebook pages reject common API keys and
+  tokens before saving. Nothing is uploaded.
 - **Network.** The app checks `github.com/mattjmdesign/feeder/releases` for updates about once an
   hour. `feeder mcp` speaks MCP over stdin and stdout and opens no port. `feeder serve` (an
-  optional companion web page, off unless you run it) listens only on the address you give it and
-  requires the token you set.
+  optional companion web page, off unless you run it) listens only on the address you give it,
+  enforces `Host`/`Origin` checks, caps request header and body sizes, sets a strict CSP, and
+  checks the bearer token you set in constant time.
 - **Other apps' files.** Only when you press Connect or Disconnect, or run `feeder setup`, Feeder
   edits those tools' MCP settings (for example `~/.cursor/mcp.json` or `~/.codex/config.toml`) and
   writes two skill files into their skills folders. Each edited file is first copied to
-  `<file>.feeder-backup`.
+  `<file>.feeder-backup` (`0600` permissions).
 - **Notifications.** Posted as Feeder through macOS's UserNotifications, after you allow them.
+  Notification clicks only open `feeder://` URLs.
 
 ## Releases and updates
 

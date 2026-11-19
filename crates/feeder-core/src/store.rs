@@ -195,6 +195,7 @@ pub struct TodoItem {
 pub struct ProjectSummary {
     pub project: Project,
     pub updates: i64,
+    pub last_update_id: Option<i64>,
     pub last_at: Option<i64>,
     pub last_agent: Option<String>,
     pub last_body: Option<String>,
@@ -226,6 +227,8 @@ pub struct FeedUpdate {
     pub created_at: i64,
     pub diff_stat: Option<String>,
     pub commit_sha: Option<String>,
+    /// When the user explicitly dismissed a `Needs you` flag on this update.
+    pub attention_dismissed_at: Option<i64>,
 }
 
 impl FeedUpdate {
@@ -255,9 +258,9 @@ pub struct NewUpdate {
 }
 
 const PROJECT_COLS: &str = "id, slug, name, path, orb, created_at, archived, seen_at, pinned, brief";
-const UPDATE_COLS: &str = "id, project_id, agent, body, screenshot, media_w, media_h, branch, created_at, diff_stat, commit_sha";
-const UPDATE_U_COLS: &str =
-    "u.id, u.project_id, u.agent, u.body, u.screenshot, u.media_w, u.media_h, u.branch, u.created_at, u.diff_stat, u.commit_sha";
+const UPDATE_COLS: &str =
+    "id, project_id, agent, body, screenshot, media_w, media_h, branch, created_at, diff_stat, commit_sha, attention_dismissed_at";
+const UPDATE_U_COLS: &str = "u.id, u.project_id, u.agent, u.body, u.screenshot, u.media_w, u.media_h, u.branch, u.created_at, u.diff_stat, u.commit_sha, u.attention_dismissed_at";
 
 pub struct Store {
     pub(crate) conn: Connection,
@@ -270,7 +273,14 @@ impl Store {
     }
 
     pub fn open(dir: &Path) -> Result<Store> {
-        std::fs::create_dir_all(dir.join("media"))?;
+        let media = dir.join("media");
+        std::fs::create_dir_all(&media)?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700));
+            let _ = std::fs::set_permissions(&media, std::fs::Permissions::from_mode(0o700));
+        }
         let conn = Connection::open(dir.join("feeder.db"))?;
         conn.busy_timeout(Duration::from_secs(5))?;
         conn.pragma_update(None, "journal_mode", "WAL")?;
@@ -299,7 +309,8 @@ impl Store {
                 branch TEXT,
                 created_at INTEGER NOT NULL,
                 diff_stat TEXT,
-                commit_sha TEXT
+                commit_sha TEXT,
+                attention_dismissed_at INTEGER
             );
             CREATE INDEX IF NOT EXISTS updates_by_project ON updates(project_id, created_at DESC, id DESC);
             CREATE TABLE IF NOT EXISTS replies (
@@ -349,6 +360,13 @@ impl Store {
         Ok(self.conn.query_row("PRAGMA data_version", [], |r| r.get(0))?)
     }
 
+    /// Cheap fingerprint of notebook state so watchers can skip reloading pages on feed-only changes.
+    pub fn notebook_stamp(&self) -> Result<(i64, i64, i64)> {
+        Ok(self.conn.query_row("SELECT COUNT(*), COALESCE(MAX(updated_at), 0), COALESCE(SUM(helped), 0) FROM notebook_pages", [], |r| {
+            Ok((r.get(0)?, r.get(1)?, r.get(2)?))
+        })?)
+    }
+
     /// Every project, pinned first, then most recently active.
     pub fn projects(&self) -> Result<Vec<ProjectSummary>> {
         let now = now_ms();
@@ -359,7 +377,7 @@ impl Store {
         let mut stmt = self.conn.prepare(
             "SELECT p.id, p.slug, p.name, p.path, p.orb, p.created_at, p.archived, p.seen_at, p.pinned, p.brief,
                     (SELECT COUNT(*) FROM updates u WHERE u.project_id = p.id),
-                    l.created_at, l.agent, l.body,
+                    l.id, l.created_at, l.agent, l.body, l.attention_dismissed_at,
                     CASE WHEN l.id IS NOT NULL AND EXISTS(
                         SELECT 1 FROM replies r WHERE r.update_id = l.id AND r.from_human = 1
                     ) THEN 1 ELSE 0 END,
@@ -373,15 +391,31 @@ impl Store {
         let rows = stmt.query_map([], |r| {
             let project = project_row(r)?;
             let updates: i64 = r.get(10)?;
-            let last_at: Option<i64> = r.get(11)?;
-            let last_agent: Option<String> = r.get(12)?;
-            let last_body: Option<String> = r.get(13)?;
-            let last_answered: i64 = r.get(14)?;
-            let unread_replies: i64 = r.get(15)?;
-            let open_todos: i64 = r.get(16)?;
-            let needs_you = !project.archived && last_answered == 0 && last_body.as_deref().is_some_and(|b| parse_attention(b).is_some());
+            let last_update_id: Option<i64> = r.get(11)?;
+            let last_at: Option<i64> = r.get(12)?;
+            let last_agent: Option<String> = r.get(13)?;
+            let last_body: Option<String> = r.get(14)?;
+            let last_dismissed_at: Option<i64> = r.get(15)?;
+            let last_answered: i64 = r.get(16)?;
+            let unread_replies: i64 = r.get(17)?;
+            let open_todos: i64 = r.get(18)?;
+            let needs_you = !project.archived
+                && last_answered == 0
+                && last_dismissed_at.is_none()
+                && last_body.as_deref().is_some_and(|b| parse_attention(b).is_some());
             let active_pulse = pulse_map.remove(&project.id);
-            Ok(ProjectSummary { project, updates, last_at, last_agent, last_body, needs_you, unread_replies, open_todos, active_pulse })
+            Ok(ProjectSummary {
+                project,
+                updates,
+                last_update_id,
+                last_at,
+                last_agent,
+                last_body,
+                needs_you,
+                unread_replies,
+                open_todos,
+                active_pulse,
+            })
         })?;
         Ok(rows.collect::<rusqlite::Result<_>>()?)
     }
@@ -466,12 +500,20 @@ impl Store {
             slug = format!("{base}-{n}");
             n += 1;
         }
-        let existing: Vec<Orb> = self.projects()?.into_iter().map(|s| s.project.orb).collect();
+        let existing: Vec<Orb> = {
+            let mut stmt = self.conn.prepare("SELECT orb FROM projects")?;
+            let rows = stmt.query_map([], |r| {
+                let raw: String = r.get(0)?;
+                Ok(serde_json::from_str::<Orb>(&raw).ok())
+            })?;
+            rows.filter_map(|r| r.ok().flatten()).collect()
+        };
         let orb = Orb::generate(&existing);
         let created_at = now_ms();
+        let orb_json = serde_json::to_string(&orb).map_err(|e| Error::Invalid(format!("orb serialization failed: {e}")))?;
         self.conn.execute(
             "INSERT INTO projects (slug, name, path, orb, created_at) VALUES (?1, ?2, ?3, ?4, ?5)",
-            params![slug, name, path.map(path_str), serde_json::to_string(&orb).expect("orb serializes"), created_at],
+            params![slug, name, path.map(path_str), orb_json, created_at],
         )?;
         Ok(Project {
             id: self.conn.last_insert_rowid(),
@@ -508,6 +550,7 @@ impl Store {
             if chars > MAX_BRIEF_CHARS {
                 return Err(Error::Invalid(format!("brief is {chars} characters; keep it to {MAX_BRIEF_CHARS} or fewer")));
             }
+            reject_secret(b)?;
         }
         let changed = self.conn.execute("UPDATE projects SET brief = ?1 WHERE id = ?2", params![cleaned, id])?;
         if changed == 0 {
@@ -559,6 +602,43 @@ impl Store {
         Ok(())
     }
 
+    /// Dismisses a `Needs you` flag on a single update so the user can clear it after handling it
+    /// directly in their editor or agent without posting a dummy reply.
+    pub fn dismiss_attention(&self, update_id: i64) -> Result<()> {
+        let changed = self.conn.execute(
+            "UPDATE updates SET attention_dismissed_at = COALESCE(attention_dismissed_at, ?1) WHERE id = ?2",
+            params![now_ms(), update_id],
+        )?;
+        if changed == 0 {
+            return Err(Error::NotFound(format!("no update {update_id}")));
+        }
+        Ok(())
+    }
+
+    /// Restores a previously dismissed `Needs you` flag on a single update (used by Undo).
+    pub fn undismiss_attention(&self, update_id: i64) -> Result<()> {
+        let changed = self.conn.execute("UPDATE updates SET attention_dismissed_at = NULL WHERE id = ?1", params![update_id])?;
+        if changed == 0 {
+            return Err(Error::NotFound(format!("no update {update_id}")));
+        }
+        Ok(())
+    }
+
+    /// Dismisses a `Needs you` flag on the latest update of `project_id`, returning `true` if one existed.
+    pub fn dismiss_project_attention(&self, project_id: i64) -> Result<bool> {
+        let latest_id: Option<i64> = self
+            .conn
+            .query_row("SELECT id FROM updates WHERE project_id = ?1 ORDER BY created_at DESC, id DESC LIMIT 1", params![project_id], |r| {
+                r.get(0)
+            })
+            .optional()?;
+        let Some(id) = latest_id else {
+            return Ok(false);
+        };
+        self.dismiss_attention(id)?;
+        Ok(true)
+    }
+
     /// Deletes a single update and removes its stored media file if any.
     pub fn delete_update(&self, id: i64) -> Result<()> {
         let shot: Option<Option<String>> =
@@ -575,7 +655,7 @@ impl Store {
 
     /// Deletes a project, its updates and their screenshots.
     pub fn remove_project(&self, id: i64) -> Result<()> {
-        for u in self.feed(id, i64::MAX as usize, None)? {
+        for u in self.feed(id, usize::MAX, None)? {
             if let Some(shot) = u.screenshot {
                 std::fs::remove_file(shot).ok();
             }
@@ -587,6 +667,7 @@ impl Store {
     /// Adds an update to a project's feed. The note is checked against the update rules first.
     pub fn post(&self, project_id: i64, update: NewUpdate) -> Result<FeedUpdate> {
         let body = validate_body(&update.body)?;
+        reject_secret(&body)?;
         let agent = update.agent.trim();
         let agent = if agent.is_empty() { "Unknown agent" } else { agent };
         let branch = update.branch.as_deref().map(str::trim).filter(|b| !b.is_empty()).map(str::to_string);
@@ -641,6 +722,7 @@ impl Store {
             created_at,
             diff_stat,
             commit_sha,
+            attention_dismissed_at: None,
         })
     }
 
@@ -663,6 +745,7 @@ impl Store {
     /// Replaces the text body of an existing update after validating it.
     pub fn edit_update(&self, id: i64, body: &str) -> Result<FeedUpdate> {
         let body = validate_body(body)?;
+        reject_secret(&body)?;
         let changed = self.conn.execute("UPDATE updates SET body = ?1 WHERE id = ?2", params![body, id])?;
         if changed == 0 {
             return Err(Error::NotFound(format!("no update {id}")));
@@ -751,6 +834,7 @@ impl Store {
         if chars > MAX_REPLY_CHARS {
             return Err(Error::Invalid(format!("reply is {chars} characters; keep it to {MAX_REPLY_CHARS} or fewer")));
         }
+        reject_secret(body)?;
         let update = self.update(update_id)?.ok_or_else(|| Error::NotFound(format!("no update {update_id}")))?;
         let author = author.trim();
         let author = if author.is_empty() { if from_human { "You" } else { "Agent" } } else { author };
@@ -775,18 +859,28 @@ impl Store {
 
     /// Fetches replies belonging to the given update IDs, oldest first per thread.
     pub fn replies_for_updates(&self, update_ids: &[i64]) -> Result<Vec<Reply>> {
+        const CHUNK: usize = 500;
         if update_ids.is_empty() {
             return Ok(Vec::new());
         }
-        let placeholders = std::iter::repeat_n("?", update_ids.len()).collect::<Vec<_>>().join(", ");
-        let sql = format!(
-            "SELECT id, update_id, project_id, author, from_human, body, created_at, read_at
-             FROM replies WHERE update_id IN ({placeholders})
-             ORDER BY created_at ASC, id ASC"
-        );
-        let mut stmt = self.conn.prepare(&sql)?;
-        let rows = stmt.query_map(rusqlite::params_from_iter(update_ids.iter().copied()), reply_row)?;
-        Ok(rows.collect::<rusqlite::Result<_>>()?)
+        let mut out = Vec::new();
+        for chunk in update_ids.chunks(CHUNK) {
+            let placeholders = std::iter::repeat_n("?", chunk.len()).collect::<Vec<_>>().join(", ");
+            let sql = format!(
+                "SELECT id, update_id, project_id, author, from_human, body, created_at, read_at
+                 FROM replies WHERE update_id IN ({placeholders})
+                 ORDER BY created_at ASC, id ASC"
+            );
+            let mut stmt = self.conn.prepare(&sql)?;
+            let rows = stmt.query_map(rusqlite::params_from_iter(chunk.iter().copied()), reply_row)?;
+            for row in rows {
+                out.push(row?);
+            }
+        }
+        if update_ids.len() > CHUNK {
+            out.sort_by_key(|r| (r.created_at, r.id));
+        }
+        Ok(out)
     }
 
     /// Returns human replies that have not yet been read by an agent (for a project or across all).
@@ -806,18 +900,21 @@ impl Store {
 
     /// Marks specific reply IDs as read by an agent.
     pub fn mark_replies_read(&self, ids: &[i64]) -> Result<()> {
+        const CHUNK: usize = 500;
         if ids.is_empty() {
             return Ok(());
         }
         let now = now_ms();
-        let placeholders = std::iter::repeat_n("?", ids.len()).collect::<Vec<_>>().join(", ");
-        let sql = format!("UPDATE replies SET read_at = COALESCE(read_at, ?1) WHERE id IN ({placeholders})");
-        let mut params_vec: Vec<rusqlite::types::Value> = Vec::with_capacity(ids.len() + 1);
-        params_vec.push(now.into());
-        for &id in ids {
-            params_vec.push(id.into());
+        for chunk in ids.chunks(CHUNK) {
+            let placeholders = std::iter::repeat_n("?", chunk.len()).collect::<Vec<_>>().join(", ");
+            let sql = format!("UPDATE replies SET read_at = COALESCE(read_at, ?1) WHERE id IN ({placeholders})");
+            let mut params_vec: Vec<rusqlite::types::Value> = Vec::with_capacity(chunk.len() + 1);
+            params_vec.push(now.into());
+            for &id in chunk {
+                params_vec.push(id.into());
+            }
+            self.conn.execute(&sql, rusqlite::params_from_iter(params_vec))?;
         }
-        self.conn.execute(&sql, rusqlite::params_from_iter(params_vec))?;
         Ok(())
     }
 
@@ -984,6 +1081,7 @@ impl Store {
             created_at: r.get(8)?,
             diff_stat: r.get(9)?,
             commit_sha: r.get(10)?,
+            attention_dismissed_at: r.get(11)?,
         })
     }
 
@@ -997,12 +1095,18 @@ impl Store {
             })?;
         let is_video = VIDEO_TYPES.contains(&ext.as_str());
         let max_bytes = if is_video { MAX_VIDEO_BYTES } else { MAX_IMAGE_BYTES };
-        let meta = std::fs::metadata(src).map_err(|e| Error::Invalid(format!("can't read media {}: {e}", src.display())))?;
+        let meta = std::fs::symlink_metadata(src).map_err(|e| Error::Invalid(format!("can't read media {}: {e}", src.display())))?;
+        if meta.file_type().is_symlink() {
+            return Err(Error::Invalid(format!("{} is a symlink; pass a regular media file", src.display())));
+        }
         if !meta.is_file() {
             return Err(Error::Invalid(format!("{} is not a file", src.display())));
         }
         if meta.len() > max_bytes {
             return Err(Error::Invalid(format!("media must be under {} MB", max_bytes / 1024 / 1024)));
+        }
+        if !matches_media_magic(src, &ext) {
+            return Err(Error::Invalid(format!("{} does not look like a valid .{ext} file", src.display())));
         }
         let rel = format!("media/{}-{}-{:04x}.{ext}", project.slug, created_at, fastrand::u16(..));
         std::fs::copy(src, self.dir.join(&rel))?;
@@ -1011,6 +1115,28 @@ impl Store {
 
     fn one(&self, sql: &str, params: impl rusqlite::Params) -> Result<Option<Project>> {
         Ok(self.conn.query_row(sql, params, project_row).optional()?)
+    }
+}
+
+fn reject_secret(text: &str) -> Result<()> {
+    if let Some(kind) = crate::secret_in(text) {
+        return Err(Error::Invalid(format!("looks like {kind} — remove the secret before saving")));
+    }
+    Ok(())
+}
+
+fn matches_media_magic(path: &Path, ext: &str) -> bool {
+    let Ok(mut f) = File::open(path) else { return false };
+    let mut head = [0u8; 16];
+    let Ok(n) = f.read(&mut head) else { return false };
+    match ext {
+        "png" => n >= 8 && &head[0..8] == b"\x89PNG\r\n\x1a\n",
+        "jpg" | "jpeg" => n >= 3 && head[0..3] == [0xff, 0xd8, 0xff],
+        "gif" => n >= 6 && (&head[0..6] == b"GIF87a" || &head[0..6] == b"GIF89a"),
+        "webp" => n >= 12 && &head[0..4] == b"RIFF" && &head[8..12] == b"WEBP",
+        "mp4" | "m4v" | "mov" => n >= 8 && matches!(&head[4..8], b"ftyp" | b"moov" | b"mdat" | b"wide" | b"free"),
+        "webm" => n >= 4 && head[0..4] == [0x1a, 0x45, 0xdf, 0xa3],
+        _ => false,
     }
 }
 
@@ -1056,6 +1182,9 @@ fn migrate_updates(conn: &Connection, dir: &Path) -> Result<()> {
     }
     if !cols.iter().any(|c| c == "commit_sha") {
         conn.execute("ALTER TABLE updates ADD COLUMN commit_sha TEXT", [])?;
+    }
+    if !cols.iter().any(|c| c == "attention_dismissed_at") {
+        conn.execute("ALTER TABLE updates ADD COLUMN attention_dismissed_at INTEGER", [])?;
     }
     let added_media_dims = !cols.iter().any(|c| c == "media_w");
     if added_media_dims {
@@ -1231,8 +1360,12 @@ mod tests {
     fn screenshots_are_copied_in_and_bad_notes_store_nothing() {
         let (s, dir) = temp_store("shot");
         let p = s.project_named("Shots", None).unwrap();
+        let spoof = dir.join("fake.png");
+        std::fs::write(&spoof, b"not really a png").unwrap();
+        assert!(s.post(p.id, NewUpdate { screenshot: Some(spoof), ..note("spoofed") }).is_err());
+
         let src = dir.join("in.png");
-        std::fs::write(&src, b"not really a png").unwrap();
+        std::fs::write(&src, b"\x89PNG\r\n\x1a\n\x00\x00\x00\x0dIHDR").unwrap();
         let u = s.post(p.id, NewUpdate { screenshot: Some(src.clone()), ..note("with a picture") }).unwrap();
         let stored = u.screenshot.unwrap();
         assert!(stored.starts_with(dir.join("media")) && stored.exists());
@@ -1353,7 +1486,7 @@ mod tests {
         let a = s.project_named("Alpha", None).unwrap();
         let b = s.project_named("Beta", None).unwrap();
         let src = dir.join("pic.png");
-        std::fs::write(&src, b"png").unwrap();
+        std::fs::write(&src, b"\x89PNG\r\n\x1a\n\x00\x00\x00\x0dIHDR").unwrap();
         let u1 = s
             .post(a.id, NewUpdate { screenshot: Some(src), branch: Some("feat/stripe-retry".into()), ..note("Fixed Stripe webhook retry") })
             .unwrap();
@@ -1404,7 +1537,7 @@ mod tests {
 
         // Posting a Decision needed update flags needs_you and clears matching pulse
         let clip = dir.join("demo.mp4");
-        std::fs::write(&clip, b"mp4bytes").unwrap();
+        std::fs::write(&clip, b"\x00\x00\x00\x18ftypmp42\x00\x00\x00\x00").unwrap();
         let u = s
             .post(
                 p.id,
@@ -1556,6 +1689,78 @@ mod tests {
         s.add_todo(p.id, "Cascade check").unwrap();
         s.remove_project(p.id).unwrap();
         assert!(s.todos(p.id).unwrap().is_empty());
+
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn dismissing_attention_clears_needs_you_without_fake_reply() {
+        let (s, dir) = temp_store("dismiss");
+        let p = s.project_named("Orbit", None).unwrap();
+        let u = s.post(p.id, note("Done: wired auth.\n\nDecision needed: keep legacy token?")).unwrap();
+        let sum = &s.projects().unwrap()[0];
+        assert!(sum.needs_you);
+        assert_eq!(sum.last_update_id, Some(u.id));
+
+        s.dismiss_attention(u.id).unwrap();
+        let sum = &s.projects().unwrap()[0];
+        assert!(!sum.needs_you);
+        assert!(s.update(u.id).unwrap().unwrap().attention_dismissed_at.is_some());
+        assert!(s.replies_for_updates(&[u.id]).unwrap().is_empty());
+
+        s.undismiss_attention(u.id).unwrap();
+        let sum = &s.projects().unwrap()[0];
+        assert!(sum.needs_you);
+        assert!(s.update(u.id).unwrap().unwrap().attention_dismissed_at.is_none());
+
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn secrets_are_rejected_in_updates_edits_replies_and_briefs() {
+        let (s, dir) = temp_store("secrets");
+        let p = s.project_named("Vault", None).unwrap();
+        let key = "sk-abcdefghijklmnopqrstuvwxyz123456";
+        assert!(s.post(p.id, note(&format!("Done: used {key}"))).is_err());
+        assert!(s.set_project_brief(p.id, Some(&format!("Key: {key}"))).is_err());
+
+        let u = s.post(p.id, note("Done: clean update.")).unwrap();
+        assert!(s.edit_update(u.id, &format!("Done: leaked {key}")).is_err());
+        assert!(s.add_reply(u.id, "You", true, &format!("Try {key}")).is_err());
+
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn symlink_media_is_refused() {
+        let (s, dir) = temp_store("symlink-media");
+        let p = s.project_named("Links", None).unwrap();
+        let real = dir.join("real.png");
+        let link = dir.join("link.png");
+        std::fs::write(&real, b"\x89PNG\r\n\x1a\n\x00\x00\x00\x0dIHDR").unwrap();
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        assert!(s.post(p.id, NewUpdate { screenshot: Some(link), ..note("symlinked") }).is_err());
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn chunked_reply_queries_handle_over_500_ids() {
+        let (s, dir) = temp_store("chunk-replies");
+        let p = s.project_named("Big", None).unwrap();
+        let u = s.post(p.id, note("Done: batch test.")).unwrap();
+        let r = s.add_reply(u.id, "You", true, "Looks good.").unwrap();
+
+        let mut ids: Vec<i64> = (1000..1600).collect();
+        ids.push(u.id);
+        let found = s.replies_for_updates(&ids).unwrap();
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].id, r.id);
+
+        let mut rids: Vec<i64> = (2000..2600).collect();
+        rids.push(r.id);
+        s.mark_replies_read(&rids).unwrap();
+        assert!(s.unread_human_replies(Some(p.id)).unwrap().is_empty());
 
         std::fs::remove_dir_all(dir).ok();
     }

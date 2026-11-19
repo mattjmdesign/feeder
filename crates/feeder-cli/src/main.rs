@@ -233,6 +233,14 @@ enum Command {
         #[arg(long)]
         all: bool,
     },
+    /// Dismiss the "needs you" flag on a project's latest update or a specific update id.
+    Dismiss {
+        /// Project name. Defaults to the project of the current folder.
+        project: Option<String>,
+        /// Specific update id to dismiss instead of the project's latest update.
+        #[arg(long)]
+        id: Option<i64>,
+    },
     /// Delete a project, its feed and its screenshots.
     Remove {
         project: String,
@@ -815,6 +823,20 @@ fn run(command: Command) -> Result<(), String> {
             }
             Ok(())
         }
+        Command::Dismiss { project, id } => {
+            if let Some(update_id) = id {
+                store.dismiss_attention(update_id).map_err(|e| e.to_string())?;
+                println!("Dismissed update #{update_id}.");
+            } else {
+                let p = resolve_existing(&store, project.as_deref())?;
+                if store.dismiss_project_attention(p.id).map_err(|e| e.to_string())? {
+                    println!("Dismissed {}'s latest update.", p.name);
+                } else {
+                    println!("{} has no updates to dismiss.", p.name);
+                }
+            }
+            Ok(())
+        }
         Command::Remove { project, yes } => {
             let p = find(&store, &project)?;
             if !yes {
@@ -957,6 +979,7 @@ pub(crate) fn update_json(u: &FeedUpdate) -> serde_json::Value {
         "diff_stat": u.diff_stat,
         "commit_sha": u.commit_sha,
         "created_at": u.created_at,
+        "attention_dismissed_at": u.attention_dismissed_at,
     })
 }
 

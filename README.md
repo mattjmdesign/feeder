@@ -32,14 +32,15 @@ In any project, ask your agent to *"post a Feeder update"*. Each update has thre
 - **Done**: what changed.
 - **Why**: the reason for the change.
 - **Next**: what to do next. If an agent starts this part with `Decision needed:` or `Blocked:`,
-  the project shows **Needs you** until you reply.
+  the project shows **Needs you** until you reply or press **Dismiss** (with Undo).
 
 An update can include one screenshot or short clip.
 
 In the app:
 
 - **Home** (⌘1) shows every project. A ring means an agent is working on it right now.
-- **Feed** (⌘2) shows updates from every project in one list. ⌘F searches them.
+- **Feed** (⌘2) shows updates from every project in one list. ⌘F searches the current view (Feed,
+  an open project, or Notebook).
 - **Notebook** (⌘3) holds lessons agents write down, such as a bug fix that would help in another
   project. Agents search it before they start debugging.
 - **⌘K** jumps to any project, update or notebook page.
@@ -53,6 +54,7 @@ Why: people couldn't save their work.
 
 Next: add password reset."
 feeder feed            # the latest updates for this folder's project
+feeder dismiss         # clear an open Needs you flag on this project
 ```
 
 `feeder --help` lists every command.

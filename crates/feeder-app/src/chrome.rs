@@ -4,7 +4,7 @@
 use std::path::Path;
 
 use feeder_core::setup::{self, Tool};
-use feeder_core::{OrbSize, Order, Theme, ago, now_ms};
+use feeder_core::{OrbSize, Order, Theme, ago};
 use rune::{
     ClipboardContent, ClipboardImage, Cursor, Drag, El, Icon, Key, KeyEvent, ScrollSpec, SurfaceFit, Transition, Tx, col, el, oklch, row,
     text, text_input,
@@ -16,7 +16,7 @@ use rune_kit::{
 
 use crate::connect::Link;
 use crate::style::{self, Palette};
-use crate::{State, Tab, ToastItem, ToastKind, agents, feed, orb};
+use crate::{CopyTarget, State, Tab, ToastItem, ToastKind, agents, feed, orb};
 
 static PLUS_ICON: Icon = Icon {
     name: "feeder-plus",
@@ -65,7 +65,18 @@ pub fn bar_button(key: &str, label: &str, p: &Palette) -> El {
 }
 
 pub fn reveal_path(path: &Path) {
-    let _ = std::process::Command::new("open").arg(path).spawn();
+    let is_plain_dir = std::fs::symlink_metadata(path).is_ok_and(|m| m.is_dir())
+        && !matches!(
+            path.extension().and_then(|e| e.to_str()).map(str::to_ascii_lowercase).as_deref(),
+            Some("app" | "bundle" | "pkg" | "mpkg" | "prefpane" | "appex" | "plugin" | "workflow" | "action")
+        );
+    let mut cmd = std::process::Command::new("/usr/bin/open");
+    if is_plain_dir {
+        cmd.args(["-a", "Finder", "--"]).arg(path);
+    } else {
+        cmd.args(["-R", "--"]).arg(path);
+    }
+    let _ = cmd.spawn();
 }
 
 fn copy_image_to_clipboard(path: &Path, tx: &mut Tx) -> Result<(), String> {
@@ -297,7 +308,7 @@ pub fn lightbox(s: &State, inset: f32, p: &Palette, k: &Kit, reduced_motion: boo
 
     let mut top = lightbox_top_chrome(s, inset, p, &caption, pos, total, can_compare, compare_target);
     if let Some(path) = media_path {
-        let copy_label = if s.image_copied_recently() { "Copied" } else { "Copy Image" };
+        let copy_label = if s.is_copied(CopyTarget::LightboxImage) { "Copied" } else { "Copy Image" };
         top = top.child(
             bar_button("lightbox-copy-image", copy_label, p)
                 .fill(p.card)
@@ -305,7 +316,7 @@ pub fn lightbox(s: &State, inset: f32, p: &Palette, k: &Kit, reduced_motion: boo
                 .label("Copy screenshot image")
                 .on_press_tx(move |s: &mut State, tx: &mut Tx| match copy_image_to_clipboard(&path, tx) {
                     Ok(()) => {
-                        s.image_copied_at = Some(now_ms());
+                        s.mark_copied(CopyTarget::LightboxImage);
                         s.push_toast(
                             "copy-image",
                             ToastItem { title: "Copied screenshot to clipboard".into(), description: None, kind: ToastKind::Info },
@@ -806,6 +817,12 @@ pub fn toasts(s: &State, k: &Kit) -> Option<El> {
                     s.set_archived_inner(project_id, was_archived, false);
                 });
             }
+            ToastKind::UndoDismiss { update_id } => {
+                t = t.icon(k, k.glyph.check).action(k, "Undo", true, move |s: &mut State, _tx: &mut Tx| {
+                    s.dismiss_toast(tid);
+                    s.undismiss_attention(update_id);
+                });
+            }
             ToastKind::Error => {
                 t = t.icon(k, k.glyph.circle_x);
             }
@@ -1022,7 +1039,7 @@ fn agents_section(s: &State, p: &Palette, k: &Kit) -> El {
         }
         Some(found) => rows.extend(found.iter().map(|(tool, link)| agent_row(s, p, k, *tool, link))),
     }
-    let copy_label = if s.copied_recently() { "Copied" } else { "Copy Config" };
+    let copy_label = if s.is_copied(CopyTarget::McpConfig) { "Copied" } else { "Copy Config" };
     rows.push(
         row()
             .w_full()
@@ -1039,7 +1056,7 @@ fn agents_section(s: &State, p: &Palette, k: &Kit) -> El {
             .child(bar_button("copy-mcp", copy_label, p).label("Copy MCP config").border(1.0, p.hairline).on_press_tx(
                 |s: &mut State, tx: &mut Tx| {
                     tx.copy(setup::mcp_json(&setup::feeder_binary()));
-                    s.copied_at = Some(now_ms());
+                    s.mark_copied(CopyTarget::McpConfig);
                 },
             )),
     );

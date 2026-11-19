@@ -389,17 +389,50 @@ fn remove_toml_table(text: &str, name: &str) -> Option<String> {
 }
 
 fn write_with_backup(path: &Path, contents: &str) -> std::io::Result<()> {
+    use std::io::Write;
     let target = if path.is_symlink() { std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf()) } else { path.to_path_buf() };
     if let Some(dir) = target.parent() {
         std::fs::create_dir_all(dir)?;
     }
     let backup = PathBuf::from(format!("{}.feeder-backup", target.display()));
     if target.exists() && !backup.exists() {
-        std::fs::copy(&target, &backup)?;
+        let existing = std::fs::read(&target)?;
+        write_private_new(&backup, &existing)?;
     }
-    let tmp = PathBuf::from(format!("{}.feeder-tmp", target.display()));
-    std::fs::write(&tmp, contents)?;
-    std::fs::rename(tmp, target)
+    let tmp = PathBuf::from(format!("{}.feeder-tmp-{}-{:08x}", target.display(), std::process::id(), fastrand::u32(..)));
+    let write_res = (|| -> std::io::Result<()> {
+        let mut opts = std::fs::OpenOptions::new();
+        opts.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            opts.mode(0o600);
+        }
+        let mut file = opts.open(&tmp)?;
+        file.write_all(contents.as_bytes())?;
+        file.sync_all()
+    })();
+    if let Err(e) = write_res {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(e);
+    }
+    std::fs::rename(&tmp, &target).inspect_err(|_| {
+        let _ = std::fs::remove_file(&tmp);
+    })
+}
+
+fn write_private_new(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    use std::io::Write;
+    let mut opts = std::fs::OpenOptions::new();
+    opts.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.mode(0o600);
+    }
+    let mut file = opts.open(path)?;
+    file.write_all(bytes)?;
+    file.sync_all()
 }
 
 /// Writes the `feeder-update` and `feeder-notebook` skills into every skills folder these tools read that exists.

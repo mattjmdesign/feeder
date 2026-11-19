@@ -22,7 +22,7 @@
              withCompletionHandler:(void (^)(void))completionHandler {
     NSString *link = response.notification.request.content.userInfo[@"url"];
     NSURL *url = link.length > 0 ? [NSURL URLWithString:link] : nil;
-    if (url != nil) {
+    if (url != nil && [[url.scheme lowercaseString] isEqualToString:@"feeder"]) {
         [NSWorkspace.sharedWorkspace openURL:url];
     }
     completionHandler();
