@@ -3,6 +3,13 @@
 What changed in each version of Feeder, newest first. Each section is copied from
 `release-notes/<version>.md` by `scripts/changelog.sh`; edit those files, not this one.
 
+## 0.4.1
+
+- **A cleaner project page.** The header holds To-Do, Copy Context, Rename and Archive. Show in Finder and Pin are on the project's orb menu on Home, and Copy Context does what Copy Prompt did.
+- **A simpler Notebook heading.** The page count and the line under the heading are gone.
+- **Matching corners.** The Notebook's main pane now curves in line with the window's corner.
+- **Buttons and menu items in Title Case**, such as Copy Context and Mark All Read.
+
 ## 0.4.0
 
 - **A new icon.** Marbles fill the tile, like the orbs on Home.
