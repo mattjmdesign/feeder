@@ -148,9 +148,9 @@ pub fn menu(s: &State, p: &Palette, k: &Kit, layer: &mut Vec<El>) -> El {
             s.show_archived = !s.show_archived;
         }));
     }
-    m.item(MenuItem::new("Connect agents…").on_select(|s: &mut State| {
+    m.item(MenuItem::new("Connect agents…").on_select_tx(|s: &mut State, tx: &mut Tx| {
         s.menu_open = false;
-        s.settings_open = true;
+        open_agent_setup(s, tx);
     }))
     .item(MenuItem::new("Show data in Finder").on_select(|s: &mut State| {
         s.menu_open = false;
@@ -999,6 +999,15 @@ pub fn settings(s: &State, p: &Palette, k: &Kit) -> Option<El> {
     )
 }
 
+/// Opens Settings scrolled to Agents, for the places that are about connecting a tool: the empty
+/// Home and "Connect agents…". Agents sits below Appearance and Projects, out of first view.
+pub fn open_agent_setup(s: &mut State, tx: &mut Tx) {
+    s.settings_open = true;
+    tx.scroll_key_to(AGENTS_SECTION_KEY, 0.0);
+}
+
+const AGENTS_SECTION_KEY: &str = "settings-agents";
+
 /// Settings → Agents: a row per installed tool with its own connect control, then a config any
 /// other MCP tool can read. Nothing connects until it's pressed.
 fn agents_section(s: &State, p: &Palette, k: &Kit) -> El {
@@ -1035,7 +1044,7 @@ fn agents_section(s: &State, p: &Palette, k: &Kit) -> El {
             )),
     );
     rows.push(note("Restart a tool after connecting or disconnecting it. Then ask an agent in any project to post a Feeder update."));
-    section(p, "Agents", rows)
+    section(p, "Agents", rows).key(AGENTS_SECTION_KEY)
 }
 
 /// One installed tool: its mark and name, where it stands under the name, and the one action

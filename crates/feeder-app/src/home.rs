@@ -362,17 +362,13 @@ fn empty(p: &Palette, size: f32) -> El {
         .child(ghost)
         .child(text("No projects yet").font(style::NAME).color(p.text))
         .child(
-            text("Connect your coding tools in Settings (⌘,). Then ask an agent in any project to post a Feeder update.")
+            text("Connect the coding tools you use, then ask an agent in any project to post a Feeder update.")
                 .font(style::META)
                 .color(p.text_3)
                 .wrap()
                 .max_w(380.0),
         )
-        .child(
-            chrome::bar_button("open-settings", "Open Settings", p)
-                .border(1.0, p.hairline)
-                .on_press(|s: &mut State| s.settings_open = true),
-        )
+        .child(chrome::bar_button("connect-tools", "Connect Your Tools", p).border(1.0, p.hairline).on_press_tx(chrome::open_agent_setup))
 }
 
 fn message(p: &Palette, title: &str, detail: &str) -> El {

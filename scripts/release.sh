@@ -13,6 +13,9 @@ cd "$(dirname "$0")/.."
 RELEASES_REPO="mattjmdesign/feeder"
 # Built into every copy of Feeder. Changing either strands the copies already installed.
 FEED_URL="https://github.com/$RELEASES_REPO/releases/latest/download/appcast.xml"
+# Feeder 0.2 and 0.3 read their feed from this repo. Every release also posts its signed feed
+# there, so those copies are offered the update and pick up FEED_URL once they install it.
+LEGACY_FEED_REPO="mattjmdesign/feeder-releases"
 PUBLIC_KEY="woqv+TW3eu0pE9safKDR37DCbBMSAvq/IjYQfLFdnm8="
 
 VERSION="$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)"
@@ -26,10 +29,12 @@ if [[ -n "$(git status --porcelain)" ]]; then
   echo "Commit your changes first; a release builds what's committed." >&2
   exit 1
 fi
-if gh release view "$TAG" --repo "$RELEASES_REPO" >/dev/null 2>&1; then
-  echo "$TAG is already released. Bump the version in Cargo.toml first." >&2
-  exit 1
-fi
+for repo in "$RELEASES_REPO" "$LEGACY_FEED_REPO"; do
+  if gh release view "$TAG" --repo "$repo" >/dev/null 2>&1; then
+    echo "$TAG is already released on $repo. Bump the version in Cargo.toml first." >&2
+    exit 1
+  fi
+done
 # notarytool keeps its credential in the data-protection keychain, which macOS seals while the
 # screen is locked. Check before a three-minute build rather than after it.
 if ! xcrun notarytool history --keychain-profile feeder >/dev/null 2>&1; then
@@ -68,6 +73,10 @@ echo "› signing the update feed"
 echo "› publishing $TAG"
 gh release create "$TAG" --repo "$RELEASES_REPO" --title "Feeder $VERSION" --notes-file "$NOTES" \
   "$STAGE/$NAME.dmg" "$STAGE/appcast.xml"
+# The feed's download links point at $RELEASES_REPO, so this copy only redirects older installs.
+gh release create "$TAG" --repo "$LEGACY_FEED_REPO" --title "Feeder $VERSION" \
+  --notes "Feeder now lives at https://github.com/$RELEASES_REPO. This release only carries the update feed." \
+  "$STAGE/appcast.xml"
 # Published images live on the releases page; keep only this one locally.
 find dist -mindepth 1 -maxdepth 1 ! -name "release-$VERSION" -exec rm -rf {} +
 echo "✓ https://github.com/$RELEASES_REPO/releases/tag/$TAG"

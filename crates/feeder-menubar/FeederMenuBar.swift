@@ -18,8 +18,6 @@ final class MenuBarController: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private var statusItem: NSStatusItem!
     private var menu: NSMenu!
     private var parentPid: pid_t?
-    private var lastDataVersion: Int64 = -1
-    private var lastPulseBucket: Int64 = -1
     private var cachedRows: [ProjectRow] = []
 
     init(parentPid: pid_t?) {
@@ -28,22 +26,15 @@ final class MenuBarController: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 
     func applicationDidFinishLaunching(_ notification: Notification) {
-        statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
+        statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.squareLength)
         menu = NSMenu()
         menu.delegate = self
         statusItem.menu = menu
+        // Drawn before the first read, so the item never shows up blank when the database is
+        // missing, locked or mid-migration.
+        updateBadge()
 
-        if let btn = statusItem.button {
-            if let img = NSImage(systemSymbolName: "circle.grid.2x2.fill", accessibilityDescription: "Feeder") {
-                img.isTemplate = true
-                btn.image = img
-                btn.imagePosition = .imageLeading
-            } else {
-                btn.title = "Feeder"
-            }
-        }
-
-        refresh(force: true)
+        refresh()
 
         Timer.scheduledTimer(withTimeInterval: 2.0, repeats: true) { [weak self] _ in
             guard let self else { return }
@@ -53,12 +44,12 @@ final class MenuBarController: NSObject, NSApplicationDelegate, NSMenuDelegate {
                     return
                 }
             }
-            self.refresh(force: false)
+            self.refresh()
         }
     }
 
     func menuWillOpen(_ menu: NSMenu) {
-        refresh(force: true)
+        refresh()
         rebuildMenu()
     }
 
@@ -112,7 +103,7 @@ final class MenuBarController: NSObject, NSApplicationDelegate, NSMenuDelegate {
         return false
     }
 
-    private func refresh(force: Bool) {
+    private func refresh() {
         let path = dbPath()
         guard FileManager.default.fileExists(atPath: path) else {
             cachedRows = []
@@ -120,6 +111,7 @@ final class MenuBarController: NSObject, NSApplicationDelegate, NSMenuDelegate {
             return
         }
 
+        // A failed read keeps the last rows and icon rather than blanking the item.
         var db: OpaquePointer?
         if sqlite3_open_v2(path, &db, SQLITE_OPEN_READONLY | SQLITE_OPEN_NOMUTEX, nil) != SQLITE_OK {
             if db != nil { sqlite3_close(db) }
@@ -127,23 +119,6 @@ final class MenuBarController: NSObject, NSApplicationDelegate, NSMenuDelegate {
         }
         defer { sqlite3_close(db) }
         sqlite3_busy_timeout(db, 500)
-
-        var version: Int64 = 0
-        var vstmt: OpaquePointer?
-        if sqlite3_prepare_v2(db, "PRAGMA data_version", -1, &vstmt, nil) == SQLITE_OK {
-            if sqlite3_step(vstmt) == SQLITE_ROW {
-                version = sqlite3_column_int64(vstmt, 0)
-            }
-        }
-        sqlite3_finalize(vstmt)
-
-        let now = nowMs()
-        let pulseBucket = now / 10_000
-        if !force && version == lastDataVersion && pulseBucket == lastPulseBucket {
-            return
-        }
-        lastDataVersion = version
-        lastPulseBucket = pulseBucket
 
         let sql = """
         SELECT
@@ -169,41 +144,42 @@ final class MenuBarController: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
         var stmt: OpaquePointer?
         var rows: [ProjectRow] = []
-        if sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK {
-            sqlite3_bind_int64(stmt, 1, now)
-            while sqlite3_step(stmt) == SQLITE_ROW {
-                let id = sqlite3_column_int64(stmt, 0)
-                let slug = readSqlString(stmt, 1) ?? ""
-                let name = readSqlString(stmt, 2) ?? slug
-                let seenAt = readSqlInt64(stmt, 3)
-                let lastAt = readSqlInt64(stmt, 4)
-                let lastAgent = readSqlString(stmt, 5)
-                let lastBody = readSqlString(stmt, 6)
-                let lastAnswered = sqlite3_column_int64(stmt, 7)
-                let pulseStatus = readSqlString(stmt, 8)
-                let pulseAgent = readSqlString(stmt, 9)
-
-                let unseen: Bool
-                if let lastAt {
-                    unseen = seenAt == nil || lastAt > seenAt!
-                } else {
-                    unseen = false
-                }
-                let needsYou = lastAnswered == 0 && parseAttention(lastBody)
-                rows.append(ProjectRow(
-                    id: id,
-                    slug: slug,
-                    name: name,
-                    unseen: unseen,
-                    needsYou: needsYou,
-                    pulseStatus: pulseStatus,
-                    pulseAgent: pulseAgent,
-                    lastAgent: lastAgent,
-                    lastAt: lastAt
-                ))
+        guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK else { return }
+        defer { sqlite3_finalize(stmt) }
+        sqlite3_bind_int64(stmt, 1, nowMs())
+        var result = sqlite3_step(stmt)
+        while result == SQLITE_ROW {
+            let id = sqlite3_column_int64(stmt, 0)
+            let slug = readSqlString(stmt, 1) ?? ""
+            let name = readSqlString(stmt, 2) ?? slug
+            let seenAt = readSqlInt64(stmt, 3)
+            let lastAt = readSqlInt64(stmt, 4)
+            let lastAgent = readSqlString(stmt, 5)
+            let lastBody = readSqlString(stmt, 6)
+            let lastAnswered = sqlite3_column_int64(stmt, 7)
+            let pulseStatus = readSqlString(stmt, 8)
+            let pulseAgent = readSqlString(stmt, 9)
+            let unseen: Bool
+            if let lastAt {
+                unseen = seenAt.map { lastAt > $0 } ?? true
+            } else {
+                unseen = false
             }
+            let needsYou = lastAnswered == 0 && parseAttention(lastBody)
+            rows.append(ProjectRow(
+                id: id,
+                slug: slug,
+                name: name,
+                unseen: unseen,
+                needsYou: needsYou,
+                pulseStatus: pulseStatus,
+                pulseAgent: pulseAgent,
+                lastAgent: lastAgent,
+                lastAt: lastAt
+            ))
+            result = sqlite3_step(stmt)
         }
-        sqlite3_finalize(stmt)
+        guard result == SQLITE_DONE else { return }
         cachedRows = rows
         updateBadge()
     }
@@ -214,65 +190,116 @@ final class MenuBarController: NSObject, NSApplicationDelegate, NSMenuDelegate {
         let liveCount = cachedRows.filter { $0.pulseStatus != nil }.count
         let unseenCount = cachedRows.filter { $0.unseen }.count
 
-        if needsCount > 0 {
-            btn.title = " !\(needsCount)"
-        } else if liveCount > 0 {
-            btn.title = " ● \(liveCount)"
-        } else if unseenCount > 0 {
-            btn.title = " \(unseenCount)"
-        } else {
-            btn.title = ""
+        let status = [
+            needsCount > 0 ? "\(needsCount) waiting on you" : nil,
+            liveCount > 0 ? "\(liveCount) working" : nil,
+            unseenCount > 0 ? "\(unseenCount) unread" : nil,
+        ].compactMap { $0 }
+        let label = (["Feeder"] + status).joined(separator: " · ")
+        btn.setAccessibilityLabel(label)
+        btn.toolTip = label
+        // Only a decision earns the dot: unread updates are almost always there, and a dot that
+        // never clears stops meaning anything.
+        btn.image = needsCount > 0 ? Self.attentionIcon : Self.idleIcon
+        btn.imagePosition = .imageOnly
+    }
+
+    private static let idleIcon = statusIcon(attention: false)
+    private static let attentionIcon = statusIcon(attention: true)
+
+    /// Three marbles, after the app icon. With `attention`, a dot sits in the top-right corner,
+    /// cut clear of the marbles so it reads at menu bar size.
+    private static func statusIcon(attention: Bool) -> NSImage {
+        let image = NSImage(size: NSSize(width: 18, height: 18), flipped: false) { _ in
+            NSColor.black.setFill()
+            NSBezierPath(ovalIn: NSRect(x: 1, y: 2, width: 10, height: 10)).fill()
+            NSBezierPath(ovalIn: NSRect(x: 12, y: 2, width: 5, height: 5)).fill()
+            NSBezierPath(ovalIn: NSRect(x: 5, y: 12.5, width: 4.5, height: 4.5)).fill()
+            if attention {
+                NSBezierPath(ovalIn: NSRect(x: 12, y: 11, width: 6, height: 6)).fill()
+            }
+            return true
         }
+        image.isTemplate = true
+        return image
+    }
+
+    private static func dot(_ color: NSColor?) -> NSImage {
+        NSImage(size: NSSize(width: 8, height: 8), flipped: false) { rect in
+            if let color {
+                color.setFill()
+                NSBezierPath(ovalIn: rect.insetBy(dx: 0.5, dy: 0.5)).fill()
+            }
+            return true
+        }
+    }
+
+    private static let needsDot = dot(.systemOrange)
+    private static let workingDot = dot(.systemGreen)
+    private static let unreadDot = dot(.controlAccentColor)
+    private static let noDot = dot(nil)
+
+    private func header(_ title: String) -> NSMenuItem {
+        if #available(macOS 14.0, *) {
+            return NSMenuItem.sectionHeader(title: title)
+        }
+        let item = NSMenuItem(title: title, action: nil, keyEquivalent: "")
+        item.isEnabled = false
+        return item
+    }
+
+    /// A project row: the name, then a quieter note (what it's doing or who posted last).
+    private func projectItem(_ p: ProjectRow, note: String?, dot: NSImage) -> NSMenuItem {
+        let item = NSMenuItem(title: p.name, action: #selector(openProjectItem(_:)), keyEquivalent: "")
+        if let note, !note.isEmpty {
+            let title = NSMutableAttributedString(string: p.name, attributes: [.font: NSFont.menuFont(ofSize: 0)])
+            title.append(NSAttributedString(string: "  \(note)", attributes: [
+                .font: NSFont.menuFont(ofSize: 0),
+                .foregroundColor: NSColor.secondaryLabelColor,
+            ]))
+            item.attributedTitle = title
+        }
+        item.image = dot
+        item.target = self
+        item.representedObject = p.slug
+        return item
     }
 
     private func rebuildMenu() {
         menu.removeAllItems()
 
-        let working = cachedRows.filter { $0.pulseStatus != nil }
-        if !working.isEmpty {
-            let hdr = NSMenuItem(title: "Working Now", action: nil, keyEquivalent: "")
-            hdr.isEnabled = false
-            menu.addItem(hdr)
-            for p in working {
-                let status = p.pulseStatus ?? "Working"
-                let agent = p.pulseAgent.map { " (\($0))" } ?? ""
-                let item = NSMenuItem(title: "● \(p.name) · \(status)\(agent)", action: #selector(openProjectItem(_:)), keyEquivalent: "")
-                item.target = self
-                item.representedObject = p.slug
-                menu.addItem(item)
-            }
-            menu.addItem(.separator())
-        }
-
-        let attention = cachedRows.filter { $0.needsYou }
-        if !attention.isEmpty {
-            let hdr = NSMenuItem(title: "Needs You", action: nil, keyEquivalent: "")
-            hdr.isEnabled = false
-            menu.addItem(hdr)
-            for p in attention {
-                let item = NSMenuItem(title: "◆ \(p.name)", action: #selector(openProjectItem(_:)), keyEquivalent: "")
-                item.target = self
-                item.representedObject = p.slug
-                menu.addItem(item)
-            }
-            menu.addItem(.separator())
-        }
-
         if cachedRows.isEmpty {
-            let empty = NSMenuItem(title: "No active projects", action: nil, keyEquivalent: "")
+            let empty = NSMenuItem(title: "No projects yet", action: nil, keyEquivalent: "")
             empty.isEnabled = false
             menu.addItem(empty)
+            let hint = NSMenuItem(title: "Ask an agent to “post a Feeder update”", action: nil, keyEquivalent: "")
+            hint.isEnabled = false
+            menu.addItem(hint)
         } else {
-            let hdr = NSMenuItem(title: "Projects", action: nil, keyEquivalent: "")
-            hdr.isEnabled = false
-            menu.addItem(hdr)
-            for p in cachedRows.prefix(10) {
-                let prefix = p.unseen ? "• " : "  "
-                let agentSuffix = p.lastAgent.map { " · \($0)" } ?? ""
-                let item = NSMenuItem(title: "\(prefix)\(p.name)\(agentSuffix)", action: #selector(openProjectItem(_:)), keyEquivalent: "")
-                item.target = self
-                item.representedObject = p.slug
-                menu.addItem(item)
+            // Each project appears once, under the most pressing thing about it.
+            let needs = cachedRows.filter { $0.needsYou }
+            let working = cachedRows.filter { !$0.needsYou && $0.pulseStatus != nil }
+            let rest = cachedRows.filter { !$0.needsYou && $0.pulseStatus == nil }
+
+            if !needs.isEmpty {
+                menu.addItem(header("Waiting on you"))
+                for p in needs {
+                    menu.addItem(projectItem(p, note: p.lastAgent, dot: Self.needsDot))
+                }
+            }
+            if !working.isEmpty {
+                menu.addItem(header("Working now"))
+                for p in working {
+                    let note = [p.pulseStatus, p.pulseAgent].compactMap { $0 }.joined(separator: " · ")
+                    menu.addItem(projectItem(p, note: note, dot: Self.workingDot))
+                }
+            }
+            let shown = max(0, 8 - needs.count - working.count)
+            if shown > 0 && !rest.isEmpty {
+                menu.addItem(header("Recent"))
+                for p in rest.prefix(shown) {
+                    menu.addItem(projectItem(p, note: p.lastAgent, dot: p.unseen ? Self.unreadDot : Self.noDot))
+                }
             }
         }
 
@@ -280,19 +307,20 @@ final class MenuBarController: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
         let unseenCount = cachedRows.filter { $0.unseen }.count
         if unseenCount > 0 {
-            let markRead = NSMenuItem(title: "Mark All Read (\(unseenCount))", action: #selector(markAllRead), keyEquivalent: "")
+            let markRead = NSMenuItem(title: "Mark All Read", action: #selector(markAllRead), keyEquivalent: "")
             markRead.target = self
             menu.addItem(markRead)
         }
 
-        let openHome = NSMenuItem(title: "Open Feeder", action: #selector(openFeederHome), keyEquivalent: "")
-        openHome.target = self
-        menu.addItem(openHome)
-
-        let openFeed = NSMenuItem(title: "Open Feed", action: #selector(openFeederFeed), keyEquivalent: "")
-        openFeed.target = self
-        menu.addItem(openFeed)
-
+        for (title, action) in [
+            ("Open Feeder", #selector(openFeederHome)),
+            ("Open Feed", #selector(openFeederFeed)),
+            ("Open Notebook", #selector(openFeederNotebook)),
+        ] {
+            let item = NSMenuItem(title: title, action: action, keyEquivalent: "")
+            item.target = self
+            menu.addItem(item)
+        }
     }
 
     private func openUrl(_ raw: String) {
@@ -307,6 +335,7 @@ final class MenuBarController: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     @objc private func openFeederHome() { openUrl("feeder://home") }
     @objc private func openFeederFeed() { openUrl("feeder://feed") }
+    @objc private func openFeederNotebook() { openUrl("feeder://notebook") }
 
     @objc private func markAllRead() {
         var candidates: [String] = []
@@ -326,7 +355,7 @@ final class MenuBarController: NSObject, NSApplicationDelegate, NSMenuDelegate {
         task.arguments = ["seen", "--all"]
         try? task.run()
         task.waitUntilExit()
-        refresh(force: true)
+        refresh()
     }
 }
 
