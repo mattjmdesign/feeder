@@ -231,11 +231,21 @@ const ballStyle = `background:${orbBackground(hero)}`;
 
   toggle?.addEventListener('click', () => {
     const next = isDark() ? 'light' : 'dark';
-    root.dataset.theme = next;
-    try {
-      localStorage.setItem('feeder-theme', next);
-    } catch {
-      /* storage unavailable */
+    const system = mq.matches ? 'dark' : 'light';
+    if (next === system) {
+      delete root.dataset.theme;
+      try {
+        localStorage.removeItem('feeder-theme');
+      } catch {
+        /* storage unavailable */
+      }
+    } else {
+      root.dataset.theme = next;
+      try {
+        localStorage.setItem('feeder-theme', next);
+      } catch {
+        /* storage unavailable */
+      }
     }
     syncThemeControl();
   });
