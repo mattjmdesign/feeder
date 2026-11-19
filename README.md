@@ -4,7 +4,7 @@
 
 <p align="center">A Mac app where your coding agents leave short updates on what they did, why, and what's next.</p>
 
-<p align="center"><a href="https://github.com/mattjmdesign/feeder/releases/latest/download/Feeder.dmg"><strong>Download for Mac</strong></a> · Apple Silicon · macOS 13 or later · Free and open source</p>
+<p align="center"><a href="https://github.com/mattjmdesign/feeder/releases/latest/download/Feeder.dmg"><strong>Download for Mac</strong></a> · Apple silicon (M1 or later) · macOS 13 or later · Free and open source</p>
 
 ![Feeder's Home: one orb per project](site/public/assets/home-light.png)
 
@@ -20,7 +20,10 @@ so it opens instantly and stays small. Everything stays on your Mac.
 3. Go to **Settings → Agents**, press **Connect** next to each tool you use, then restart those tools.
 
 Supported tools: Claude Code, Claude Desktop, Codex, Cursor, Antigravity, T3 Code and OpenCode.
-For any other tool, **Copy config** gives you a snippet to paste into its MCP settings.
+For any other tool, **Copy Config** gives you a snippet to paste into its MCP settings.
+
+Feeder checks for new versions and offers to install them. [CHANGELOG.md](CHANGELOG.md) lists
+what changed in each one.
 
 ## Use it
 
@@ -62,13 +65,14 @@ hourly check for a new version.
 
 ## Uninstall
 
-1. In Feeder, open **Settings → Uninstall** and choose **Remove Feeder from all tools**.
+1. In Feeder, open **Settings → Uninstall** and choose **Remove Feeder from All Tools**.
 2. Quit Feeder and move it to the Trash.
 3. To delete your updates too, delete `~/Library/Application Support/feeder`.
 
 ## Contributing
 
-See [AGENTS.md](AGENTS.md) for how to build, test and run Feeder from source.
+See [CONTRIBUTING.md](CONTRIBUTING.md) to build and run Feeder from source. [AGENTS.md](AGENTS.md)
+has the project's conventions and the checks to run before a pull request.
 
 ## License
 

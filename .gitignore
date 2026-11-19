@@ -1,39 +1,39 @@
-# Rust build output
+# Rust
 /target/
-**/*.rs.bk
 *.profraw
 *.profdata
 
-# Packaging scratch (scripts/mac-app.sh stages bundles in temp dirs; never commit built apps)
+# Packaging: scripts/mac-app.sh builds into temp folders and dist/
+/dist/
 *.app/
 *.iconset/
 *.icns
-/dist/
 
 # Website (Astro)
 /site/node_modules/
 /site/dist/
 /site/.astro/
 
-# Local Feeder data, if FEEDER_HOME is ever pointed inside the repo
+# Feeder data, in case FEEDER_HOME is pointed inside the repo. Keep scratch data outside it.
 feeder.db
 feeder.db-*
-/media/
-settings.json
 *.feeder-backup
 *.feeder-tmp
 
-# Headless snapshots and recordings made while developing
+# Headless snapshots made while developing
 /snaps/
 *.snap.png
 
-# Editors and OS
-.DS_Store
+# Local agent and editor settings
+.claude/settings.local.json
+CLAUDE.local.md
 .idea/
 .vscode/
 *.swp
 *~
+.DS_Store
 
 # Secrets
 .env
 .env.*
+!.env.example

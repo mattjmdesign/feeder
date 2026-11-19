@@ -25,6 +25,9 @@ if [[ ! -f "$NOTES" ]]; then
   echo "No release notes at $NOTES. Write what changed for people under a '## What's new' heading." >&2
   exit 2
 fi
+if ! scripts/changelog.sh --check; then
+  exit 1
+fi
 if [[ -n "$(git status --porcelain)" ]]; then
   echo "Commit your changes first; a release builds what's committed." >&2
   exit 1
