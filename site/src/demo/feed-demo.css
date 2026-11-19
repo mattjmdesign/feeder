@@ -216,13 +216,16 @@
   }
 
   .fd-card__agent {
+    display: inline-flex;
+    align-items: center;
+    gap: 5px;
     color: var(--ss-text);
     font-size: 12px;
   }
 
   .fd-card__agent::before {
     content: '·';
-    margin-right: 10px;
+    margin-right: 5px;
     color: var(--ss-text-faint);
   }
 

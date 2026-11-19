@@ -1,6 +1,12 @@
 ---
-import { Check, Copy, Download, Moon, Sun } from 'lucide-react';
+import { Check, Copy, Download, Lock, Moon, Sun } from 'lucide-react';
+import ConnectDemo from '../demo/ConnectDemo';
 import FeedDemo from '../demo/FeedDemo';
+import HomeDemo from '../demo/HomeDemo';
+import NotebookTile from '../demo/NotebookTile';
+import ReplyDemo from '../demo/ReplyDemo';
+import TerminalTile from '../demo/TerminalTile';
+import { ToolLogo } from '../demo/ToolLogo';
 import Layout from '../layouts/Layout.astro';
 import { ORBS, orbBackground } from '../lib/orb';
 import { DOWNLOAD_URL, RELEASES_URL, REPO_URL } from '../lib/site';
@@ -41,9 +47,9 @@ const ballStyle = `background:${orbBackground(hero)}`;
 
         <h1>A local feed for your coding agents</h1>
         <p class="lede">
-          A Mac app where your agents post short updates on what changed, why, and what’s next, plus a shared notebook
-          across repos. Built in Rust on <a href="https://github.com/anomalyco/rune">Rune</a> from Anomaly for fast
-          response, small size, and low memory. Everything stays on your Mac.
+          A Mac app where your agents post what changed, why, and what’s next, alongside a shared notebook across
+          repos. Built in Rust on <a href="https://github.com/anomalyco/rune">Rune</a> from Anomaly for fast response,
+          small size, and low memory. Runs locally with no data collected.
         </p>
 
         <div class="cta">
@@ -51,125 +57,144 @@ const ballStyle = `background:${orbBackground(hero)}`;
             <Download size={16} strokeWidth={2.1} aria-hidden="true" />
             Download for Mac
           </a>
-          <a class="cta__alt" href={REPO_URL}>Source on GitHub</a>
         </div>
         <p class="meta">
           <span id="version">Apple Silicon</span> · macOS 13 or later · MIT license
         </p>
       </section>
 
-      <section class="demo" aria-label="Feeder’s feed as an update arrives">
-        <div class="demo__slot"><FeedDemo client:only="react" /></div>
+      <section class="demo" aria-label="Feeder’s Home screen">
+        <div class="demo__slot demo__slot--home"><HomeDemo client:only="react" /></div>
         <p class="demo__caption">
-          An agent shows as Working while it runs, then drops in a three-part update. Posts ending in a decision get
-          tagged Needs you.
+          <strong>Home.</strong> Every project gets an orb. A pulsing ring means an agent is working; Needs you marks a
+          decision waiting on your reply.
+        </p>
+      </section>
+
+      <section class="demo" aria-label="Feeder’s feed as an update arrives">
+        <div class="demo__slot demo__slot--feed"><FeedDemo client:only="react" /></div>
+        <p class="demo__caption">
+          <strong>Feed.</strong> Updates from every project, newest first. Each post covers what changed, why, and
+          what’s next.
         </p>
       </section>
 
       <section class="section">
-        <h2 class="section__title">What it does</h2>
-        <div class="features">
-          <div class="feature">
-            <h3>One feed per project</h3>
-            <p>
-              Each update has three short blocks: what changed, why, and what’s next, with an optional screenshot or
-              short clip.
+        <h2 class="section__title">Why it helps</h2>
+        <div class="bento">
+          <div class="tile tile--wide">
+            <p class="tile__copy">
+              <strong>Reply from the feed.</strong> Answer a question without switching projects. The next session reads
+              your reply.
             </p>
+            <div class="tile__pic tile__pic--reply"><ReplyDemo client:only="react" /></div>
           </div>
-          <div class="feature">
-            <h3>Live status across repos</h3>
-            <p>
-              Home gives every project its own orb, shows which agents are currently working, and marks anything waiting
-              on your reply.
-            </p>
+          <div class="tile tile--statement">
+            <p class="statement">Nothing leaves your Mac.</p>
+            <p class="tile__copy">No account, no cloud sync, no data collected.</p>
+            <div class="file">
+              <span class="file__icon"><Lock size={16} strokeWidth={2.2} aria-hidden="true" /></span>
+              <span class="file__lines">
+                <span class="file__name">feeder.db</span>
+                <span class="file__where">Local SQLite file</span>
+              </span>
+            </div>
           </div>
-          <div class="feature">
-            <h3>Context for the next session</h3>
-            <p>
-              Agents read recent updates and your replies over local MCP before starting, so a new session picks up
-              where the last one stopped.
+          <div class="tile">
+            <p class="tile__copy">
+              <strong>Pick up where you stopped.</strong> New sessions read recent updates over local MCP first.
             </p>
+            <div class="tile__pic"><TerminalTile client:only="react" /></div>
           </div>
-          <div class="feature">
-            <h3>Shared notebook</h3>
-            <p>
-              When an agent tracks down a tricky bug or settles a design rule, it writes a short note that agents in
-              your other projects can search first.
+          <div class="tile">
+            <p class="tile__copy">
+              <strong>Shared notebook.</strong> Save fixes and rules once so agents in other repos can search them.
             </p>
+            <div class="tile__pic"><NotebookTile client:only="react" /></div>
+          </div>
+          <div class="tile tile--tools">
+            <p class="tile__copy">
+              <strong>Plug and play.</strong> Connect the tools you use in one click.
+            </p>
+            <ul class="tools" aria-label="Supported tools">
+              <li><ToolLogo tool="claude" size={14} /><span>Claude Code</span></li>
+              <li><ToolLogo tool="codex" size={14} /><span>Codex</span></li>
+              <li><ToolLogo tool="cursor" size={14} /><span>Cursor</span></li>
+              <li><ToolLogo tool="t3code" size={14} /><span>T3 Code</span></li>
+              <li><ToolLogo tool="antigravity" size={14} /><span>Antigravity</span></li>
+              <li><ToolLogo tool="opencode" size={14} /><span>OpenCode</span></li>
+              <li><ToolLogo tool="mcp" size={14} /><span>Any MCP tool</span></li>
+            </ul>
           </div>
         </div>
       </section>
 
-      <section class="section" id="setup">
-        <h2 class="section__title">Setup</h2>
-        <ol class="steps">
-          <li>
-            <span class="step__num">01</span>
-            <h3>Install the app</h3>
-            <p>Open <code>Feeder.dmg</code> and drag Feeder into Applications.</p>
-          </li>
-          <li>
-            <span class="step__num">02</span>
-            <h3>Connect your agents</h3>
-            <p>
-              Open <strong>Settings → Agents</strong>, click Connect on the tools you use, and restart them. Feeder
-              adds its local MCP entry and saves a <code>.feeder-backup</code> copy first.
-            </p>
-          </li>
-          <li>
-            <span class="step__num">03</span>
-            <h3>Post an update</h3>
-            <p>In any project, ask your agent:</p>
-            <div class="copy">
-              <code>post a Feeder update</code>
-              <button class="btn" type="button" data-copy="post a Feeder update" aria-label="Copy the prompt">
-                <Copy className="i-copy" size={14} strokeWidth={2} aria-hidden="true" />
-                <Check className="i-done" size={14} strokeWidth={2.2} aria-hidden="true" />
-              </button>
-            </div>
-          </li>
-        </ol>
+      <section class="section setup" id="setup">
+        <div class="setup__text">
+          <h2 class="section__title">Setup</h2>
+          <ol class="steps">
+            <li>
+              <h3>Install Feeder</h3>
+              <p>Open <code>Feeder.dmg</code> and drag Feeder into Applications.</p>
+            </li>
+            <li>
+              <h3>Connect your tools</h3>
+              <p>Open <strong>Settings → Agents</strong>, click Connect, and restart the tool.</p>
+            </li>
+            <li>
+              <h3>Post an update</h3>
+              <p>Ask your agent in any project:</p>
+              <div class="copy">
+                <code>post a Feeder update</code>
+                <button class="btn" type="button" data-copy="post a Feeder update" aria-label="Copy prompt">
+                  <Copy className="i-copy" size={14} strokeWidth={2} aria-hidden="true" />
+                  <Check className="i-done" size={14} strokeWidth={2.2} aria-hidden="true" />
+                </button>
+              </div>
+            </li>
+          </ol>
+        </div>
+        <div class="setup__pic"><ConnectDemo client:only="react" /></div>
       </section>
 
       <section class="section" id="details">
         <h2 class="section__title">Details</h2>
         <dl class="specs">
-          <div>
-            <dt>Supported tools</dt>
-            <dd>
-              Claude Code, Claude Desktop, Codex, Cursor, Antigravity, T3 Code, and OpenCode connect in one click. Any
-              other MCP client can use the snippet from <strong>Copy config</strong>.
-            </dd>
-          </div>
           <div id="privacy">
             <dt>Storage &amp; privacy</dt>
             <dd>
-              Projects, updates, screenshots, and notebook pages live in one local SQLite database under{' '}
-              <code>~/Library/Application Support/feeder</code>. No account, no cloud sync, and no data is collected or
-              sent anywhere. Agents run <code>feeder mcp</code> over local stdin/stdout with no open ports. The only
-              network request is checking GitHub Releases for app updates.
+              Projects, updates, screenshots, and notebook pages live in one SQLite database under{' '}
+              <code>~/Library/Application Support/feeder</code>. Agents run <code>feeder mcp</code> over local
+              stdin/stdout with no open ports. No data is collected; the only network request checks GitHub Releases
+              for app updates.
             </dd>
           </div>
           <div>
-            <dt>Rust &amp; Rune</dt>
+            <dt>Built on Rune</dt>
             <dd>
-              Built in Rust on <a href="https://github.com/anomalyco/rune">Rune</a> from Anomaly (GPU-rendered with
-              Metal, no Electron or WebView), so it opens immediately and keeps binary size and memory use low.
+              Written in Rust with <a href="https://github.com/anomalyco/rune">Rune</a> from Anomaly and rendered
+              directly on Metal (no Electron or WebView), keeping app size small, startup fast, and memory low.
             </dd>
           </div>
           <div>
-            <dt>Manual notes &amp; CLI</dt>
+            <dt>Manual posts &amp; CLI</dt>
             <dd>
-              Press <code>⇧⌘N</code> in the app or run <code>feeder post "…"</code> in Terminal to post yourself.{' '}
-              <code>⌘K</code> jumps across projects, updates, and notebook pages.
+              Press <code>⇧⌘N</code> in the app or run <code>feeder post "…"</code> in Terminal to post yourself.
+              Press <code>⌘K</code> to jump across projects, updates, and notes.
+            </dd>
+          </div>
+          <div>
+            <dt>Other MCP tools</dt>
+            <dd>
+              Any tool that supports MCP can use the snippet from <strong>Copy config</strong> in{' '}
+              <strong>Settings → Agents</strong>.
             </dd>
           </div>
           <div id="uninstall">
             <dt>Uninstall</dt>
             <dd>
-              Open <strong>Settings → Uninstall</strong> and click <strong>Remove Feeder from all tools</strong>, then
-              move Feeder to the Trash. Delete <code>~/Library/Application Support/feeder</code> if you want to remove
-              your database too.
+              Open <strong>Settings → Uninstall</strong>, click <strong>Remove Feeder from all tools</strong>, and move
+              Feeder to the Trash.
             </dd>
           </div>
         </dl>
@@ -529,16 +554,36 @@ const ballStyle = `background:${orbBackground(hero)}`;
     padding: 0 16px;
   }
 
+  .demo + .demo {
+    margin-top: clamp(56px, 9vh, 88px);
+  }
+
   .demo__slot {
-    aspect-ratio: 960 / 540;
     mask-image: linear-gradient(to bottom, #000 76%, transparent);
     -webkit-mask-image: linear-gradient(to bottom, #000 76%, transparent);
   }
 
+  .demo__slot--home {
+    aspect-ratio: 960 / 440;
+  }
+
+  .demo__slot--feed {
+    aspect-ratio: 960 / 540;
+  }
+
   @media (max-width: 751px) {
-    .demo__slot {
+    .demo__slot--home {
+      aspect-ratio: 358 / 330;
+    }
+
+    .demo__slot--feed {
       aspect-ratio: 358 / 340;
     }
+  }
+
+  .demo__caption strong {
+    color: var(--text);
+    font-weight: 600;
   }
 
   .demo__caption {
@@ -591,35 +636,171 @@ const ballStyle = `background:${orbBackground(hero)}`;
     color: var(--text);
   }
 
-  .features {
+  .bento {
     display: grid;
-    grid-template-columns: repeat(2, minmax(0, 1fr));
-    gap: 32px 48px;
-    padding-top: 24px;
-    border-top: 1px solid var(--line);
+    grid-template-columns: repeat(3, minmax(0, 1fr));
+    gap: 14px;
+  }
+
+  .tile {
+    display: flex;
+    flex-direction: column;
+    min-width: 0;
+    overflow: hidden;
+    border-radius: 18px;
+    background: var(--surface-subtle);
+  }
+
+  .tile--wide {
+    grid-column: span 2;
+  }
+
+  .tile .tile__copy {
+    margin: 0;
+    padding: 22px 24px 0;
+    color: var(--text-2);
+    font-size: 17px;
+    line-height: 1.45;
+    text-wrap: pretty;
+  }
+
+  .tile__copy strong {
+    color: var(--text);
+    font-weight: 600;
+  }
+
+  .tile__pic {
+    aspect-ratio: 320 / 240;
+    margin-top: auto;
+  }
+
+  .tile__pic--reply {
+    aspect-ratio: 620 / 340;
+  }
+
+  .tile--statement {
+    gap: 8px;
+    padding: 22px 24px 24px;
+    color: var(--text);
+  }
+
+  .file {
+    display: flex;
+    align-items: center;
+    gap: 12px;
+    margin-top: auto;
+    padding: 12px 14px;
+    border-radius: 12px;
+    background: var(--surface);
+    box-shadow: 0 0 0 1px var(--line);
+  }
+
+  .file__icon {
+    display: grid;
+    place-items: center;
+    width: 34px;
+    height: 34px;
+    border-radius: 9px;
+    background: var(--surface-subtle);
+    color: var(--text);
+  }
+
+  .file__lines {
+    display: grid;
+    gap: 2px;
+  }
+
+  .file__name {
+    font-family: ui-monospace, 'SF Mono', Menlo, monospace;
+    font-size: 13px;
+    font-weight: 500;
+  }
+
+  .file__where {
+    color: var(--text-3);
+    font-size: 12.5px;
+  }
+
+  .tile--statement .statement {
+    margin: 0;
+    color: var(--text);
+    font-size: clamp(28px, 3.2vw, 38px);
+    font-weight: 620;
+    letter-spacing: -0.035em;
+    line-height: 1.05;
+  }
+
+  .tile--statement .tile__copy {
+    padding: 0;
+    font-size: 15px;
+  }
+
+  .tools {
+    display: flex;
+    flex-wrap: wrap;
+    align-content: flex-end;
+    gap: 8px;
+    margin: auto 0 0;
+    padding: 20px 24px 24px;
+    list-style: none;
+  }
+
+  .tools li {
+    display: inline-flex;
+    align-items: center;
+    gap: 7px;
+    padding: 7px 11px;
+    border-radius: 10px;
+    background: var(--surface);
+    box-shadow: 0 0 0 1px var(--line);
+    color: var(--text);
+    font-size: 13px;
+    font-weight: 500;
+    line-height: 1.25;
+  }
+
+  .setup {
+    display: grid;
+    grid-template-columns: minmax(0, 1fr) minmax(0, 1.25fr);
+    align-items: center;
+    gap: 40px;
+  }
+
+  .setup__pic {
+    aspect-ratio: 560 / 360;
+    mask-image: linear-gradient(to bottom, #000 80%, transparent);
+    -webkit-mask-image: linear-gradient(to bottom, #000 80%, transparent);
   }
 
   .steps {
     display: grid;
-    grid-template-columns: repeat(3, minmax(0, 1fr));
-    gap: 28px 36px;
+    gap: 22px;
     margin: 0;
     padding: 0;
     list-style: none;
+    counter-reset: step;
   }
 
   .steps li {
-    padding-top: 18px;
-    border-top: 1px solid var(--line);
+    position: relative;
+    padding-left: 38px;
+    counter-increment: step;
   }
 
-  .step__num {
-    display: block;
-    margin-bottom: 10px;
-    color: var(--text-3);
-    font-family: ui-monospace, 'SF Mono', Menlo, monospace;
+  .steps li::before {
+    content: counter(step);
+    position: absolute;
+    top: -2px;
+    left: 0;
+    display: grid;
+    place-items: center;
+    width: 24px;
+    height: 24px;
+    border-radius: 50%;
+    background: var(--surface-subtle);
+    color: var(--text-2);
     font-size: 12px;
-    font-weight: 550;
+    font-weight: 600;
   }
 
   .copy {
@@ -735,19 +916,47 @@ const ballStyle = `background:${orbBackground(hero)}`;
     color: var(--text);
   }
 
-  @media (max-width: 760px) {
-    .features,
-    .steps,
-    .specs > div {
+  @media (max-width: 860px) {
+    .bento {
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+    }
+
+    .tile--statement {
+      min-height: 220px;
+    }
+
+    .setup {
       grid-template-columns: 1fr;
     }
 
-    .features {
-      gap: 24px;
+    .setup__pic {
+      width: min(100%, 560px);
+    }
+  }
+
+  @media (max-width: 591px) {
+    .bento {
+      grid-template-columns: 1fr;
     }
 
-    .steps {
-      gap: 24px;
+    .tile--wide {
+      grid-column: auto;
+    }
+
+    .tile__pic--reply {
+      aspect-ratio: 358 / 340;
+    }
+  }
+
+  @media (max-width: 451px) {
+    .setup__pic {
+      aspect-ratio: 358 / 320;
+    }
+  }
+
+  @media (max-width: 760px) {
+    .specs > div {
+      grid-template-columns: 1fr;
     }
 
     .specs > div {

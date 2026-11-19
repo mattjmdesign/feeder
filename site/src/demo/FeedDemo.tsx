@@ -1,4 +1,3 @@
-import { useEffect, useState } from 'react'
 import { Stage } from '../stageshow/kit/stage'
 import type { Act } from '../stageshow/kit/act'
 import { Bar, Window } from '../stageshow/kit/window'
@@ -7,6 +6,8 @@ import { Badge } from '../stageshow/kit/controls/Badge'
 import { Segmented } from '../stageshow/kit/controls/Segmented'
 import { Spinner } from '../stageshow/kit/parts/Spinner'
 import { ORBS, orbBackground, type Orb } from '../lib/orb'
+import { ToolLogo } from './ToolLogo'
+import { useSiteTheme } from './theme'
 import './feed-demo.css'
 
 // Feeder's Feed while an agent works. Beats: a Working pulse opens at the top
@@ -30,31 +31,6 @@ async function script(a: Act<S>) {
   await a.wait(4200)
   a.put({ posted: false })
   await a.wait(900)
-}
-
-function resolveTheme(): 'light' | 'dark' {
-  if (typeof document === 'undefined') return 'dark'
-  const explicit = document.documentElement.dataset.theme
-  if (explicit === 'light' || explicit === 'dark') return explicit
-  return window.matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light'
-}
-
-function useSiteTheme(): 'light' | 'dark' {
-  const [theme, setTheme] = useState<'light' | 'dark'>(resolveTheme)
-
-  useEffect(() => {
-    const sync = () => setTheme(resolveTheme())
-    const mq = window.matchMedia('(prefers-color-scheme: dark)')
-    mq.addEventListener('change', sync)
-    const mo = new MutationObserver(sync)
-    mo.observe(document.documentElement, { attributes: true, attributeFilter: ['data-theme'] })
-    return () => {
-      mq.removeEventListener('change', sync)
-      mo.disconnect()
-    }
-  }, [])
-
-  return theme
 }
 
 function OrbDot({ orb, size = 22 }: { orb: Orb; size?: number }) {
@@ -113,7 +89,7 @@ export default function FeedDemo() {
                   <header className="fd-card__head">
                     <OrbDot orb={ORBS.orbit!} />
                     <span className="fd-card__project">Orbit</span>
-                    <span className="fd-card__agent">Codex</span>
+                    <span className="fd-card__agent"><ToolLogo tool="codex" size={12} />Codex</span>
                     <span className="fd-card__spacer" />
                     <Badge tone="warning" dot className="fd-needs">Needs you</Badge>
                     <span className="fd-card__when">just now</span>
@@ -137,7 +113,7 @@ export default function FeedDemo() {
                 <header className="fd-card__head">
                   <OrbDot orb={ORBS.atlas!} />
                   <span className="fd-card__project">Atlas API</span>
-                  <span className="fd-card__agent">Claude Code</span>
+                  <span className="fd-card__agent"><ToolLogo tool="claude" size={12} />Claude Code</span>
                   <span className="fd-card__spacer" />
                   <span className="fd-card__when">2h ago</span>
                 </header>

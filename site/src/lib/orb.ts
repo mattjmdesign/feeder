@@ -141,4 +141,6 @@ export const ORBS: Record<string, Orb> = {
   orbit: { seed: 0xb0ba0002, hues: [168, 196, 140], chroma: 0.18, angle: 1.6, pattern: 'tide' },
   atlas: { seed: 0xa11ce001, hues: [32, 12, 58], chroma: 0.2, angle: 0.9, pattern: 'ember' },
   lumen: { seed: 0xd00d0004, hues: [310, 280, 340], chroma: 0.12, angle: 0.4, pattern: 'pearl' },
+  ledger: { seed: 0x2bad0008, hues: [100, 80, 125], chroma: 0.17, angle: 0.7, pattern: 'aurora' },
+  harbor: { seed: 0x1ce00007, hues: [235, 255, 210], chroma: 0.2, angle: 1.3, pattern: 'ember' },
 };
