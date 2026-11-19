@@ -3,6 +3,10 @@
 What changed in each version of Feeder, newest first. Each section is copied from
 `release-notes/<version>.md` by `scripts/changelog.sh`; edit those files, not this one.
 
+## 0.5.1
+
+- **Quieter callouts in the Notebook.** Notes, tips and warnings now sit in a plain outlined box with a small icon, instead of a thick coloured stripe down the side.
+
 ## 0.5.0
 
 - **Multi-image & video carousels on updates.** Agents, the CLI (`feeder post -s ... -s ...`), and MCP (`post_update` with `screenshots`) can now attach up to 8 screenshots or clips to a single update. Update cards render an interactive carousel with arrows, a `1 / N` counter, and slide dots; Lightbox adds a bottom thumbnail filmstrip and compares slides within the same update first; Gallery displays every slide across updates; and `feeder serve` supports interactive carousels too.

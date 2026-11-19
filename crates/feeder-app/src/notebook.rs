@@ -1134,10 +1134,34 @@ impl CalloutKind {
     fn icon_color(self, p: &Palette) -> Color {
         match self {
             Self::Note => p.text_2,
-            Self::Tip => if p.dark { oklch(0.73, 0.085, 155.0) } else { oklch(0.49, 0.095, 155.0) },
-            Self::Warning => if p.dark { oklch(0.76, 0.10, 68.0) } else { oklch(0.54, 0.11, 64.0) },
-            Self::Important => if p.dark { oklch(0.74, 0.09, 255.0) } else { oklch(0.50, 0.10, 255.0) },
-            Self::Caution => if p.dark { oklch(0.73, 0.11, 26.0) } else { oklch(0.52, 0.12, 26.0) },
+            Self::Tip => {
+                if p.dark {
+                    oklch(0.73, 0.085, 155.0)
+                } else {
+                    oklch(0.49, 0.095, 155.0)
+                }
+            }
+            Self::Warning => {
+                if p.dark {
+                    oklch(0.76, 0.10, 68.0)
+                } else {
+                    oklch(0.54, 0.11, 64.0)
+                }
+            }
+            Self::Important => {
+                if p.dark {
+                    oklch(0.74, 0.09, 255.0)
+                } else {
+                    oklch(0.50, 0.10, 255.0)
+                }
+            }
+            Self::Caution => {
+                if p.dark {
+                    oklch(0.73, 0.11, 26.0)
+                } else {
+                    oklch(0.52, 0.12, 26.0)
+                }
+            }
         }
     }
 }
