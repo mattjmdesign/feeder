@@ -3,9 +3,10 @@ import { Check, Copy, Download, Lock, Moon, Sun } from 'lucide-react';
 import ConnectDemo from '../demo/ConnectDemo';
 import FeedDemo from '../demo/FeedDemo';
 import HomeDemo from '../demo/HomeDemo';
-import NotebookTile from '../demo/NotebookTile';
+import MenuTile from '../demo/MenuTile';
+import McpDemo from '../demo/McpDemo';
+import NotebookDemo from '../demo/NotebookDemo';
 import ReplyDemo from '../demo/ReplyDemo';
-import TerminalTile from '../demo/TerminalTile';
 import { ToolLogo } from '../demo/ToolLogo';
 import Layout from '../layouts/Layout.astro';
 import { ORBS, orbBackground } from '../lib/orb';
@@ -79,6 +80,34 @@ const ballStyle = `background:${orbBackground(hero)}`;
         </p>
       </section>
 
+      <section class="section feature" id="mcp">
+        <div class="feature__text">
+          <h2 class="section__title">Agents talk to Feeder over MCP</h2>
+          <p>
+            Feeder runs a small MCP server on your Mac. An agent reads the feed before it starts and posts what it did
+            when it’s done, so the next session picks up the plan and your replies.
+          </p>
+        </div>
+        <div class="feature__pic feature__pic--mcp"><McpDemo client:only="react" /></div>
+        <ul class="calls" aria-label="What agents can do">
+          <li><code>get_feed</code><span>Recent updates and your replies</span></li>
+          <li><code>post_update</code><span>What was done, why, and what’s next</span></li>
+          <li><code>pulse</code><span>Shows the agent as working on Home</span></li>
+          <li><code>search_notebook</code><span>Fixes from your other projects</span></li>
+        </ul>
+      </section>
+
+      <section class="section feature" id="notebook">
+        <div class="feature__text">
+          <h2 class="section__title">A notebook that carries across projects</h2>
+          <p>
+            When an agent solves something tricky, it writes a short page: what happened and what to do next time.
+            Agents in your other projects search it before they start debugging.
+          </p>
+        </div>
+        <div class="feature__pic feature__pic--notebook"><NotebookDemo client:only="react" /></div>
+      </section>
+
       <section class="section">
         <h2 class="section__title">Why it helps</h2>
         <div class="bento">
@@ -101,29 +130,21 @@ const ballStyle = `background:${orbBackground(hero)}`;
             </div>
           </div>
           <div class="tile">
-            <p class="tile__copy">
-              <strong>Pick up where you stopped.</strong> New sessions read recent updates over local MCP first.
-            </p>
-            <div class="tile__pic"><TerminalTile client:only="react" /></div>
+            <p class="tile__copy"><strong>Glance from the menu bar.</strong> See what’s waiting on you without opening the app.</p>
+            <div class="tile__pic tile__pic--menu"><MenuTile client:only="react" /></div>
           </div>
-          <div class="tile">
-            <p class="tile__copy">
-              <strong>Shared notebook.</strong> Save fixes and rules once so agents in other repos can search them.
-            </p>
-            <div class="tile__pic"><NotebookTile client:only="react" /></div>
-          </div>
-          <div class="tile tile--tools">
+          <div class="tile tile--tools tile--wide">
             <p class="tile__copy">
               <strong>Plug and play.</strong> Connect the tools you use in one click.
             </p>
             <ul class="tools" aria-label="Supported tools">
-              <li><ToolLogo tool="claude" size={14} /><span>Claude Code</span></li>
-              <li><ToolLogo tool="codex" size={14} /><span>Codex</span></li>
-              <li><ToolLogo tool="cursor" size={14} /><span>Cursor</span></li>
-              <li><ToolLogo tool="t3code" size={14} /><span>T3 Code</span></li>
-              <li><ToolLogo tool="antigravity" size={14} /><span>Antigravity</span></li>
-              <li><ToolLogo tool="opencode" size={14} /><span>OpenCode</span></li>
-              <li><ToolLogo tool="mcp" size={14} /><span>Any MCP tool</span></li>
+              <li><ToolLogo tool="claude" size={16} /><span>Claude Code</span></li>
+              <li><ToolLogo tool="codex" size={16} /><span>Codex</span></li>
+              <li><ToolLogo tool="cursor" size={16} /><span>Cursor</span></li>
+              <li><ToolLogo tool="t3code" size={16} /><span>T3 Code</span></li>
+              <li><ToolLogo tool="antigravity" size={16} /><span>Antigravity</span></li>
+              <li><ToolLogo tool="opencode" size={16} /><span>OpenCode</span></li>
+              <li><ToolLogo tool="mcp" size={16} /><span>Any MCP tool</span></li>
             </ul>
           </div>
         </div>
@@ -163,7 +184,7 @@ const ballStyle = `background:${orbBackground(hero)}`;
           <div id="privacy">
             <dt>Storage &amp; privacy</dt>
             <dd>
-              Projects, updates, screenshots, and notebook pages live in one SQLite database under{' '}
+              Projects, updates, and notebook pages live in a SQLite database. Attachments are stored alongside it in{' '}
               <code>~/Library/Application Support/feeder</code>. Agents run <code>feeder mcp</code> over local
               stdin/stdout with no open ports. No data is collected; the only network request checks GitHub Releases
               for app updates.
@@ -323,8 +344,8 @@ const ballStyle = `background:${orbBackground(hero)}`;
     display: inline-flex;
     align-items: center;
     gap: 9px;
-    font-size: 15px;
-    font-weight: 600;
+    font-size: var(--fs-body);
+    font-weight: 500;
     letter-spacing: -0.01em;
   }
 
@@ -343,7 +364,7 @@ const ballStyle = `background:${orbBackground(hero)}`;
 
   .top__link {
     color: var(--text-2);
-    font-size: 14px;
+    font-size: var(--fs-body);
     transition: color 0.16s ease;
   }
 
@@ -463,8 +484,8 @@ const ballStyle = `background:${orbBackground(hero)}`;
   h1 {
     margin: 28px 0 0;
     max-width: 18em;
-    font-size: clamp(32px, 5vw, 50px);
-    font-weight: 620;
+    font-size: var(--fs-1);
+    font-weight: 500;
     letter-spacing: -0.036em;
     line-height: 1.08;
     text-wrap: balance;
@@ -474,7 +495,7 @@ const ballStyle = `background:${orbBackground(hero)}`;
     max-width: 43em;
     margin: 18px 0 0;
     color: var(--text-2);
-    font-size: clamp(15.5px, 1.5vw, 17px);
+    font-size: var(--fs-lead);
     line-height: 1.6;
     text-wrap: pretty;
   }
@@ -508,8 +529,8 @@ const ballStyle = `background:${orbBackground(hero)}`;
     height: 42px;
     padding: 0 20px;
     border-radius: 999px;
-    font-size: 14.5px;
-    font-weight: 560;
+    font-size: var(--fs-body);
+    font-weight: 500;
     letter-spacing: -0.01em;
     transition:
       background 0.16s ease,
@@ -544,7 +565,7 @@ const ballStyle = `background:${orbBackground(hero)}`;
   .meta {
     margin: 14px 0 0;
     color: var(--text-3);
-    font-size: 13px;
+    font-size: var(--fs-sm);
     font-variant-numeric: tabular-nums;
   }
 
@@ -583,14 +604,14 @@ const ballStyle = `background:${orbBackground(hero)}`;
 
   .demo__caption strong {
     color: var(--text);
-    font-weight: 600;
+    font-weight: 500;
   }
 
   .demo__caption {
     max-width: 38em;
     margin: 14px auto 0;
     color: var(--text-3);
-    font-size: 13.5px;
+    font-size: var(--fs-sm);
     line-height: 1.55;
     text-align: center;
   }
@@ -603,15 +624,15 @@ const ballStyle = `background:${orbBackground(hero)}`;
 
   .section__title {
     margin: 0 0 24px;
-    font-size: clamp(22px, 2.6vw, 28px);
-    font-weight: 600;
+    font-size: var(--fs-2);
+    font-weight: 500;
     letter-spacing: -0.028em;
   }
 
   .section h3 {
     margin: 0;
-    font-size: 15px;
-    font-weight: 600;
+    font-size: var(--fs-body);
+    font-weight: 500;
     letter-spacing: -0.01em;
   }
 
@@ -619,14 +640,14 @@ const ballStyle = `background:${orbBackground(hero)}`;
   .specs dd {
     margin: 7px 0 0;
     color: var(--text-2);
-    font-size: 14.5px;
+    font-size: var(--fs-body);
     line-height: 1.6;
     text-wrap: pretty;
   }
 
   .section strong {
     color: var(--text);
-    font-weight: 560;
+    font-weight: 500;
   }
 
   .section code {
@@ -634,6 +655,70 @@ const ballStyle = `background:${orbBackground(hero)}`;
     border-radius: 5px;
     background: var(--surface-subtle);
     color: var(--text);
+  }
+
+  .feature__text {
+    max-width: 40em;
+  }
+
+  .feature__pic {
+    margin-top: 28px;
+    mask-image: linear-gradient(to bottom, #000 80%, transparent);
+    -webkit-mask-image: linear-gradient(to bottom, #000 80%, transparent);
+  }
+
+  .feature__pic--mcp {
+    aspect-ratio: 960 / 420;
+  }
+
+  .feature__pic--notebook {
+    aspect-ratio: 960 / 440;
+  }
+
+  @media (max-width: 751px) {
+    .feature__pic--mcp {
+      aspect-ratio: 358 / 470;
+    }
+
+    .feature__pic--notebook {
+      aspect-ratio: 358 / 440;
+    }
+  }
+
+  .calls {
+    display: grid;
+    grid-template-columns: repeat(4, minmax(0, 1fr));
+    gap: 20px;
+    margin: 24px 0 0;
+    padding: 20px 0 0;
+    border-top: 1px solid var(--line);
+    list-style: none;
+  }
+
+  .calls li {
+    display: grid;
+    gap: 4px;
+  }
+
+  .calls code {
+    justify-self: start;
+    font-size: var(--fs-sm);
+  }
+
+  .calls span {
+    color: var(--text-2);
+    font-size: var(--fs-sm);
+    line-height: 1.45;
+  }
+
+  @media (max-width: 760px) {
+    .calls {
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+    }
+  }
+
+  .tile__pic--menu {
+    aspect-ratio: 320 / 260;
   }
 
   .bento {
@@ -659,14 +744,14 @@ const ballStyle = `background:${orbBackground(hero)}`;
     margin: 0;
     padding: 22px 24px 0;
     color: var(--text-2);
-    font-size: 17px;
+    font-size: var(--fs-lead);
     line-height: 1.45;
     text-wrap: pretty;
   }
 
   .tile__copy strong {
     color: var(--text);
-    font-weight: 600;
+    font-weight: 500;
   }
 
   .tile__pic {
@@ -712,49 +797,50 @@ const ballStyle = `background:${orbBackground(hero)}`;
 
   .file__name {
     font-family: ui-monospace, 'SF Mono', Menlo, monospace;
-    font-size: 13px;
+    font-size: var(--fs-sm);
     font-weight: 500;
   }
 
   .file__where {
     color: var(--text-3);
-    font-size: 12.5px;
+    font-size: var(--fs-sm);
   }
 
   .tile--statement .statement {
     margin: 0;
     color: var(--text);
-    font-size: clamp(28px, 3.2vw, 38px);
-    font-weight: 620;
+    font-size: var(--fs-2);
+    font-weight: 500;
     letter-spacing: -0.035em;
     line-height: 1.05;
   }
 
   .tile--statement .tile__copy {
     padding: 0;
-    font-size: 15px;
+    font-size: var(--fs-body);
   }
 
   .tools {
     display: flex;
+    flex: 1;
     flex-wrap: wrap;
-    align-content: flex-end;
-    gap: 8px;
-    margin: auto 0 0;
-    padding: 20px 24px 24px;
+    align-content: center;
+    gap: 10px;
+    margin: 0;
+    padding: 24px;
     list-style: none;
   }
 
   .tools li {
     display: inline-flex;
     align-items: center;
-    gap: 7px;
-    padding: 7px 11px;
+    gap: 9px;
+    padding: 10px 14px;
     border-radius: 10px;
     background: var(--surface);
     box-shadow: 0 0 0 1px var(--line);
     color: var(--text);
-    font-size: 13px;
+    font-size: var(--fs-body);
     font-weight: 500;
     line-height: 1.25;
   }
@@ -799,8 +885,8 @@ const ballStyle = `background:${orbBackground(hero)}`;
     border-radius: 50%;
     background: var(--surface-subtle);
     color: var(--text-2);
-    font-size: 12px;
-    font-weight: 600;
+    font-size: var(--fs-sm);
+    font-weight: 500;
   }
 
   .copy {
@@ -819,7 +905,7 @@ const ballStyle = `background:${orbBackground(hero)}`;
     padding: 0;
     background: none;
     color: var(--text);
-    font-size: 13px;
+    font-size: var(--fs-sm);
   }
 
   .btn {
@@ -884,8 +970,8 @@ const ballStyle = `background:${orbBackground(hero)}`;
   }
 
   .specs dt {
-    font-size: 14.5px;
-    font-weight: 560;
+    font-size: var(--fs-body);
+    font-weight: 500;
   }
 
   .specs dd {
@@ -903,7 +989,7 @@ const ballStyle = `background:${orbBackground(hero)}`;
     padding: 24px clamp(16px, 4vw, 32px) 40px;
     border-top: 1px solid var(--line);
     color: var(--text-3);
-    font-size: 13px;
+    font-size: var(--fs-sm);
   }
 
   .foot__links {
