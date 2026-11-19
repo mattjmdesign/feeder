@@ -4,7 +4,7 @@
 use feeder_core::{AttentionKind, FeedUpdate, Orb, ProjectSummary, ago, day_key, day_label, parse_attention};
 use rune::tok::motion;
 use rune::{
-    Cursor, DragItem, El, Key, KeyEvent, ScrollSpec, Spring, SurfaceFit, Transition, Tx, auto_grow, col, el, row, text, text_input,
+    Cursor, DragItem, El, Key, KeyEvent, ScrollSpec, Spring, SurfaceFit, Transition, Tx, auto_grow, col, el, oklch, row, text, text_input,
 };
 use rune_kit::search::Fold;
 use rune_kit::{Button, ButtonVariant, Checkbox, Kit, Markdown, MarkdownStyle, scroll_bar};
@@ -147,7 +147,7 @@ pub fn view(s: &State, id: i64, p: &Palette, k: &Kit, reduced_motion: bool) -> E
     let md = markdown_style(p, k);
     let mut timeline = col().key("timeline").w_full();
     if s.feed_for == Some(id) {
-        let has_media = s.feed.iter().any(|u| u.screenshot.is_some());
+        let has_media = s.feed.iter().any(FeedUpdate::has_media);
         let search_active = s.project_search_open || !s.project_search.text.is_empty();
         if has_media || s.branch_filter.is_some() || search_active {
             timeline = timeline.child(project_toolbar(s, p, has_media));
@@ -562,18 +562,25 @@ fn project_toolbar(s: &State, p: &Palette, has_media: bool) -> El {
 }
 
 fn gallery_grid(s: &State, p: &Palette, visible: &[&FeedUpdate]) -> El {
-    let items: Vec<&FeedUpdate> = visible.iter().copied().filter(|u| u.screenshot.is_some()).collect();
+    let mut items: Vec<(&FeedUpdate, usize, usize, crate::MediaSlide)> = Vec::new();
+    for &u in visible {
+        let slides = crate::media_slides(u);
+        let total = slides.len();
+        for (idx, slide) in slides.into_iter().enumerate() {
+            items.push((u, idx, total, slide));
+        }
+    }
     if items.is_empty() {
         return text("No media attached yet.").font(style::META).color(p.text_3).self_center().py(24.0);
     }
     let tile_w = (COLUMN - 14.0) / 2.0;
     let mut grid = row().key("gallery-grid").w_full().flex_wrap().gap(14.0);
-    for u in items {
-        let uid = u.id;
+    for (u, slide_idx, total_slides, slide) in items {
+        let mid = slide.id;
         let thumb_h = 196.0;
-        let media = if let Some(img) = s.shots.get(&uid) {
+        let mut media = if let Some(img) = s.shots.get(&mid) {
             el().w_full().h(thumb_h).pixels_fit(img.pixels(), SurfaceFit::Fit)
-        } else if let Some(player) = s.videos.get(&uid) {
+        } else if let Some(player) = s.videos.get(&mid) {
             el().w_full().h(thumb_h).video(player, SurfaceFit::Fit).child(
                 el().pin(None, Some(8.0), Some(8.0), None)
                     .px(7.0)
@@ -585,6 +592,18 @@ fn gallery_grid(s: &State, p: &Palette, visible: &[&FeedUpdate]) -> El {
         } else {
             el().w_full().h(thumb_h).fill(p.hover).center().child(text("Loading…").font(style::META).color(p.text_3))
         };
+
+        if total_slides > 1 {
+            media = media.child(
+                el().pin(Some(8.0), Some(8.0), None, None)
+                    .px(7.0)
+                    .py(2.0)
+                    .radius(6.0)
+                    .fill(oklch(0.10, 0.0, 0.0).alpha(0.72))
+                    .border(1.0, oklch(1.0, 0.0, 0.0).alpha(0.16))
+                    .child(text(format!("{}/{}", slide_idx + 1, total_slides)).font(style::META).color(oklch(0.96, 0.0, 0.0))),
+            );
+        }
 
         let mut footer = row()
             .w_full()
@@ -601,7 +620,7 @@ fn gallery_grid(s: &State, p: &Palette, visible: &[&FeedUpdate]) -> El {
 
         grid = grid.child(
             col()
-                .key(format!("gal-{uid}"))
+                .key(format!("gal-{mid}"))
                 .role("button")
                 .label("Open media")
                 .focusable(true)
@@ -611,7 +630,7 @@ fn gallery_grid(s: &State, p: &Palette, visible: &[&FeedUpdate]) -> El {
                 .border(1.0, p.hairline)
                 .cursor(Cursor::Pointer)
                 .press_scale(0.985)
-                .on_press_tx(move |s: &mut State, tx: &mut Tx| s.open_lightbox(uid, tx))
+                .on_press_tx(move |s: &mut State, tx: &mut Tx| s.open_lightbox(mid, tx))
                 .child(media)
                 .child(rune::rule(1.0, p.hairline))
                 .child(footer),
@@ -1043,51 +1062,125 @@ pub fn replies_section(s: &State, p: &Palette, k: &Kit, u: &FeedUpdate) -> Optio
     Some(box_el)
 }
 
-/// An update's attached screenshot or video clip at `width`.
+/// An update's attached screenshot(s) or video clip(s) at `width`.
+/// Single attachments render directly; multiple attachments render an interactive carousel
+/// with left/right arrows, a top-right `1 / N` badge, and clickable slide dots.
 pub fn media_view(s: &State, p: &Palette, u: &FeedUpdate, width: f32) -> Option<El> {
+    let slides = crate::media_slides(u);
+    if slides.is_empty() {
+        return None;
+    }
     let uid = u.id;
-    if let Some(player) = s.videos.get(&uid) {
+    let total = slides.len();
+    let idx = s.card_slide_index(uid, total);
+    let slide = &slides[idx];
+    let (slide_el, frame_h) = render_slide(s, p, slide, width)?;
+
+    if total == 1 {
+        return Some(slide_el);
+    }
+
+    let btn_y = ((frame_h - 30.0) * 0.5).max(8.0);
+    let arrow_btn = |key: String, glyph: &'static str, label: &'static str, delta: isize| {
+        el().key(key)
+            .role("button")
+            .label(label)
+            .focusable(true)
+            .size(30.0, 30.0)
+            .radius(15.0)
+            .fill(oklch(0.12, 0.0, 0.0).alpha(0.72))
+            .hover(oklch(0.12, 0.0, 0.0).alpha(0.90))
+            .border(1.0, oklch(1.0, 0.0, 0.0).alpha(0.20))
+            .center()
+            .cursor(Cursor::Pointer)
+            .press_scale(0.93)
+            .on_press(move |s: &mut State| s.step_card_slide(uid, delta, total))
+            .child(text(glyph).font(style::NAME).color(oklch(0.98, 0.0, 0.0)))
+    };
+
+    let counter = el()
+        .key(format!("car-count-{uid}"))
+        .pin(None, Some(10.0), Some(10.0), None)
+        .px(8.0)
+        .py(3.0)
+        .radius(99.0)
+        .fill(oklch(0.10, 0.0, 0.0).alpha(0.72))
+        .border(1.0, oklch(1.0, 0.0, 0.0).alpha(0.18))
+        .child(text(format!("{} / {total}", idx + 1)).font(style::META).color(oklch(0.96, 0.0, 0.0)));
+
+    let frame = el()
+        .key(format!("car-frame-{uid}"))
+        .w_full()
+        .h(frame_h)
+        .child(slide_el)
+        .child(counter)
+        .child(arrow_btn(format!("car-prev-{uid}"), "‹", "Previous slide", -1).absolute(10.0, btn_y))
+        .child(arrow_btn(format!("car-next-{uid}"), "›", "Next slide", 1).pin(None, Some(btn_y), Some(10.0), None));
+
+    let mut dots = row().key(format!("car-dots-{uid}")).w_full().center().gap(2.0).pt(6.0);
+    for i in 0..total {
+        let active = i == idx;
+        dots = dots.child(
+            el().key(format!("car-dot-{uid}-{i}"))
+                .role("button")
+                .label(format!("Show slide {}", i + 1))
+                .focusable(true)
+                .h(16.0)
+                .px(4.0)
+                .center()
+                .cursor(Cursor::Pointer)
+                .on_press(move |s: &mut State| s.set_card_slide(uid, i))
+                .child(
+                    el().w(if active { 14.0 } else { 5.0 })
+                        .h(5.0)
+                        .radius(2.5)
+                        .fill(if active { p.text_2 } else { p.hairline })
+                        .hover(p.text_3),
+                ),
+        );
+    }
+
+    Some(col().key(format!("car-{uid}")).w_full().child(frame).child(dots))
+}
+
+fn render_slide(s: &State, p: &Palette, slide: &crate::MediaSlide, width: f32) -> Option<(El, f32)> {
+    let mid = slide.id;
+    if let Some(player) = s.videos.get(&mid) {
         let (vw, vh) = player.natural_size().unwrap_or((16, 9));
         let ratio = vw.max(1) as f32 / vh.max(1) as f32;
         let natural_h = (width / ratio).clamp(180.0, SHOT_MAX_H);
         let playing = player.is_playing();
-        return Some(
-            el().key(format!("vid-{uid}"))
-                .w_full()
-                .h(natural_h)
-                .radius(10.0)
-                .border(1.0, p.hairline)
-                .fill(p.bg.alpha(0.5))
-                .video(player, SurfaceFit::Fit)
-                .child(
-                    row()
-                        .pin(None, Some(10.0), Some(10.0), None)
-                        .gap(6.0)
-                        .child(
-                            chrome::bar_button(&format!("vid-toggle-{uid}"), if playing { "Pause" } else { "Play" }, p)
-                                .fill(p.card.alpha(0.92))
-                                .border(1.0, p.hairline)
-                                .on_press(move |s: &mut State| s.toggle_video(uid)),
-                        )
-                        .child(
-                            chrome::bar_button(&format!("vid-expand-{uid}"), "Expand", p)
-                                .fill(p.card.alpha(0.92))
-                                .border(1.0, p.hairline)
-                                .on_press_tx(move |s: &mut State, tx: &mut Tx| s.open_lightbox(uid, tx)),
-                        ),
-                ),
-        );
+        let node = el()
+            .key(format!("vid-{mid}"))
+            .w_full()
+            .h(natural_h)
+            .radius(10.0)
+            .border(1.0, p.hairline)
+            .fill(p.bg.alpha(0.5))
+            .video(player, SurfaceFit::Fit)
+            .child(
+                row()
+                    .pin(Some(10.0), Some(10.0), None, None)
+                    .gap(6.0)
+                    .child(
+                        chrome::bar_button(&format!("vid-toggle-{mid}"), if playing { "Pause" } else { "Play" }, p)
+                            .fill(p.card.alpha(0.92))
+                            .border(1.0, p.hairline)
+                            .on_press(move |s: &mut State| s.toggle_video(mid)),
+                    )
+                    .child(
+                        chrome::bar_button(&format!("vid-expand-{mid}"), "Expand", p)
+                            .fill(p.card.alpha(0.92))
+                            .border(1.0, p.hairline)
+                            .on_press_tx(move |s: &mut State, tx: &mut Tx| s.open_lightbox(mid, tx)),
+                    ),
+            );
+        return Some((node, natural_h));
     }
-    screenshot(s, p, u, width)
-}
 
-/// An update's screenshot at `width`: fits the card's full width while keeping aspect ratio,
-/// capping unusually tall portrait images inside a centered full-width frame. While decoding
-/// is in flight, reserves the exact final height using persisted `(media_w, media_h)`.
-pub fn screenshot(s: &State, p: &Palette, u: &FeedUpdate, width: f32) -> Option<El> {
-    let uid = u.id;
-    let mut button = el()
-        .key(format!("shot-{uid}"))
+    let path = slide.path.clone();
+    let button = el()
+        .key(format!("shot-{mid}"))
         .role("button")
         .label("Expand screenshot")
         .focusable(true)
@@ -1096,36 +1189,35 @@ pub fn screenshot(s: &State, p: &Palette, u: &FeedUpdate, width: f32) -> Option<
         .border(1.0, p.hairline)
         .cursor(Cursor::Pointer)
         .press_scale(0.99)
-        .on_press_tx(move |s: &mut State, tx: &mut Tx| s.open_lightbox(uid, tx));
-    if let Some(path) = u.screenshot.clone() {
-        button = button.drag_out(move |_: &State| Some(DragItem::new().file(&path)));
-    }
+        .on_press_tx(move |s: &mut State, tx: &mut Tx| s.open_lightbox(mid, tx))
+        .drag_out(move |_: &State| Some(DragItem::new().file(&path)));
 
-    if let Some(img) = s.shots.get(&uid)
+    if let Some(img) = s.shots.get(&mid)
         && let Some([w, h]) = img.size()
     {
         let ratio = w.max(1) as f32 / h.max(1) as f32;
         let natural_h = width / ratio;
         if natural_h <= SHOT_MAX_H {
-            Some(button.h(natural_h).pixels_fit(img.pixels(), SurfaceFit::Fit))
+            Some((button.h(natural_h).pixels_fit(img.pixels(), SurfaceFit::Fit), natural_h))
         } else {
             let shot_w = SHOT_MAX_H * ratio;
-            Some(
+            Some((
                 button
                     .h(SHOT_MAX_H)
                     .fill(p.bg.alpha(0.5))
                     .center()
                     .child(el().w(shot_w).h(SHOT_MAX_H).pixels_fit(img.pixels(), SurfaceFit::Fit)),
-            )
+                SHOT_MAX_H,
+            ))
         }
-    } else if u.has_image()
-        && let (Some(w), Some(h)) = (u.media_w, u.media_h)
+    } else if slide.is_image()
+        && let (Some(w), Some(h)) = (slide.width, slide.height)
         && w > 0
         && h > 0
     {
         let ratio = w as f32 / h as f32;
         let box_h = (width / ratio).min(SHOT_MAX_H);
-        Some(button.h(box_h).fill(p.hover).center().child(text("Loading…").font(style::META).color(p.text_3)))
+        Some((button.h(box_h).fill(p.hover).center().child(text("Loading…").font(style::META).color(p.text_3)), box_h))
     } else {
         None
     }

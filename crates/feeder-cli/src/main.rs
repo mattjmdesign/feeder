@@ -35,9 +35,9 @@ enum Command {
         /// Who's posting, e.g. "Claude Code". Detected from the tool you run it in.
         #[arg(short, long)]
         agent: Option<String>,
-        /// A screenshot or short video clip to attach (png, jpg, webp, gif, mp4, mov, webm).
+        /// Screenshot(s) or short video clip(s) to attach (repeat up to 8× for a carousel).
         #[arg(short, long)]
-        screenshot: Option<PathBuf>,
+        screenshot: Vec<PathBuf>,
         /// Git branch name. Defaults to the current branch of --dir.
         #[arg(short, long)]
         branch: Option<String>,
@@ -373,7 +373,7 @@ fn run(command: Command) -> Result<(), String> {
             }
             .map_err(|e| e.to_string())?;
             let agent = agent_display_name(&agent.unwrap_or_else(default_agent));
-            let screenshot = screenshot.map(|p| absolute(&p));
+            let screenshots: Vec<PathBuf> = screenshot.into_iter().map(|p| absolute(&p)).collect();
             let meta = detect_git_meta(&dir);
             let branch = branch
                 .and_then(|b| {
@@ -383,8 +383,9 @@ fn run(command: Command) -> Result<(), String> {
                 .or(meta.branch);
             let diff_stat = diff_stat.or(meta.diff_stat);
             let commit_sha = meta.commit_sha;
-            let posted =
-                store.post(project.id, NewUpdate { agent, body, screenshot, branch, diff_stat, commit_sha }).map_err(|e| e.to_string())?;
+            let posted = store
+                .post(project.id, NewUpdate { agent, body, screenshot: None, screenshots, branch, diff_stat, commit_sha })
+                .map_err(|e| e.to_string())?;
             if json {
                 println!("{}", json!({ "project": project_json(&project), "update": update_json(&posted) }));
             } else {
@@ -654,7 +655,15 @@ fn run(command: Command) -> Result<(), String> {
             let agent = agent_from_env().unwrap_or_else(|| "Git".to_string());
             let _ = store.post(
                 project.id,
-                NewUpdate { agent, body, screenshot: None, branch: meta.branch, diff_stat: meta.diff_stat, commit_sha: meta.commit_sha },
+                NewUpdate {
+                    agent,
+                    body,
+                    screenshot: None,
+                    screenshots: Vec::new(),
+                    branch: meta.branch,
+                    diff_stat: meta.diff_stat,
+                    commit_sha: meta.commit_sha,
+                },
             );
             Ok(())
         }
@@ -967,11 +976,31 @@ pub(crate) fn update_json(u: &FeedUpdate) -> serde_json::Value {
         feeder_core::MediaKind::Image => "image",
         feeder_core::MediaKind::Video => "video",
     });
+    let media: Vec<_> = u
+        .media
+        .iter()
+        .map(|m| {
+            let kind = m.kind().map(|k| match k {
+                feeder_core::MediaKind::Image => "image",
+                feeder_core::MediaKind::Video => "video",
+            });
+            json!({
+                "id": m.id,
+                "position": m.position,
+                "path": m.path,
+                "kind": kind,
+                "w": m.width,
+                "h": m.height,
+                "caption": m.caption,
+            })
+        })
+        .collect();
     json!({
         "id": u.id,
         "agent": u.agent,
         "body": u.body,
         "screenshot": u.screenshot,
+        "media": media,
         "media_kind": media_kind,
         "media_w": u.media_w,
         "media_h": u.media_h,

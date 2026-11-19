@@ -183,6 +183,7 @@ mod tests {
             screenshot: None,
             media_w: None,
             media_h: None,
+            media: Vec::new(),
             branch: Some("feat/todos".into()),
             created_at: 1_000,
             diff_stat: None,

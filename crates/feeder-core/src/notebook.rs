@@ -1,10 +1,10 @@
-//! The notebook: one shared, searchable record of what was learned while building, across every
-//! project and every agent. Each page is a single lesson in four parts (title, what happened,
-//! why, do this), filed as a fix, a pitfall, a pattern or a decision, and tagged by area.
+//! The notebook: one shared, searchable knowledge library of freeform Markdown articles across
+//! every project and every agent.
 //!
-//! The bar is deliberately high so the notebook stays worth reading: every page is checked for
-//! shape and length, near-duplicates are refused in favour of revising the page that exists, and
-//! anything that looks like a secret is turned away.
+//! Write a note like you would in Obsidian or Notion: a title, an optional category/topic, and a
+//! freeform `.md` body (headings, code blocks, checklists, tables, callouts, links). Near-duplicate
+//! titles are flagged for agents so existing articles stay fresh, and anything that looks like a
+//! secret is turned away.
 
 use std::collections::{HashMap, HashSet};
 use std::fmt;
@@ -15,23 +15,22 @@ use rusqlite::{Connection, OptionalExtension, Row, params};
 use crate::{Error, Result, Store, ago, now_ms};
 
 /// Title length, in characters.
-pub const TITLE_CHARS: std::ops::RangeInclusive<usize> = 6..=90;
-/// "What happened" length, in characters.
-pub const CONTEXT_CHARS: std::ops::RangeInclusive<usize> = 12..=700;
-/// "Do this" length, in characters: one or two sentences.
-pub const RULE_CHARS: std::ops::RangeInclusive<usize> = 12..=320;
-/// "Why" is optional, but no longer than this.
-pub const MAX_CAUSE_CHARS: usize = 500;
-/// Tags per page.
-pub const TAG_COUNT: std::ops::RangeInclusive<usize> = 1..=6;
+pub const TITLE_CHARS: std::ops::RangeInclusive<usize> = 2..=120;
+/// Markdown article body length, in characters.
+pub const BODY_CHARS: std::ops::RangeInclusive<usize> = 1..=50_000;
+/// Optional tags per page.
+pub const TAG_COUNT: std::ops::RangeInclusive<usize> = 0..=10;
 /// Characters per tag.
 pub const TAG_CHARS: std::ops::RangeInclusive<usize> = 2..=24;
-/// Title-word overlap (Jaccard) at which two pages count as the same lesson.
+/// Title-word overlap (Jaccard) at which two pages count as the same note.
 const SIMILAR_TITLE: f32 = 0.6;
 
-/// What sort of lesson a page records.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
+/// Optional kind label for a notebook article. Freeform notes default to [`Kind::Note`].
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub enum Kind {
+    /// A freeform Markdown note or article.
+    #[default]
+    Note,
     /// A bug and how it was solved.
     Fix,
     /// An approach that failed or broke something, and why to avoid it.
@@ -43,11 +42,12 @@ pub enum Kind {
 }
 
 impl Kind {
-    pub const ALL: [Kind; 4] = [Kind::Fix, Kind::Pitfall, Kind::Pattern, Kind::Decision];
+    pub const ALL: [Kind; 5] = [Kind::Note, Kind::Fix, Kind::Pitfall, Kind::Pattern, Kind::Decision];
 
-    /// The stored and typed form: `fix`, `pitfall`, `pattern`, `decision`.
+    /// The stored and typed form: `note`, `fix`, `pitfall`, `pattern`, `decision`.
     pub fn as_str(self) -> &'static str {
         match self {
+            Kind::Note => "note",
             Kind::Fix => "fix",
             Kind::Pitfall => "pitfall",
             Kind::Pattern => "pattern",
@@ -57,6 +57,7 @@ impl Kind {
 
     pub fn label(self) -> &'static str {
         match self {
+            Kind::Note => "Note",
             Kind::Fix => "Fix",
             Kind::Pitfall => "Pitfall",
             Kind::Pattern => "Pattern",
@@ -66,6 +67,7 @@ impl Kind {
 
     pub fn plural(self) -> &'static str {
         match self {
+            Kind::Note => "Notes",
             Kind::Fix => "Fixes",
             Kind::Pitfall => "Pitfalls",
             Kind::Pattern => "Patterns",
@@ -76,6 +78,7 @@ impl Kind {
     /// One line on when to file a page under this kind.
     pub fn hint(self) -> &'static str {
         match self {
+            Kind::Note => "A freeform Markdown note, guide, or reference",
             Kind::Fix => "A bug whose cause wasn't obvious, and how it was solved",
             Kind::Pitfall => "Something tried that failed or broke, and why to avoid it",
             Kind::Pattern => "An approach that worked well and applies elsewhere",
@@ -96,12 +99,13 @@ impl FromStr for Kind {
     fn from_str(s: &str) -> Result<Kind> {
         let s = s.trim().to_ascii_lowercase();
         let found = match s.as_str() {
+            "" | "note" | "notes" | "article" | "doc" | "guide" => Kind::Note,
             "fix" | "fixes" | "bug" | "bugfix" => Kind::Fix,
             "pitfall" | "pitfalls" | "trap" | "gotcha" | "avoid" => Kind::Pitfall,
             "pattern" | "patterns" | "practice" | "technique" => Kind::Pattern,
             "decision" | "decisions" | "choice" => Kind::Decision,
             other => {
-                return Err(Error::Invalid(format!("unknown kind `{other}`; use one of: fix, pitfall, pattern, decision")));
+                return Err(Error::Invalid(format!("unknown kind `{other}`; use one of: note, fix, pitfall, pattern, decision")));
             }
         };
         Ok(found)
@@ -111,7 +115,7 @@ impl FromStr for Kind {
 /// Maximum characters for a custom topic slug.
 pub const TOPIC_MAX_CHARS: usize = 32;
 
-/// A canonical high-level topic in the notebook's two-tier hierarchy (`topic` -> sub-`tags`).
+/// A canonical high-level category/topic in the notebook.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct TopicSpec {
     pub slug: &'static str,
@@ -119,7 +123,7 @@ pub struct TopicSpec {
     pub aliases: &'static [&'static str],
 }
 
-/// Curated top-level topics ordered by stack specificity for inference (e.g. Next.js before React).
+/// Curated top-level categories ordered by stack specificity for inference (e.g. Next.js before React).
 pub const CANONICAL_TOPICS: &[TopicSpec] = &[
     TopicSpec { slug: "nextjs", label: "Next.js", aliases: &["nextjs", "next", "next-js", "next.js", "app-router", "rsc", "vercel"] },
     TopicSpec { slug: "react-native", label: "React Native", aliases: &["react-native", "reactnative", "rn", "expo", "metro"] },
@@ -175,7 +179,7 @@ pub const CANONICAL_TOPICS: &[TopicSpec] = &[
     },
 ];
 
-/// Normalizes a typed or stored topic into a canonical slug (or custom slug).
+/// Normalizes a typed or stored category/topic into a canonical slug (or custom slug).
 pub fn normalize_topic(raw: &str) -> Option<String> {
     let trimmed = raw.trim();
     if trimmed.is_empty() {
@@ -197,7 +201,7 @@ pub fn normalize_topic(raw: &str) -> Option<String> {
     Some(slug.chars().take(TOPIC_MAX_CHARS).collect())
 }
 
-/// Human-readable label for a topic slug.
+/// Human-readable label for a category/topic slug.
 pub fn topic_label(slug: &str) -> String {
     let clean = slug.trim();
     if clean.is_empty() || clean.eq_ignore_ascii_case("general") {
@@ -217,8 +221,8 @@ pub fn topic_label(slug: &str) -> String {
         .join(" ")
 }
 
-/// Picks the best high-level topic from tags first, then title/context words.
-pub fn infer_topic(tags: &[String], title: &str, context: &str) -> String {
+/// Picks the best high-level category from tags first, then title/body words.
+pub fn infer_topic(tags: &[String], title: &str, body: &str) -> String {
     let norm_tags: Vec<String> = tags.iter().map(|t| crate::slugify(t.trim().trim_start_matches('#'))).collect();
     for spec in CANONICAL_TOPICS {
         if norm_tags.iter().any(|t| t == spec.slug || spec.aliases.contains(&t.as_str())) {
@@ -227,7 +231,7 @@ pub fn infer_topic(tags: &[String], title: &str, context: &str) -> String {
     }
     let words: HashSet<String> = title
         .split(|c: char| !c.is_alphanumeric() && c != '-' && c != '.')
-        .chain(context.split(|c: char| !c.is_alphanumeric() && c != '-' && c != '.'))
+        .chain(body.split(|c: char| !c.is_alphanumeric() && c != '-' && c != '.').take(256))
         .map(str::to_lowercase)
         .filter(|w| w.len() >= 2)
         .collect();
@@ -237,6 +241,23 @@ pub fn infer_topic(tags: &[String], title: &str, context: &str) -> String {
         }
     }
     "general".into()
+}
+
+/// Formats legacy structured fields (`what_happened`, optional `why`, `do_this`) into clean Markdown.
+pub fn compose_legacy_body(context: &str, cause: Option<&str>, rule: &str) -> String {
+    let mut parts = Vec::new();
+    let ctx = context.trim();
+    if !ctx.is_empty() {
+        parts.push(format!("## What happened\n\n{ctx}"));
+    }
+    if let Some(c) = cause.map(str::trim).filter(|c| !c.is_empty()) {
+        parts.push(format!("## Why\n\n{c}"));
+    }
+    let r = rule.trim();
+    if !r.is_empty() {
+        parts.push(format!("## Takeaway\n\n{r}"));
+    }
+    parts.join("\n\n")
 }
 
 /// Whether a page is in the notebook's working set or kept only for the record.
@@ -257,22 +278,18 @@ impl Standing {
     }
 }
 
-/// One lesson in the notebook.
+/// One Markdown article in the notebook.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Page {
     pub id: i64,
     pub kind: Kind,
-    /// High-level grouping (`rust`, `react`, `nextjs`, `design`, ...).
+    /// High-level category (`rust`, `react`, `nextjs`, `design`, `general`, or custom).
     pub topic: String,
     pub title: String,
     pub tags: Vec<String>,
-    /// What happened: the situation or symptom, with the exact error text if there was one.
-    pub context: String,
-    /// Why: the root cause or the reasoning.
-    pub cause: Option<String>,
-    /// Do this: the rule to follow next time.
-    pub rule: String,
-    /// The project the lesson came from, if any.
+    /// Freeform Markdown content of the article.
+    pub body: String,
+    /// The project the note came from, if any.
     pub project_id: Option<i64>,
     /// Who wrote the latest revision.
     pub agent: String,
@@ -293,9 +310,17 @@ impl Page {
         topic_label(&self.topic)
     }
 
-    /// The page as Markdown, for the CLI, MCP and the app's Copy.
+    /// Plain-text one-line preview extracted from the Markdown body for lists and search hits.
+    pub fn excerpt(&self, max_chars: usize) -> String {
+        markdown_excerpt(&self.body, max_chars)
+    }
+
+    /// The page as clean Markdown, for the CLI, MCP, and the app's Copy Markdown action.
     pub fn to_markdown(&self, project: Option<&str>, now: i64) -> String {
-        let mut meta = vec![self.topic_label(), self.kind.label().to_string()];
+        let mut meta = vec![self.topic_label()];
+        if self.kind != Kind::Note {
+            meta.push(self.kind.label().to_string());
+        }
         if !self.tags.is_empty() {
             meta.push(self.tags.iter().map(|t| format!("#{t}")).collect::<Vec<_>>().join(" "));
         }
@@ -309,78 +334,92 @@ impl Page {
         if self.is_archived() {
             meta.push("archived".into());
         }
-        let mut out = format!("## {} (#{})\n_{}_\n\n**What happened:** {}\n", self.title, self.id, meta.join(" · "), self.context);
-        if let Some(cause) = &self.cause {
-            out.push_str(&format!("\n**Why:** {cause}\n"));
-        }
-        out.push_str(&format!("\n**Do this:** {}\n", self.rule));
-        out
+        format!("# {}\n_{}_\n\n{}\n", self.title, meta.join(" · "), self.body.trim())
     }
 
-    /// One line for search results: id, topic, kind, title and the rule.
+    /// One line for search results: id, category, title, and a short excerpt.
     pub fn summary_line(&self) -> String {
-        let tags = self.tags.iter().map(|t| format!("#{t}")).collect::<Vec<_>>().join(" ");
-        let helped = if self.helped > 0 { format!(" · helped {}×", self.helped) } else { String::new() };
-        format!("#{} [{} · {}] {} — Do this: {} ({tags}{helped})", self.id, self.topic_label(), self.kind.label(), self.title, self.rule)
+        let mut badge = self.topic_label();
+        if self.kind != Kind::Note {
+            badge.push_str(" · ");
+            badge.push_str(self.kind.label());
+        }
+        let mut trail = Vec::new();
+        if !self.tags.is_empty() {
+            trail.push(self.tags.iter().map(|t| format!("#{t}")).collect::<Vec<_>>().join(" "));
+        }
+        if self.helped > 0 {
+            trail.push(format!("helped {}×", self.helped));
+        }
+        let suffix = if trail.is_empty() { String::new() } else { format!(" ({})", trail.join(" · ")) };
+        let preview = self.excerpt(140);
+        if preview.is_empty() {
+            format!("#{} [{}] {}{suffix}", self.id, badge, self.title)
+        } else {
+            format!("#{} [{}] {} — {preview}{suffix}", self.id, badge, self.title)
+        }
     }
 }
 
-/// What a page says, before it's filed. [`PageDraft::checked`] normalizes it and enforces the
-/// notebook's bar.
-#[derive(Clone, Debug, PartialEq, Eq)]
+/// What a page says, before it's saved. [`PageDraft::checked`] normalizes it and checks limits.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct PageDraft {
     pub kind: Kind,
-    /// Optional high-level topic; inferred from tags and prose when omitted.
+    /// Optional high-level category; inferred from tags and content when omitted.
     pub topic: Option<String>,
     pub title: String,
     pub tags: Vec<String>,
-    pub context: String,
-    pub cause: Option<String>,
-    pub rule: String,
+    /// Freeform Markdown content.
+    pub body: String,
 }
 
 impl PageDraft {
-    /// Trims every part, normalizes topic and tags to short lowercase slugs and checks every limit.
+    /// Starts a freeform Markdown article draft.
+    pub fn new(title: impl Into<String>, body: impl Into<String>) -> Self {
+        Self { kind: Kind::Note, topic: None, title: title.into(), tags: Vec::new(), body: body.into() }
+    }
+
+    /// Builds a draft from legacy structured fields (`what_happened`, `why`, `do_this`).
+    pub fn from_legacy(
+        kind: Kind,
+        topic: Option<String>,
+        title: String,
+        tags: Vec<String>,
+        context: String,
+        cause: Option<String>,
+        rule: String,
+    ) -> Self {
+        let body = compose_legacy_body(&context, cause.as_deref(), &rule);
+        Self { kind, topic, title, tags, body }
+    }
+
+    /// Trims title/body, normalizes category and optional tags, and enforces limits & secret checks.
     ///
     /// # Errors
-    /// [`Error::Invalid`] naming the first part that falls short of the bar, worded so an agent
-    /// can fix it and try again.
+    /// [`Error::Invalid`] naming the first check that failed.
     pub fn checked(self) -> Result<PageDraft> {
         let title = squash(&self.title).trim_end_matches('.').to_string();
-        let context = self.context.trim().to_string();
-        let rule = self.rule.trim().to_string();
-        let cause = self.cause.map(|c| c.trim().to_string()).filter(|c| !c.is_empty());
+        let body = self.body.trim().to_string();
         let tags = normalize_tags(&self.tags);
-        let topic = self.topic.as_deref().and_then(normalize_topic).unwrap_or_else(|| infer_topic(&tags, &title, &context));
+        let topic = self.topic.as_deref().and_then(normalize_topic).unwrap_or_else(|| infer_topic(&tags, &title, &body));
 
-        within("title", &title, TITLE_CHARS, "name the situation as someone would search for it")?;
-        within("what happened", &context, CONTEXT_CHARS, "describe the symptom or situation, with the exact error text if there was one")?;
-        within("do this", &rule, RULE_CHARS, "state the rule to follow next time in one or two sentences")?;
-        if let Some(c) = &cause
-            && c.chars().count() > MAX_CAUSE_CHARS
-        {
-            return Err(Error::Invalid(format!("`why` is {} characters; keep the root cause under {MAX_CAUSE_CHARS}", c.chars().count())));
-        }
+        within("title", &title, TITLE_CHARS, "give the note a clear title")?;
+        within("body", &body, BODY_CHARS, "write the note content in Markdown")?;
         if !TAG_COUNT.contains(&tags.len()) {
-            return Err(Error::Invalid(format!(
-                "a page needs {} to {} tags (language, framework or area, e.g. `rust`, `sqlite`, `layout`); got {}",
-                TAG_COUNT.start(),
-                TAG_COUNT.end(),
-                tags.len()
-            )));
+            return Err(Error::Invalid(format!("keep tags to {} or fewer (got {})", TAG_COUNT.end(), tags.len())));
         }
-        for text in [&topic, &title, &context, &rule].into_iter().chain(cause.as_ref()) {
+        for text in [&topic, &title, &body] {
             if let Some(what) = secret_in(text) {
                 return Err(Error::Invalid(format!(
-                    "this page looks like it contains {what}; the notebook is shared across projects, so leave secrets out"
+                    "this note looks like it contains {what}; the notebook is shared across projects, so leave secrets out"
                 )));
             }
         }
-        Ok(PageDraft { kind: self.kind, topic: Some(topic), title, tags, context, cause, rule })
+        Ok(PageDraft { kind: self.kind, topic: Some(topic), title, tags, body })
     }
 
     pub fn resolved_topic(&self) -> String {
-        self.topic.as_deref().and_then(normalize_topic).unwrap_or_else(|| infer_topic(&self.tags, &self.title, &self.context))
+        self.topic.as_deref().and_then(normalize_topic).unwrap_or_else(|| infer_topic(&self.tags, &self.title, &self.body))
     }
 }
 
@@ -410,7 +449,7 @@ pub struct TagCount {
     pub pages: usize,
 }
 
-/// A high-level topic summary, with its current page count and scoped tags.
+/// A high-level category summary, with its current page count and scoped tags.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct TopicSummary {
     pub topic: String,
@@ -420,7 +459,7 @@ pub struct TopicSummary {
 }
 
 const PAGE_COLS: &str =
-    "id, kind, topic, title, tags, context, cause, rule, project_id, agent, created_at, updated_at, revision, standing, helped";
+    "id, kind, topic, title, tags, body, context, cause, rule, project_id, agent, created_at, updated_at, revision, standing, helped";
 
 impl Store {
     /// Every page that passes `filter`, the most recently revised first.
@@ -435,8 +474,8 @@ impl Store {
         Ok(self.conn.query_row(&format!("SELECT {PAGE_COLS} FROM notebook_pages WHERE id = ?1"), params![id], page_row).optional()?)
     }
 
-    /// Pages matching `query`, best first: title and tags count most, then the rule, then the
-    /// rest. An empty query lists the filter's pages.
+    /// Pages matching `query`, best first: title and tags count most, then category, then body.
+    /// An empty query lists the filter's pages.
     pub fn search_pages(&self, query: &str, filter: &PageFilter, limit: usize) -> Result<Vec<Page>> {
         let limit = limit.max(1);
         let Some(fts) = fts_terms(query) else {
@@ -448,7 +487,7 @@ impl Store {
             "SELECT {} FROM notebook_pages p
              JOIN notebook_fts ON notebook_fts.rowid = p.id
              WHERE notebook_fts MATCH ?1
-             ORDER BY bm25(notebook_fts, 4.0, 6.0, 4.0, 3.0, 1.0, 1.0) - (p.helped * 0.15), p.updated_at DESC",
+             ORDER BY bm25(notebook_fts, 4.0, 6.0, 4.0, 2.0) - (p.helped * 0.15), p.updated_at DESC",
             PAGE_COLS.split(", ").map(|c| format!("p.{c}")).collect::<Vec<_>>().join(", ")
         ))?;
         let rows = stmt.query_map(params![fts], page_row)?;
@@ -460,9 +499,8 @@ impl Store {
                 .pages(filter)?
                 .into_iter()
                 .filter(|p| {
-                    [&p.topic, &p.title, &p.context, &p.rule].iter().any(|t| t.to_lowercase().contains(&needle))
+                    [&p.topic, &p.title, &p.body].iter().any(|t| t.to_lowercase().contains(&needle))
                         || p.topic_label().to_lowercase().contains(&needle)
-                        || p.cause.as_ref().is_some_and(|c| c.to_lowercase().contains(&needle))
                         || p.tags.iter().any(|t| t.contains(&needle))
                 })
                 .collect();
@@ -471,7 +509,7 @@ impl Store {
         Ok(hits)
     }
 
-    /// Current pages that read like `draft`: the same lesson by title, best match first.
+    /// Current pages that read like `draft`: the same note by title, best match first.
     pub fn similar_pages(&self, draft: &PageDraft) -> Result<Vec<Page>> {
         let want = title_words(&draft.title);
         let mut scored: Vec<(f32, Page)> = self
@@ -484,12 +522,11 @@ impl Store {
         Ok(scored.into_iter().map(|(_, p)| p).collect())
     }
 
-    /// Files a new page.
+    /// Files a new Markdown article.
     ///
     /// # Errors
-    /// [`Error::Invalid`] when the draft falls short of the bar, or, with [`OnSimilar::Refuse`],
-    /// when a current page already covers the same lesson (the message names it so the writer
-    /// can revise it instead).
+    /// [`Error::Invalid`] when the draft falls short of limits, or, with [`OnSimilar::Refuse`],
+    /// when a current page already covers the same topic by title.
     pub fn create_page(&self, draft: PageDraft, author: &str, project_id: Option<i64>, on_similar: OnSimilar) -> Result<Page> {
         let draft = draft.checked()?;
         let topic = draft.resolved_topic();
@@ -497,57 +534,44 @@ impl Store {
             && let Some(existing) = self.similar_pages(&draft)?.into_iter().next()
         {
             return Err(Error::Invalid(format!(
-                "the notebook already has a page on this: #{} \"{}\". Revise it (pass id {}) rather than adding another, or file this as new only if it's a genuinely different lesson",
+                "the notebook already has a page on this: #{} \"{}\". Revise it (pass id {}) rather than adding another, or file this as new only if it's a genuinely different note",
                 existing.id, existing.title, existing.id
             )));
         }
         let now = now_ms();
         self.conn.execute(
-            "INSERT INTO notebook_pages (kind, topic, title, tags, context, cause, rule, project_id, agent, created_at, updated_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?10)",
-            params![
-                draft.kind.as_str(),
-                topic,
-                draft.title,
-                draft.tags.join(" "),
-                draft.context,
-                draft.cause,
-                draft.rule,
-                project_id,
-                author_name(author),
-                now
-            ],
+            "INSERT INTO notebook_pages (kind, topic, title, tags, body, context, cause, rule, project_id, agent, created_at, updated_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, '', NULL, '', ?6, ?7, ?8, ?8)",
+            params![draft.kind.as_str(), topic, draft.title, draft.tags.join(" "), draft.body, project_id, author_name(author), now],
         )?;
         let id = self.conn.last_insert_rowid();
         self.page(id)?.ok_or_else(|| Error::NotFound(format!("page {id} vanished")))
     }
 
-    /// Rewrites a page with a better or corrected version of the same lesson. The project it came
-    /// from stays; the revision count goes up.
+    /// Rewrites an existing page. The originating project stays; the revision count increments.
     pub fn revise_page(&self, id: i64, draft: PageDraft, author: &str) -> Result<Page> {
         let draft = draft.checked()?;
         let topic = draft.resolved_topic();
         let changed = self.conn.execute(
             "UPDATE notebook_pages
-             SET kind = ?1, topic = ?2, title = ?3, tags = ?4, context = ?5, cause = ?6, rule = ?7, agent = ?8,
-                 updated_at = ?9, revision = revision + 1
-             WHERE id = ?10",
-            params![
-                draft.kind.as_str(),
-                topic,
-                draft.title,
-                draft.tags.join(" "),
-                draft.context,
-                draft.cause,
-                draft.rule,
-                author_name(author),
-                now_ms(),
-                id
-            ],
+             SET kind = ?1, topic = ?2, title = ?3, tags = ?4, body = ?5, context = '', cause = NULL, rule = '',
+                 agent = ?6, updated_at = ?7, revision = revision + 1
+             WHERE id = ?8",
+            params![draft.kind.as_str(), topic, draft.title, draft.tags.join(" "), draft.body, author_name(author), now_ms(), id],
         )?;
         if changed == 0 {
             return Err(Error::NotFound(format!("no notebook page {id}")));
         }
+        self.page(id)?.ok_or_else(|| Error::NotFound(format!("no notebook page {id}")))
+    }
+
+    /// Toggles the `task_index`-th GFM task checkbox (`- [ ]` / `- [x]`) in a page's Markdown body.
+    pub fn toggle_page_task(&self, id: i64, task_index: usize, checked: bool) -> Result<Page> {
+        let page = self.page(id)?.ok_or_else(|| Error::NotFound(format!("no notebook page {id}")))?;
+        let Some(updated) = toggle_markdown_task(&page.body, task_index, checked) else {
+            return Ok(page);
+        };
+        self.conn.execute("UPDATE notebook_pages SET body = ?1, updated_at = ?2 WHERE id = ?3", params![updated, now_ms(), id])?;
         self.page(id)?.ok_or_else(|| Error::NotFound(format!("no notebook page {id}")))
     }
 
@@ -578,17 +602,17 @@ impl Store {
         Ok(tag_counts(&self.pages(&PageFilter::default())?))
     }
 
-    /// High-level topics across current pages, the largest first.
+    /// High-level categories across current pages, the largest first.
     pub fn page_topics(&self) -> Result<Vec<TopicSummary>> {
         Ok(topic_counts(&self.pages(&PageFilter::default())?))
     }
 }
 
-/// High-level topics across current `pages`, sorted by page count descending then label A–Z.
+/// High-level categories across current `pages`, sorted by page count descending then label A–Z.
 pub fn topic_counts(pages: &[Page]) -> Vec<TopicSummary> {
     let mut grouped: HashMap<String, Vec<&Page>> = HashMap::new();
     for p in pages.iter().filter(|p| !p.is_archived()) {
-        let slug = if p.topic.trim().is_empty() { infer_topic(&p.tags, &p.title, &p.context) } else { p.topic.clone() };
+        let slug = if p.topic.trim().is_empty() { infer_topic(&p.tags, &p.title, &p.body) } else { p.topic.clone() };
         grouped.entry(slug).or_default().push(p);
     }
     let mut out: Vec<TopicSummary> = grouped
@@ -636,6 +660,185 @@ pub fn normalize_tags(raw: &[String]) -> Vec<String> {
         .collect()
 }
 
+/// Extracts a concise plain-text preview line from a Markdown body (skipping fences and markers).
+pub fn markdown_excerpt(md: &str, max_chars: usize) -> String {
+    if max_chars == 0 {
+        return String::new();
+    }
+    let mut in_fence = false;
+    let mut parts = Vec::new();
+    for raw in md.lines() {
+        let trimmed = raw.trim();
+        if trimmed.starts_with("```") || trimmed.starts_with("~~~") {
+            in_fence = !in_fence;
+            continue;
+        }
+        if in_fence || trimmed.is_empty() || trimmed.starts_with("---") || trimmed.starts_with("***") {
+            continue;
+        }
+        // Skip GFM table separator lines like `| --- | --- |`
+        if trimmed.starts_with('|') && trimmed.chars().all(|c| matches!(c, '|' | '-' | ':' | ' ' | '\t')) {
+            continue;
+        }
+        // Strip Obsidian callout tags (`> [!note]` or `> [!tip] Custom title`), keeping any custom title.
+        let line_for_strip = if trimmed.starts_with('>') {
+            let inner = trimmed.trim_start_matches('>').trim();
+            if let Some(after_open) = inner.strip_prefix("[!")
+                && let Some(end) = after_open.find(']')
+            {
+                let rest = after_open[end + 1..].trim();
+                if rest.is_empty() {
+                    continue;
+                }
+                rest
+            } else {
+                trimmed
+            }
+        } else {
+            trimmed
+        };
+        let cleaned = strip_markdown_line(line_for_strip);
+        if !cleaned.is_empty() {
+            parts.push(cleaned);
+            let joined_len: usize = parts.iter().map(|s| s.chars().count() + 1).sum();
+            if joined_len >= max_chars + 16 {
+                break;
+            }
+        }
+    }
+    let joined = parts.join(" ");
+    let mut chars = joined.chars();
+    let head: String = chars.by_ref().take(max_chars).collect();
+    if chars.next().is_some() {
+        let trimmed = head.trim_end_matches(|c: char| !c.is_alphanumeric()).trim_end();
+        format!("{trimmed}…")
+    } else {
+        head
+    }
+}
+
+fn strip_markdown_line(line: &str) -> String {
+    let mut s = line.trim();
+    // Strip leading quote markers, headings, list bullets, ordered markers, checkboxes.
+    while let Some(rest) = s.strip_prefix('>') {
+        s = rest.trim_start();
+    }
+    if s.starts_with('#') {
+        s = s.trim_start_matches('#').trim_start();
+    }
+    for prefix in ["- [ ] ", "- [x] ", "- [X] ", "* [ ] ", "* [x] ", "* [X] ", "- ", "* ", "+ "] {
+        if let Some(rest) = s.strip_prefix(prefix) {
+            s = rest.trim_start();
+            break;
+        }
+    }
+    if let Some(dot) = s.find(". ")
+        && dot > 0
+        && dot <= 4
+        && s[..dot].chars().all(|c| c.is_ascii_digit())
+    {
+        s = s[dot + 2..].trim_start();
+    }
+    // Strip inline `[label](url)` -> `label`, and emphasis/code punctuation.
+    let mut out = String::with_capacity(s.len());
+    let chars: Vec<char> = s.chars().collect();
+    let mut i = 0;
+    while i < chars.len() {
+        if chars[i] == '['
+            && let Some(close_br) = (i + 1..chars.len()).find(|&j| chars[j] == ']')
+            && close_br + 1 < chars.len()
+            && chars[close_br + 1] == '('
+            && let Some(close_par) = (close_br + 2..chars.len()).find(|&j| chars[j] == ')')
+        {
+            for &ch in &chars[i + 1..close_br] {
+                if !matches!(ch, '*' | '_' | '`' | '~') {
+                    out.push(ch);
+                }
+            }
+            i = close_par + 1;
+            continue;
+        }
+        let ch = chars[i];
+        if !matches!(ch, '*' | '_' | '`' | '~') {
+            out.push(ch);
+        }
+        i += 1;
+    }
+    squash(&out)
+}
+
+/// Toggles the `task_index`-th GFM task list checkbox outside fenced code blocks.
+pub fn toggle_markdown_task(md: &str, task_index: usize, checked: bool) -> Option<String> {
+    let mut in_fence = false;
+    let mut seen = 0usize;
+    let mut out = String::with_capacity(md.len());
+    let mut changed = false;
+    for chunk in md.split_inclusive('\n') {
+        let trimmed = chunk.trim_start();
+        if trimmed.starts_with("```") || trimmed.starts_with("~~~") {
+            in_fence = !in_fence;
+            out.push_str(chunk);
+            continue;
+        }
+        if !in_fence && let Some(box_offset) = find_task_box_offset(chunk) {
+            if seen == task_index {
+                let mark = if checked { 'x' } else { ' ' };
+                out.push_str(&chunk[..box_offset]);
+                out.push(mark);
+                out.push_str(&chunk[box_offset + 1..]);
+                changed = true;
+                seen += 1;
+                continue;
+            }
+            seen += 1;
+        }
+        out.push_str(chunk);
+    }
+    changed.then_some(out)
+}
+
+/// Returns the byte index of the character inside `[ ]` / `[x]` for a GFM task list line.
+fn find_task_box_offset(line: &str) -> Option<usize> {
+    let bytes = line.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() && matches!(bytes[i], b' ' | b'\t' | b'>') {
+        i += 1;
+    }
+    if i >= bytes.len() {
+        return None;
+    }
+    if matches!(bytes[i], b'-' | b'*' | b'+') {
+        i += 1;
+    } else if bytes[i].is_ascii_digit() {
+        while i < bytes.len() && bytes[i].is_ascii_digit() {
+            i += 1;
+        }
+        if i < bytes.len() && matches!(bytes[i], b'.' | b')') {
+            i += 1;
+        } else {
+            return None;
+        }
+    } else {
+        return None;
+    }
+    if i >= bytes.len() || !matches!(bytes[i], b' ' | b'\t') {
+        return None;
+    }
+    while i < bytes.len() && matches!(bytes[i], b' ' | b'\t') {
+        i += 1;
+    }
+    if i + 3 <= bytes.len()
+        && bytes[i] == b'['
+        && matches!(bytes[i + 1], b' ' | b'x' | b'X')
+        && bytes[i + 2] == b']'
+        && (i + 3 == bytes.len() || matches!(bytes[i + 3], b' ' | b'\t' | b'\r' | b'\n'))
+    {
+        Some(i + 1)
+    } else {
+        None
+    }
+}
+
 fn passes(p: &Page, f: &PageFilter) -> bool {
     (f.include_archived || !p.is_archived())
         && f.kind.is_none_or(|k| p.kind == k)
@@ -653,7 +856,7 @@ fn within(part: &str, text: &str, range: std::ops::RangeInclusive<usize>, advice
         return Err(Error::Invalid(format!("`{part}` is too short ({n} characters); {advice}")));
     }
     if n > *range.end() {
-        return Err(Error::Invalid(format!("`{part}` is {n} characters; keep it under {} so the page stays a quick read", range.end())));
+        return Err(Error::Invalid(format!("`{part}` is {n} characters; keep it under {}", range.end())));
     }
     Ok(())
 }
@@ -667,7 +870,7 @@ fn author_name(a: &str) -> &str {
     if a.is_empty() { "Unknown agent" } else { a }
 }
 
-/// Words that carry meaning in a title, for telling two pages on the same lesson apart.
+/// Words that carry meaning in a title, for telling two pages on the same note apart.
 fn title_words(title: &str) -> HashSet<String> {
     const STOP: [&str; 24] = [
         "the", "and", "for", "with", "when", "while", "from", "into", "that", "this", "its", "are", "was", "not", "use", "using", "via",
@@ -724,25 +927,31 @@ fn page_row(r: &Row<'_>) -> rusqlite::Result<Page> {
     let title: String = r.get(3)?;
     let tags_raw: String = r.get(4)?;
     let tags: Vec<String> = tags_raw.split_whitespace().map(str::to_string).collect();
-    let context: String = r.get(5)?;
-    let topic = normalize_topic(&raw_topic).unwrap_or_else(|| infer_topic(&tags, &title, &context));
-    let standing: String = r.get(13)?;
+    let raw_body: String = r.get(5)?;
+    let body = if raw_body.trim().is_empty() {
+        let context: String = r.get(6)?;
+        let cause: Option<String> = r.get(7)?;
+        let rule: String = r.get(8)?;
+        compose_legacy_body(&context, cause.as_deref(), &rule)
+    } else {
+        raw_body
+    };
+    let topic = normalize_topic(&raw_topic).unwrap_or_else(|| infer_topic(&tags, &title, &body));
+    let standing: String = r.get(14)?;
     Ok(Page {
         id: r.get(0)?,
-        kind: kind.parse().unwrap_or(Kind::Pattern),
+        kind: kind.parse().unwrap_or(Kind::Note),
         topic,
         title,
         tags,
-        context,
-        cause: r.get(6)?,
-        rule: r.get(7)?,
-        project_id: r.get(8)?,
-        agent: r.get(9)?,
-        created_at: r.get(10)?,
-        updated_at: r.get(11)?,
-        revision: r.get(12)?,
+        body,
+        project_id: r.get(9)?,
+        agent: r.get(10)?,
+        created_at: r.get(11)?,
+        updated_at: r.get(12)?,
+        revision: r.get(13)?,
         standing: if standing == "archived" { Standing::Archived } else { Standing::Current },
-        helped: r.get(14)?,
+        helped: r.get(15)?,
     })
 }
 
@@ -751,13 +960,14 @@ pub(crate) fn migrate(conn: &Connection) -> Result<()> {
     conn.execute_batch(
         "CREATE TABLE IF NOT EXISTS notebook_pages (
             id INTEGER PRIMARY KEY,
-            kind TEXT NOT NULL,
+            kind TEXT NOT NULL DEFAULT 'note',
             topic TEXT NOT NULL DEFAULT '',
             title TEXT NOT NULL,
             tags TEXT NOT NULL DEFAULT '',
-            context TEXT NOT NULL,
+            body TEXT NOT NULL DEFAULT '',
+            context TEXT NOT NULL DEFAULT '',
             cause TEXT,
-            rule TEXT NOT NULL,
+            rule TEXT NOT NULL DEFAULT '',
             project_id INTEGER REFERENCES projects(id) ON DELETE SET NULL,
             agent TEXT NOT NULL,
             created_at INTEGER NOT NULL,
@@ -769,31 +979,40 @@ pub(crate) fn migrate(conn: &Connection) -> Result<()> {
         CREATE INDEX IF NOT EXISTS notebook_by_updated ON notebook_pages(updated_at DESC, id DESC);",
     )?;
 
-    let mut has_topic_col = false;
-    {
+    let cols: Vec<String> = {
         let mut stmt = conn.prepare("PRAGMA table_info(notebook_pages)")?;
-        let mut rows = stmt.query([])?;
-        while let Some(row) = rows.next()? {
-            let name: String = row.get(1)?;
-            if name == "topic" {
-                has_topic_col = true;
-                break;
-            }
-        }
-    }
-    if !has_topic_col {
+        let rows = stmt.query_map([], |r| r.get(1))?;
+        rows.collect::<rusqlite::Result<_>>()?
+    };
+    if !cols.iter().any(|c| c == "topic") {
         conn.execute("ALTER TABLE notebook_pages ADD COLUMN topic TEXT NOT NULL DEFAULT ''", [])?;
     }
+    if !cols.iter().any(|c| c == "body") {
+        conn.execute("ALTER TABLE notebook_pages ADD COLUMN body TEXT NOT NULL DEFAULT ''", [])?;
+    }
 
-    // Backfill any page whose topic is still empty (either freshly migrated or legacy writes).
-    let needs_backfill: Vec<(i64, String, String, String)> = {
-        let mut stmt = conn.prepare("SELECT id, tags, title, context FROM notebook_pages WHERE trim(topic) = ''")?;
+    // Backfill Markdown `body` for legacy structured rows whose `body` is still empty.
+    let needs_body: Vec<(i64, String, Option<String>, String)> = {
+        let mut stmt = conn.prepare("SELECT id, context, cause, rule FROM notebook_pages WHERE trim(body) = ''")?;
         let rows = stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))?;
         rows.collect::<rusqlite::Result<_>>()?
     };
-    for (id, tags_raw, title, context) in needs_backfill {
+    for (id, context, cause, rule) in needs_body {
+        let body = compose_legacy_body(&context, cause.as_deref(), &rule);
+        if !body.is_empty() {
+            conn.execute("UPDATE notebook_pages SET body = ?1 WHERE id = ?2", params![body, id])?;
+        }
+    }
+
+    // Backfill any page whose topic is still empty.
+    let needs_topic: Vec<(i64, String, String, String)> = {
+        let mut stmt = conn.prepare("SELECT id, tags, title, body FROM notebook_pages WHERE trim(topic) = ''")?;
+        let rows = stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))?;
+        rows.collect::<rusqlite::Result<_>>()?
+    };
+    for (id, tags_raw, title, body) in needs_topic {
         let tags: Vec<String> = tags_raw.split_whitespace().map(str::to_string).collect();
-        let topic = infer_topic(&tags, &title, &context);
+        let topic = infer_topic(&tags, &title, &body);
         conn.execute("UPDATE notebook_pages SET topic = ?1 WHERE id = ?2", params![topic, id])?;
     }
 
@@ -801,7 +1020,7 @@ pub(crate) fn migrate(conn: &Connection) -> Result<()> {
         conn.query_row("SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'notebook_fts'", [], |r| r.get(0)).optional()?;
     let needs_fts_rebuild = match fts_sql {
         None => true,
-        Some(sql) => !sql.contains("topic"),
+        Some(sql) => !sql.contains("body") || !sql.contains("topic"),
     };
     if needs_fts_rebuild {
         conn.execute_batch(
@@ -814,22 +1033,22 @@ pub(crate) fn migrate(conn: &Connection) -> Result<()> {
 
     conn.execute_batch(
         "CREATE VIRTUAL TABLE IF NOT EXISTS notebook_fts USING fts5(
-            topic, title, tags, rule, context, cause,
+            topic, title, tags, body,
             content='notebook_pages', content_rowid='id', tokenize='unicode61'
         );
         CREATE TRIGGER IF NOT EXISTS notebook_ai AFTER INSERT ON notebook_pages BEGIN
-            INSERT INTO notebook_fts(rowid, topic, title, tags, rule, context, cause)
-            VALUES (new.id, new.topic, new.title, new.tags, new.rule, new.context, COALESCE(new.cause, ''));
+            INSERT INTO notebook_fts(rowid, topic, title, tags, body)
+            VALUES (new.id, new.topic, new.title, new.tags, new.body);
         END;
         CREATE TRIGGER IF NOT EXISTS notebook_ad AFTER DELETE ON notebook_pages BEGIN
-            INSERT INTO notebook_fts(notebook_fts, rowid, topic, title, tags, rule, context, cause)
-            VALUES ('delete', old.id, old.topic, old.title, old.tags, old.rule, old.context, COALESCE(old.cause, ''));
+            INSERT INTO notebook_fts(notebook_fts, rowid, topic, title, tags, body)
+            VALUES ('delete', old.id, old.topic, old.title, old.tags, old.body);
         END;
-        CREATE TRIGGER IF NOT EXISTS notebook_au AFTER UPDATE OF topic, title, tags, rule, context, cause ON notebook_pages BEGIN
-            INSERT INTO notebook_fts(notebook_fts, rowid, topic, title, tags, rule, context, cause)
-            VALUES ('delete', old.id, old.topic, old.title, old.tags, old.rule, old.context, COALESCE(old.cause, ''));
-            INSERT INTO notebook_fts(rowid, topic, title, tags, rule, context, cause)
-            VALUES (new.id, new.topic, new.title, new.tags, new.rule, new.context, COALESCE(new.cause, ''));
+        CREATE TRIGGER IF NOT EXISTS notebook_au AFTER UPDATE OF topic, title, tags, body ON notebook_pages BEGIN
+            INSERT INTO notebook_fts(notebook_fts, rowid, topic, title, tags, body)
+            VALUES ('delete', old.id, old.topic, old.title, old.tags, old.body);
+            INSERT INTO notebook_fts(rowid, topic, title, tags, body)
+            VALUES (new.id, new.topic, new.title, new.tags, new.body);
         END;",
     )?;
     if needs_fts_rebuild {
@@ -849,18 +1068,16 @@ mod tests {
 
     fn draft(title: &str) -> PageDraft {
         PageDraft {
-            kind: Kind::Fix,
+            kind: Kind::Note,
             topic: None,
             title: title.into(),
             tags: vec!["sqlite".into(), "Rust".into()],
-            context: "Readers in the app stalled for seconds while the CLI posted an update.".into(),
-            cause: Some("A write transaction held the lock while copying a large screenshot.".into()),
-            rule: "Copy media before opening the write transaction, and keep transactions to the insert itself.".into(),
+            body: "## Symptom\n\nReaders in the app stalled while the CLI copied a screenshot inside a write transaction.\n\n## Rule\n\nCopy media files before opening the SQLite write transaction.".into(),
         }
     }
 
     #[test]
-    fn drafts_are_normalized_and_held_to_the_bar() {
+    fn drafts_are_normalized_and_freeform_without_forced_tags() {
         let d = PageDraft {
             title: "  SQLite   reads stall during long writes. ".into(),
             tags: vec!["#Rust, sqlite".into(), "rust".into()],
@@ -871,28 +1088,29 @@ mod tests {
         assert_eq!(ok.tags, ["rust", "sqlite"]);
         assert_eq!(ok.topic.as_deref(), Some("rust"));
 
+        // Freeform notes need no tags or kind at all.
+        let freeform = PageDraft::new("Rune scroll tricks", "Bound an ancestor height and add `min_h(0)`.").checked().unwrap();
+        assert_eq!(freeform.kind, Kind::Note);
+        assert!(freeform.tags.is_empty());
+        assert_eq!(freeform.topic.as_deref(), Some("rust"));
+
         let explicit = PageDraft { topic: Some("Next.js".into()), ..draft("App Router streaming falls back") }.checked().unwrap();
         assert_eq!(explicit.topic.as_deref(), Some("nextjs"));
         let custom = PageDraft { topic: Some("GraphQL API".into()), ..draft("Cache headers break hydration") }.checked().unwrap();
         assert_eq!(custom.topic.as_deref(), Some("graphql-api"));
         assert_eq!(topic_label("graphql-api"), "Graphql Api");
 
-        let short = PageDraft { rule: "Fix it.".into(), ..draft("SQLite reads stall during long writes") };
-        assert!(short.checked().unwrap_err().to_string().contains("`do this` is too short"));
-        let untagged = PageDraft { tags: vec![], ..draft("SQLite reads stall during long writes") };
-        assert!(untagged.checked().unwrap_err().to_string().contains("tags"));
-        let leaky = PageDraft {
-            context: "Called the API with sk-abcdefghijklmnopqrstuvwxyz123456 and it failed loudly.".into(),
-            ..draft("Webhook calls fail with stale keys")
-        };
+        let empty_body = PageDraft::new("Valid title", "   ");
+        assert!(empty_body.checked().unwrap_err().to_string().contains("`body` is too short"));
+        let leaky = PageDraft::new("Webhook keys", "Called the API with sk-abcdefghijklmnopqrstuvwxyz123456 and it failed.");
         assert!(leaky.checked().unwrap_err().to_string().contains("API key"));
     }
 
     #[test]
-    fn topic_inference_prefers_specific_frameworks_and_legacy_db_migrates() {
-        assert_eq!(infer_topic(&["react".into(), "nextjs".into()], "Server actions", "context"), "nextjs");
-        assert_eq!(infer_topic(&["react".into(), "expo".into()], "Scroll jitter", "context"), "react-native");
-        assert_eq!(infer_topic(&["hooks".into()], "Effect cleanup", "context"), "react");
+    fn legacy_structured_db_migrates_into_markdown_body_and_fts() {
+        assert_eq!(infer_topic(&["react".into(), "nextjs".into()], "Server actions", "body"), "nextjs");
+        assert_eq!(infer_topic(&["react".into(), "expo".into()], "Scroll jitter", "body"), "react-native");
+        assert_eq!(infer_topic(&["hooks".into()], "Effect cleanup", "body"), "react");
 
         let dir = std::env::temp_dir().join(format!("feeder-notebook-legacy-{}-{}", std::process::id(), fastrand::u32(..)));
         std::fs::create_dir_all(&dir).unwrap();
@@ -917,16 +1135,42 @@ mod tests {
                     helped INTEGER NOT NULL DEFAULT 0
                 );
                 CREATE VIRTUAL TABLE notebook_fts USING fts5(title, tags, rule, context, cause, content='notebook_pages', content_rowid='id');
-                INSERT INTO notebook_pages (id, kind, title, tags, context, rule, agent, created_at, updated_at)
-                VALUES (1, 'pitfall', 'Reanimated worklets drop closures', 'expo react-native', 'Shared value broke.', 'Mark callbacks with worklet.', 'Codex', 1, 1);",
+                INSERT INTO notebook_pages (id, kind, title, tags, context, cause, rule, agent, created_at, updated_at)
+                VALUES (1, 'pitfall', 'Reanimated worklets drop closures', 'expo react-native', 'Shared value broke.', 'JS closure not serialized.', 'Mark callbacks with worklet.', 'Codex', 1, 1);",
             )
             .unwrap();
         }
         let s = Store::open(&dir).unwrap();
         let page = s.page(1).unwrap().unwrap();
         assert_eq!(page.topic, "react-native");
-        let hits = s.search_pages("react-native", &PageFilter::default(), 5).unwrap();
+        assert_eq!(page.kind, Kind::Pitfall);
+        assert!(page.body.contains("## What happened"));
+        assert!(page.body.contains("Shared value broke."));
+        assert!(page.body.contains("## Why"));
+        assert!(page.body.contains("## Takeaway"));
+        let hits = s.search_pages("worklet", &PageFilter::default(), 5).unwrap();
         assert_eq!(hits.len(), 1);
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn toggle_task_checkboxes_skips_code_fences_and_persists() {
+        let (s, dir) = temp_store("tasks");
+        let page = s
+            .create_page(
+                PageDraft::new("Release checklist", "```md\n- [ ] ignore fenced task\n```\n\n- [ ] Run clippy\n- [x] Update changelog\n"),
+                "You",
+                None,
+                OnSimilar::Allow,
+            )
+            .unwrap();
+        let updated = s.toggle_page_task(page.id, 0, true).unwrap();
+        assert!(updated.body.contains("- [ ] ignore fenced task"));
+        assert!(updated.body.contains("- [x] Run clippy"));
+        assert!(updated.body.contains("- [x] Update changelog"));
+
+        let updated2 = s.toggle_page_task(page.id, 1, false).unwrap();
+        assert!(updated2.body.contains("- [ ] Update changelog"));
         std::fs::remove_dir_all(dir).ok();
     }
 
@@ -945,7 +1189,7 @@ mod tests {
                 first.id,
                 PageDraft {
                     topic: Some("data".into()),
-                    rule: "Keep write transactions to the insert; copy files first.".into(),
+                    body: "Keep write transactions short; copy files before opening SQLite.".into(),
                     ..draft("SQLite reads stall during long writes")
                 },
                 "T3 Code",
@@ -968,9 +1212,7 @@ mod tests {
                     topic: Some("rust".into()),
                     title: "Scroll viewport collapses to zero height".into(),
                     tags: vec!["rune".into(), "layout".into()],
-                    context: "A grown scroll column inside an auto-height column drew nothing at all.".into(),
-                    cause: None,
-                    rule: "Bound an ancestor's height and put min_h(0) on each column between it and the viewport.".into(),
+                    body: "A grown scroll column inside an auto-height column drew nothing.\n\nBound an ancestor's height and put `min_h(0)` on each column between it and the viewport.".into(),
                 },
                 "Claude Code",
                 None,
@@ -1003,19 +1245,18 @@ mod tests {
     }
 
     #[test]
-    fn kinds_parse_from_what_people_type() {
+    fn kinds_and_markdown_export_work_cleanly() {
         assert_eq!("Bug".parse::<Kind>().unwrap(), Kind::Fix);
         assert_eq!("gotcha".parse::<Kind>().unwrap(), Kind::Pitfall);
+        assert_eq!("article".parse::<Kind>().unwrap(), Kind::Note);
         assert!("vibe".parse::<Kind>().is_err());
-        let md = Page {
+        let page = Page {
             id: 3,
             kind: Kind::Decision,
             topic: "agents".into(),
             title: "Keep the MCP server stdio-only".into(),
             tags: vec!["mcp".into()],
-            context: "Considered an HTTP transport.".into(),
-            cause: Some("A port would expose the store.".into()),
-            rule: "Ship stdio only.".into(),
+            body: "Considered an HTTP transport, but a local port would expose the store.\n\n> [!note]\n> Ship **stdio** only.".into(),
             project_id: None,
             agent: "You".into(),
             created_at: 0,
@@ -1023,10 +1264,11 @@ mod tests {
             revision: 1,
             standing: Standing::Current,
             helped: 2,
-        }
-        .to_markdown(Some("Feeder"), 0);
-        assert!(md.starts_with("## Keep the MCP server stdio-only (#3)"));
+        };
+        let md = page.to_markdown(Some("Feeder"), 0);
+        assert!(md.starts_with("# Keep the MCP server stdio-only\n"));
         assert!(md.contains("Agents & MCP · Decision"));
-        assert!(md.contains("**Do this:** Ship stdio only."));
+        assert!(md.contains("Ship **stdio** only."));
+        assert!(page.excerpt(80).contains("Considered an HTTP transport"));
     }
 }

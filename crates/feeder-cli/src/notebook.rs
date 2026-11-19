@@ -46,36 +46,42 @@ pub enum NotebookCmd {
         #[arg(long)]
         json: bool,
     },
-    /// Write a new page, or revise one with `--id`. `feeder notebook guide` says what makes a good one.
+    /// Write a new Markdown note, or revise one with `--id`. `feeder notebook guide` explains how.
     #[command(after_long_help = NOTEBOOK_GUIDE)]
     Write {
         /// Revise this page instead of adding a new one.
         #[arg(long)]
         id: Option<i64>,
-        /// fix, pitfall, pattern or decision.
+        /// Optional kind (`note`, `fix`, `pitfall`, `pattern`, `decision`). Defaults to `note`.
         #[arg(long)]
-        kind: String,
-        /// High-level topic (`rust`, `react`, `nextjs`, `design`, …); inferred from tags if omitted.
+        kind: Option<String>,
+        /// Optional category/topic (`rust`, `react`, `nextjs`, `design`, `general`, or a custom slug).
         #[arg(long)]
         topic: Option<String>,
         #[arg(long)]
         title: String,
-        /// Comma-separated: `rust,sqlite`.
+        /// Optional comma-separated tags: `rust,sqlite`.
         #[arg(long, value_delimiter = ',')]
         tags: Vec<String>,
-        /// What happened: the symptom or situation.
+        /// Freeform Markdown body. Pass `-` or omit with `--file` / piped stdin.
         #[arg(long)]
-        what: String,
-        /// Why: the root cause or reasoning.
+        body: Option<String>,
+        /// Read the Markdown body from a `.md` file.
+        #[arg(short, long)]
+        file: Option<std::path::PathBuf>,
+        /// Legacy: what happened (composed into Markdown if `--body` is omitted).
+        #[arg(long)]
+        what: Option<String>,
+        /// Legacy: why / root cause (composed into Markdown if `--body` is omitted).
         #[arg(long)]
         why: Option<String>,
-        /// Do this: the rule to follow next time.
+        /// Legacy: rule to follow (composed into Markdown if `--body` is omitted).
         #[arg(long = "do")]
-        rule: String,
+        rule: Option<String>,
         /// The project it came from. Defaults to the current folder's project, if it has a feed.
         #[arg(short, long)]
         project: Option<String>,
-        /// File it even if a similar page exists (only for a genuinely different lesson).
+        /// File it even if a similar page exists (only for a genuinely different note).
         #[arg(long)]
         new: bool,
         #[arg(short, long)]
@@ -96,7 +102,7 @@ pub enum NotebookCmd {
         #[arg(long)]
         yes: bool,
     },
-    /// High-level topics in use, with page counts and top tags.
+    /// High-level categories/topics in use, with page counts and top tags.
     Topics {
         #[arg(long)]
         json: bool,
@@ -139,11 +145,13 @@ pub fn run(store: &Store, cmd: Option<NotebookCmd>, author: &str) -> Result<(), 
             if json {
                 println!("{}", Value::Array(pages.iter().map(|p| page_json(store, p)).collect()));
             } else if pages.is_empty() {
-                println!("The notebook is empty so far. Agents add pages as they learn; `feeder notebook guide` explains how.");
+                println!(
+                    "The notebook is empty so far. Write a note in Feeder or via `feeder notebook write`; `feeder notebook guide` explains how."
+                );
             } else {
                 for p in &pages {
                     let archived = if p.is_archived() { "  (archived)" } else { "" };
-                    println!("#{:<4} {:<14} {:<9} {}{archived}", p.id, p.topic_label(), p.kind.label(), p.title);
+                    println!("#{:<4} {:<14} {}{archived}", p.id, p.topic_label(), p.title);
                 }
             }
         }
@@ -155,15 +163,28 @@ pub fn run(store: &Store, cmd: Option<NotebookCmd>, author: &str) -> Result<(), 
                 print!("{}", page.to_markdown(project_name(store, &page).as_deref(), now));
             }
         }
-        NotebookCmd::Write { id, kind, topic, title, tags, what, why, rule, project, new, agent, json } => {
-            let draft = PageDraft {
-                kind: kind.parse().map_err(|e: feeder_core::Error| e.to_string())?,
-                topic,
-                title,
-                tags,
-                context: what,
-                cause: why,
-                rule,
+        NotebookCmd::Write { id, kind, topic, title, tags, body, file, what, why, rule, project, new, agent, json } => {
+            let kind = parse_kind(kind)?.unwrap_or(Kind::Note);
+            let draft = if let Some(path) = file {
+                let text = std::fs::read_to_string(&path).map_err(|e| format!("can't read {}: {e}", path.display()))?;
+                PageDraft { kind, topic, title, tags, body: text }
+            } else if let Some(b) = body {
+                let text = if b.trim() == "-" {
+                    let mut buf = String::new();
+                    std::io::Read::read_to_string(&mut std::io::stdin(), &mut buf).map_err(|e| e.to_string())?;
+                    buf
+                } else {
+                    b
+                };
+                PageDraft { kind, topic, title, tags, body: text }
+            } else if what.is_some() || rule.is_some() {
+                PageDraft::from_legacy(kind, topic, title, tags, what.unwrap_or_default(), why, rule.unwrap_or_default())
+            } else if !std::io::IsTerminal::is_terminal(&std::io::stdin()) {
+                let mut buf = String::new();
+                std::io::Read::read_to_string(&mut std::io::stdin(), &mut buf).map_err(|e| e.to_string())?;
+                PageDraft { kind, topic, title, tags, body: buf }
+            } else {
+                return Err("provide `--body <markdown>`, `--file <path.md>`, or pipe Markdown on stdin".into());
             };
             let author = agent.map(|a| feeder_core::agent_display_name(&a)).unwrap_or_else(|| author.to_string());
             let page = match id {
@@ -271,9 +292,8 @@ pub(crate) fn page_json(store: &Store, p: &Page) -> Value {
         "topic_label": p.topic_label(),
         "title": p.title,
         "tags": p.tags,
-        "what_happened": p.context,
-        "why": p.cause,
-        "do_this": p.rule,
+        "body": p.body,
+        "excerpt": p.excerpt(160),
         "project": project_name(store, p),
         "agent": p.agent,
         "revision": p.revision,

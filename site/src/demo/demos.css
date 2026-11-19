@@ -800,6 +800,32 @@
     line-height: 1.5;
   }
 
+  .nd-page code {
+    padding: 1px 5px;
+    border-radius: 4px;
+    background: var(--ss-ink-1);
+    font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+    font-size: 12px;
+  }
+
+  .nd-callout {
+    margin-top: 8px;
+    padding: 9px 12px;
+    border-radius: 8px;
+    border: 1px solid var(--ss-line-faint);
+    border-left: 3px solid var(--ss-success-text);
+    background: var(--ss-ink-1);
+    display: grid;
+    gap: 3px;
+  }
+
+  .nd-callout__title {
+    color: var(--ss-success-text);
+    font-size: 12px;
+    font-weight: 600;
+    line-height: 1.3;
+  }
+
   .nd-page__foot {
     margin-top: 14px;
     padding-top: 12px;

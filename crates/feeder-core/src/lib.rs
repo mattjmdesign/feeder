@@ -19,15 +19,15 @@ pub use detect::{
 };
 pub use guide::{GUIDE, NOTEBOOK_GUIDE, notebook_skill_markdown, skill_markdown};
 pub use notebook::{
-    CANONICAL_TOPICS, CONTEXT_CHARS, Kind, MAX_CAUSE_CHARS, OnSimilar, Page, PageDraft, PageFilter, RULE_CHARS, Standing, TAG_COUNT,
-    TITLE_CHARS, TOPIC_MAX_CHARS, TagCount, TopicSpec, TopicSummary, infer_topic, normalize_tags, normalize_topic, secret_in, tag_counts,
-    topic_counts, topic_label,
+    BODY_CHARS, CANONICAL_TOPICS, Kind, OnSimilar, Page, PageDraft, PageFilter, Standing, TAG_COUNT, TITLE_CHARS, TOPIC_MAX_CHARS,
+    TagCount, TopicSpec, TopicSummary, compose_legacy_body, infer_topic, markdown_excerpt, normalize_tags, normalize_topic, secret_in,
+    tag_counts, toggle_markdown_task, topic_counts, topic_label,
 };
 pub use orb::{Orb, Pattern};
 pub use settings::{OrbSize, Order, Settings, Theme};
 pub use store::{
-    FeedUpdate, MAX_TODO_CHARS, MediaKind, NewUpdate, Project, ProjectSummary, Pulse, Reply, Store, TodoItem, data_dir, image_dimensions,
-    media_kind_for_path,
+    FeedUpdate, MAX_MEDIA_PER_UPDATE, MAX_TODO_CHARS, MediaAttachment, MediaKind, NewUpdate, Project, ProjectSummary, Pulse, Reply, Store,
+    TodoItem, data_dir, image_dimensions, media_kind_for_path,
 };
 pub use time::{ago, day_key, day_label, now_ms, relative_time};
 pub use update::{

@@ -1,25 +1,31 @@
-//! The Notebook tab: Feeder's shared engineering knowledge base, modelled on Obsidian & Notion
-//! using native `rune-kit` components (`SplitView`, `Toolbar`, `Tree`, `Select`, `TextInput`,
-//! `TextArea`, `SegmentedControl`, `Markdown`, `Menu`, `Divider`, `Badge`, `Button`).
+//! The Notebook tab: Feeder's freeform Markdown knowledge library, modelled on Obsidian & Notion.
+//!
+//! Writing a new note opens a borderless blank canvas (title + single category selector + live
+//! syntax-decorated `.md` editor with formatting toolbar, keyboard shortcuts, smart list
+//! continuation, and Write/Preview toggle). Reading renders full GFM Markdown with syntax-highlighted
+//! code blocks, tables, Obsidian `> [!note]` callouts, and interactive persisted task checkboxes.
 
 use std::collections::HashMap;
 
-use feeder_core::{CANONICAL_TOPICS, Kind, Page, PageDraft, Standing, ago, infer_topic, normalize_topic, topic_counts, topic_label};
+use feeder_core::{
+    CANONICAL_TOPICS, Kind, Page, PageDraft, Standing, ago, infer_topic, normalize_topic, toggle_markdown_task, topic_counts, topic_label,
+};
 use rune::{
-    Color, Cursor, El, Icon, Key, KeyEvent, Link, LinkPaint, ScrollSpec, TextEdit, Transition, Tx, col, el, icon, oklch, row, text,
+    Color, Cursor, El, Icon, Key, KeyEvent, Link, LinkPaint, ScrollSpec, Span, TextEdit, Transition, Tx, col, el, icon, oklch, row, text,
+    text_input,
 };
 use rune_kit::shell::{SidebarPeek, SidebarToggle};
+use rune_kit::syntax::{self, SyntaxTheme};
 use rune_kit::{
     Badge, BadgeVariant, Button, ButtonVariant, ControlSize, Divider, Kit, Markdown, Menu, MenuItem, PaneState, Placement,
-    SegmentedControl, Select, SelectAppearance, SidebarHeader, SidebarRow, SplitView, TextArea, TextInput, Toolbar, Tree, TreeItem,
-    TreeModel, TreeRow, TreeStyle, scroll_bar,
+    SegmentedControl, Select, SelectAppearance, SidebarHeader, SidebarRow, SplitView, TextInput, Toolbar, Tree, TreeItem, TreeModel,
+    TreeRow, TreeStyle, scroll_bar,
 };
 
 use crate::style::{self, Palette};
 use crate::watch::NotebookOp;
 use crate::{CopyTarget, State, ToastItem, ToastKind, agents, chrome, feed, orb};
 
-/// Keeps index rows and document prose comfortably scannable.
 /// How far a list row's hover surface reaches past the text column on each side.
 const ROW_BLEED: f32 = 10.0;
 const INDEX_MAX_W: f32 = 760.0;
@@ -104,19 +110,19 @@ pub enum TopicChoice {
     Custom,
 }
 
-/// A page being written or revised in the Notion-style document editor.
+/// A freeform Markdown note being written or revised on a borderless canvas.
 pub struct Editor {
-    /// The page being revised, or None for a new one.
+    /// The page being revised, or None for a brand-new note.
     pub id: Option<i64>,
+    /// Preserved metadata from existing notes (defaults to `Kind::Note` for fresh notes).
     pub kind: Kind,
+    pub tags: Vec<String>,
     pub topic_choice: TopicChoice,
     pub topic_open: bool,
     pub topic_custom: TextEdit,
     pub title: TextEdit,
-    pub tags: TextEdit,
-    pub what: TextEdit,
-    pub why: TextEdit,
-    pub rule: TextEdit,
+    pub body: TextEdit,
+    pub preview: bool,
     pub error: Option<String>,
 }
 
@@ -126,7 +132,8 @@ impl Editor {
         title.focused = true;
         Editor {
             id: None,
-            kind: Kind::Fix,
+            kind: Kind::Note,
+            tags: Vec::new(),
             topic_choice: match default_topic {
                 Some(t) if !t.is_empty() => TopicChoice::Selected(t.to_string()),
                 _ => TopicChoice::Auto,
@@ -134,28 +141,25 @@ impl Editor {
             topic_open: false,
             topic_custom: TextEdit::new(""),
             title,
-            tags: TextEdit::new(""),
-            what: TextEdit::new(""),
-            why: TextEdit::new(""),
-            rule: TextEdit::new(""),
+            body: TextEdit::new(""),
+            preview: false,
             error: None,
         }
     }
 
     fn from_page(p: &Page) -> Editor {
-        let mut title = TextEdit::new(&p.title);
-        title.focused = true;
+        let mut body = TextEdit::new(&p.body);
+        body.focused = true;
         Editor {
             id: Some(p.id),
             kind: p.kind,
+            tags: p.tags.clone(),
             topic_choice: TopicChoice::Selected(p.topic.clone()),
             topic_open: false,
             topic_custom: TextEdit::new(""),
-            title,
-            tags: TextEdit::new(p.tags.join(", ")),
-            what: TextEdit::new(&p.context),
-            why: TextEdit::new(p.cause.as_deref().unwrap_or("")),
-            rule: TextEdit::new(&p.rule),
+            title: TextEdit::new(&p.title),
+            body,
+            preview: false,
             error: None,
         }
     }
@@ -169,20 +173,17 @@ impl Editor {
     }
 
     fn draft(&self) -> PageDraft {
-        let why = self.why.text.trim();
         PageDraft {
             kind: self.kind,
             topic: self.resolved_topic_arg(),
             title: self.title.text.clone(),
-            tags: vec![self.tags.text.clone()],
-            context: self.what.text.clone(),
-            cause: (!why.is_empty()).then(|| why.to_string()),
-            rule: self.rule.text.clone(),
+            tags: self.tags.clone(),
+            body: self.body.text.clone(),
         }
     }
 
     fn is_typing(&self) -> bool {
-        self.title.focused || self.topic_custom.focused || self.tags.focused || self.what.focused || self.why.focused || self.rule.focused
+        self.title.focused || self.topic_custom.focused || self.body.focused
     }
 }
 
@@ -229,17 +230,8 @@ impl Notebook {
             let mut topic_pages: Vec<&Page> = self.pages.iter().filter(|p| !p.is_archived() && p.topic == ts.topic).collect();
             topic_pages.sort_by(|a, b| b.updated_at.cmp(&a.updated_at).then(b.id.cmp(&a.id)));
             for pg in topic_pages {
-                let search_blob = format!(
-                    "{} {} {} {} {} {} {}",
-                    pg.title,
-                    pg.topic,
-                    topic_label(&pg.topic),
-                    pg.tags.join(" "),
-                    pg.rule,
-                    pg.context,
-                    pg.cause.as_deref().unwrap_or("")
-                )
-                .to_lowercase();
+                let search_blob =
+                    format!("{} {} {} {} {}", pg.title, pg.topic, topic_label(&pg.topic), pg.tags.join(" "), pg.body).to_lowercase();
                 self.tree.insert(
                     Some(&folder_id),
                     format!("page:{}", pg.id),
@@ -309,8 +301,7 @@ fn score(p: &Page, words: &[String]) -> Option<usize> {
     let title = p.title.to_lowercase();
     let topic_slug = p.topic.to_lowercase();
     let topic_name = topic_label(&p.topic).to_lowercase();
-    let rule = p.rule.to_lowercase();
-    let rest = format!("{} {}", p.context, p.cause.as_deref().unwrap_or("")).to_lowercase();
+    let body = p.body.to_lowercase();
     words.iter().try_fold(0, |acc, w| {
         let hit = if title.contains(w.as_str()) {
             6
@@ -318,10 +309,8 @@ fn score(p: &Page, words: &[String]) -> Option<usize> {
             5
         } else if p.tags.iter().any(|t| t.contains(w.as_str())) {
             4
-        } else if rule.contains(w.as_str()) {
-            3
-        } else if rest.contains(w.as_str()) {
-            1
+        } else if body.contains(w.as_str()) {
+            2
         } else {
             return None;
         };
@@ -331,15 +320,37 @@ fn score(p: &Page, words: &[String]) -> Option<usize> {
 
 /// Each kind's muted semantic ink dot/accent, legible in both light and dark modes.
 pub fn kind_color(kind: Kind, p: &Palette) -> Color {
-    // (hue, light chroma, dark chroma): each chroma stays inside sRGB at its lightness, so no
-    // ink is clipped toward a neighbouring hue.
-    let (hue, light, dark) = match kind {
-        Kind::Fix => (155.0, 0.13, 0.13),
-        Kind::Pitfall => (32.0, 0.16, 0.14),
-        Kind::Pattern => (252.0, 0.14, 0.125),
-        Kind::Decision => (300.0, 0.13, 0.12),
-    };
-    if p.dark { oklch(0.76, dark, hue) } else { oklch(0.53, light, hue) }
+    match kind {
+        Kind::Note => p.text_3,
+        Kind::Fix => {
+            if p.dark {
+                oklch(0.76, 0.13, 155.0)
+            } else {
+                oklch(0.53, 0.13, 155.0)
+            }
+        }
+        Kind::Pitfall => {
+            if p.dark {
+                oklch(0.76, 0.14, 32.0)
+            } else {
+                oklch(0.53, 0.16, 32.0)
+            }
+        }
+        Kind::Pattern => {
+            if p.dark {
+                oklch(0.76, 0.125, 252.0)
+            } else {
+                oklch(0.53, 0.14, 252.0)
+            }
+        }
+        Kind::Decision => {
+            if p.dark {
+                oklch(0.76, 0.12, 300.0)
+            } else {
+                oklch(0.53, 0.13, 300.0)
+            }
+        }
+    }
 }
 
 impl State {
@@ -381,6 +392,15 @@ impl State {
         self.notebook.sync_tree_selection();
     }
 
+    pub fn notebook_toggle_task(&mut self, page_id: i64, task_index: usize, checked: bool) {
+        if let Some(page) = self.notebook.pages.iter_mut().find(|p| p.id == page_id)
+            && let Some(updated) = toggle_markdown_task(&page.body, task_index, checked)
+        {
+            page.body = updated;
+        }
+        self.notebook_send(NotebookOp::ToggleTask(page_id, task_index, checked));
+    }
+
     fn notebook_select_tree_node(&mut self, id: &str) {
         if let Some(slug) = id.strip_prefix("topic:") {
             self.notebook.shelf = Shelf::Topic(slug.to_string());
@@ -395,7 +415,7 @@ impl State {
         }
     }
 
-    /// Checks the editor's page against the notebook's bar and files it, or shows what's missing.
+    /// Checks the editor's note and saves it, or surfaces what's missing inline.
     pub fn notebook_save(&mut self) {
         let Some(editor) = self.notebook.editor.as_mut() else { return };
         let draft = match editor.draft().checked() {
@@ -414,7 +434,7 @@ impl State {
             None => self.notebook_send(NotebookOp::Create(draft)),
         }
         self.notebook.editor = None;
-        let verb = if id.is_some() { "Revised" } else { "Added" };
+        let verb = if id.is_some() { "Saved" } else { "Created" };
         self.push_toast(
             "notebook-saved",
             ToastItem { title: format!("{verb} \"{title}\""), description: None, kind: ToastKind::Info },
@@ -514,18 +534,20 @@ fn toolbar_breadcrumb(nb: &Notebook, p: &Palette, k: &Kit) -> El {
         btn.build(k).key(key.to_string())
     };
 
-    // Shrinks before the view tabs do: the last crumb truncates instead of running under them.
     let mut row_el = row().key("nb-breadcrumb").gap(2.0).center_y().shrink().min_w(0.0);
     if let Some(ed) = &nb.editor {
+        let title_crumb = if ed.title.text.trim().is_empty() {
+            if ed.id.is_some() { "Edit note".to_string() } else { "New note".to_string() }
+        } else {
+            ed.title.text.trim().to_string()
+        };
         row_el = row_el
             .child(crumb_btn("nb-bc-all", "Notebook", false).on_press(|s: &mut State| {
                 s.notebook.editor = None;
                 s.notebook_shelf(Shelf::All);
             }))
             .child(sep())
-            .child(
-                text(if ed.id.is_some() { "Revise page" } else { "New page" }).font(k.ty.ui_compact).color(p.text).truncate().pl(CRUMB_PAD),
-            );
+            .child(text(title_crumb).font(k.ty.ui_compact).color(p.text).truncate().max_w(260.0).pl(CRUMB_PAD));
         return row_el;
     }
 
@@ -579,7 +601,7 @@ fn sidebar_view(s: &State, p: &Palette, k: &Kit) -> El {
     }
     let search = search_input.build(k).key("nb-search");
 
-    let new_page = Button::new("New Page")
+    let new_page = Button::new("New Note")
         .icon(&PLUS_ICON)
         .variant(ButtonVariant::Outline)
         .control_size(ControlSize::Regular)
@@ -589,7 +611,7 @@ fn sidebar_view(s: &State, p: &Palette, k: &Kit) -> El {
         .key("nb-new");
 
     let all_selected = nb.editor.is_none() && nb.open.is_none() && nb.shelf == Shelf::All;
-    let all_row = SidebarRow::new("All pages")
+    let all_row = SidebarRow::new("All notes")
         .badge(current_count.to_string())
         .selected(all_selected)
         .on_select(|s: &mut State, _| s.notebook_shelf(Shelf::All))
@@ -598,7 +620,7 @@ fn sidebar_view(s: &State, p: &Palette, k: &Kit) -> El {
 
     let header = col().key("nb-sidebar-header").w_full().px(10.0).pt(4.0).pb(8.0).gap(8.0).child(search).child(new_page).child(all_row);
 
-    let mut topics_head = SidebarHeader::new("Topics");
+    let mut topics_head = SidebarHeader::new("Categories");
     if !topics.is_empty() {
         topics_head = topics_head.count(topics.len());
     }
@@ -613,7 +635,7 @@ fn sidebar_view(s: &State, p: &Palette, k: &Kit) -> El {
                 .grow(1.0)
                 .px(16.0)
                 .py(12.0)
-                .child(text("Topics appear as agents add pages.").font(style::META).color(p.text_3).wrap()),
+                .child(text("Categories appear as you or agents add notes.").font(style::META).color(p.text_3).wrap()),
         );
     } else {
         let palette = *p;
@@ -621,7 +643,7 @@ fn sidebar_view(s: &State, p: &Palette, k: &Kit) -> El {
         let mut tree_style = TreeStyle::from_kit(k).chevron_only_folders(true).guides_on_hover(0.55);
         tree_style.row_height = 26.0;
         let tree_el = Tree::new(|s: &State| &s.notebook.tree, |s: &mut State| &mut s.notebook.tree, NavNode::label)
-            .name("Notebook topics")
+            .name("Notebook categories")
             .style(tree_style)
             .row(move |node, _row: &TreeRow| match node {
                 NavNode::Topic { label, count, .. } => {
@@ -632,7 +654,10 @@ fn sidebar_view(s: &State, p: &Palette, k: &Kit) -> El {
                     item
                 }
                 NavNode::Page { title, kind, .. } => {
-                    let mut item = TreeItem::new(title).dot(kind_color(*kind, &palette));
+                    let mut item = TreeItem::new(title);
+                    if *kind != Kind::Note {
+                        item = item.dot(kind_color(*kind, &palette));
+                    }
                     if !q.is_empty() {
                         item = item.highlight(&q);
                     }
@@ -677,26 +702,30 @@ fn index_view(s: &State, p: &Palette, k: &Kit) -> El {
 
     let pages = nb.visible();
 
-    let mut kind_labels = vec!["All"];
-    for kind in Kind::ALL {
-        kind_labels.push(kind.plural());
-    }
-    let selected_kind_idx = match nb.kind_filter {
-        None => Some(0),
-        Some(kind) => Kind::ALL.iter().position(|&x| x == kind).map(|i| i + 1),
-    };
-    let kind_control = SegmentedControl::new(&kind_labels, selected_kind_idx)
-        .label("Filter by kind")
-        .fit()
-        .on_pick(|s: &mut State, i: usize, _: &mut Tx| {
-            s.notebook.kind_filter = if i == 0 { None } else { Kind::ALL.get(i - 1).copied() };
-        })
-        .build(k);
+    // Only show the kind filter bar when the library has tagged kinds beyond plain Notes.
+    let present_kinds: Vec<Kind> = Kind::ALL.iter().copied().filter(|&kind| nb.pages.iter().any(|pg| pg.kind == kind)).collect();
+    let show_kind_filter = present_kinds.len() > 1 || nb.kind_filter.is_some();
 
-    // The heading and the filter are the whole header: the list below already shows how many
-    // pages there are, and a tagline under a heading only restates it.
-    let header =
-        col().key("nb-header").w_full().pb(16.0).gap(20.0).child(text(heading).font(style::DISPLAY).color(p.text)).child(kind_control);
+    let mut header = col().key("nb-header").w_full().pb(16.0).gap(16.0).child(text(heading).font(style::DISPLAY).color(p.text));
+    if show_kind_filter {
+        let mut kind_labels = vec!["All"];
+        for kind in &present_kinds {
+            kind_labels.push(kind.plural());
+        }
+        let selected_kind_idx = match nb.kind_filter {
+            None => Some(0),
+            Some(kind) => present_kinds.iter().position(|&x| x == kind).map(|i| i + 1),
+        };
+        let pick_kinds = present_kinds.clone();
+        let kind_control = SegmentedControl::new(&kind_labels, selected_kind_idx)
+            .label("Filter by kind")
+            .fit()
+            .on_pick(move |s: &mut State, i: usize, _: &mut Tx| {
+                s.notebook.kind_filter = if i == 0 { None } else { pick_kinds.get(i - 1).copied() };
+            })
+            .build(k);
+        header = header.child(kind_control);
+    }
 
     let mut list = col().key("nb-index").w_full();
     if pages.is_empty() {
@@ -705,7 +734,7 @@ fn index_view(s: &State, p: &Palette, k: &Kit) -> El {
                 .w_full()
                 .py(36.0)
                 .gap(8.0)
-                .child(text("No matching pages").font(style::NAME).color(p.text))
+                .child(text("No matching notes").font(style::NAME).color(p.text))
                 .child(text("Clear a filter or search for fewer words.").font(style::META).color(p.text_3)),
         );
     } else {
@@ -722,24 +751,22 @@ fn index_view(s: &State, p: &Palette, k: &Kit) -> El {
 
 fn index_row(s: &State, page: &Page, p: &Palette, k: &Kit) -> El {
     let id = page.id;
-    let ink = kind_color(page.kind, p);
     let show_topic = !matches!(s.notebook.shelf, Shelf::Topic(_));
+    let excerpt = page.excerpt(160);
 
-    let mut meta_top = row()
-        .w_full()
-        .gap(8.0)
-        .center_y()
-        .child(el().size(7.0, 7.0).radius(3.5).fill(ink))
-        .child(text(page.kind.label().to_string()).font(style::META).color(ink));
-
+    let mut meta_top = row().w_full().gap(8.0).center_y();
     if show_topic {
         meta_top = meta_top.child(Badge::new(topic_label(&page.topic)).variant(BadgeVariant::Subtle).build(k));
     }
+    if page.kind != Kind::Note {
+        let ink = kind_color(page.kind, p);
+        meta_top = meta_top
+            .child(el().size(6.0, 6.0).radius(3.0).fill(ink))
+            .child(text(page.kind.label().to_string()).font(style::META).color(ink));
+    }
     meta_top = meta_top.child(rune::spacer()).child(text(ago(page.updated_at, s.now)).font(style::META).color(p.text_3));
 
-    // The hover surface reaches ROW_BLEED past the column so the row's text sits on the same
-    // edge as the heading and the kind filter above it.
-    col()
+    let mut card = col()
         .key(format!("nb-page-{id}"))
         .role("button")
         .label(page.title.clone())
@@ -753,9 +780,11 @@ fn index_row(s: &State, page: &Page, p: &Palette, k: &Kit) -> El {
         .cursor(Cursor::Pointer)
         .on_press(move |s: &mut State| s.notebook_open_page(id))
         .child(meta_top)
-        .child(text(page.title.clone()).font(style::SECTION_TITLE).color(p.text).wrap())
-        .child(text(page.rule.clone()).font(style::BODY).color(p.text_2).wrap().max_lines(2))
-        .child(byline(s, page, p, 12.0).mt(2.0))
+        .child(text(page.title.clone()).font(style::SECTION_TITLE).color(p.text).wrap());
+    if !excerpt.is_empty() {
+        card = card.child(text(excerpt).font(style::BODY).color(p.text_2).wrap().max_lines(2));
+    }
+    card.child(byline(s, page, p, 12.0).mt(2.0))
 }
 
 /// "Claude Code · Feeder · helped 3×": author, source project, and usefulness count.
@@ -778,8 +807,6 @@ fn byline(s: &State, page: &Page, p: &Palette, mark: f32) -> El {
 
 fn page_view(s: &State, page: &Page, p: &Palette, k: &Kit, layer: &mut Vec<El>) -> El {
     let id = page.id;
-    let ink = kind_color(page.kind, p);
-    let md = feed::markdown_style(p, k).body_font(style::PROSE);
     let project = page.project_id.and_then(|pid| s.summary(pid)).map(|sum| sum.project.name.clone());
     let markdown = page.to_markdown(project.as_deref(), s.now);
     let copied = s.is_copied(CopyTarget::NotebookPage(id));
@@ -790,7 +817,7 @@ fn page_view(s: &State, page: &Page, p: &Palette, k: &Kit, layer: &mut Vec<El>) 
     let copy_btn = Button::new(if copied { "Copied" } else { "Copy" })
         .variant(ButtonVariant::Ghost)
         .control_size(ControlSize::Regular)
-        .help("Copy page as Markdown")
+        .help("Copy note as Markdown")
         .on_press_tx(move |s: &mut State, tx: &mut Tx| {
             tx.copy(markdown.clone());
             s.mark_copied(CopyTarget::NotebookPage(id));
@@ -802,7 +829,7 @@ fn page_view(s: &State, page: &Page, p: &Palette, k: &Kit, layer: &mut Vec<El>) 
     let helped_btn = Button::new(helped_label)
         .variant(ButtonVariant::Ghost)
         .control_size(ControlSize::Regular)
-        .help("Mark that this page helped you")
+        .help("Mark that this note helped you")
         .on_press(move |s: &mut State| s.notebook_send(NotebookOp::Helped(id)))
         .build(k)
         .key("nb-helped");
@@ -815,11 +842,11 @@ fn page_view(s: &State, page: &Page, p: &Palette, k: &Kit, layer: &mut Vec<El>) 
         .key("nb-edit");
 
     let (archive_label, standing) =
-        if page.is_archived() { ("Restore page", Standing::Current) } else { ("Archive page", Standing::Archived) };
+        if page.is_archived() { ("Restore Note", Standing::Current) } else { ("Archive Note", Standing::Archived) };
     let more_trigger = row()
         .key("nb-more-btn")
         .role("button")
-        .label("Page actions")
+        .label("Note actions")
         .focusable(true)
         .size(28.0, 24.0)
         .center()
@@ -843,7 +870,7 @@ fn page_view(s: &State, page: &Page, p: &Palette, k: &Kit, layer: &mut Vec<El>) 
             s.notebook.sync_tree_selection();
         }))
         .separator()
-        .item(MenuItem::new("Delete Page…").danger(true).on_select(move |s: &mut State| {
+        .item(MenuItem::new("Delete Note…").danger(true).on_select(move |s: &mut State| {
             s.notebook.action_menu_open = false;
             s.notebook.delete_confirm = Some(id);
         }))
@@ -856,8 +883,6 @@ fn page_view(s: &State, page: &Page, p: &Palette, k: &Kit, layer: &mut Vec<El>) 
         .pb(20.0)
         .center_y()
         .child(
-            // A text link, flush with the title's edge below it; the toolbar's breadcrumb names
-            // where it goes.
             text("Back")
                 .key("nb-back")
                 .font(style::CONTROL)
@@ -882,7 +907,7 @@ fn page_view(s: &State, page: &Page, p: &Palette, k: &Kit, layer: &mut Vec<El>) 
             .radius(8.0)
             .fill(k.c.layer_01)
             .border(1.0, k.c.danger.border)
-            .child(text("Delete this page permanently?").font(style::BODY).color(p.text))
+            .child(text("Delete this note permanently?").font(style::BODY).color(p.text))
             .child(rune::spacer())
             .child(
                 Button::new("Keep")
@@ -892,7 +917,7 @@ fn page_view(s: &State, page: &Page, p: &Palette, k: &Kit, layer: &mut Vec<El>) 
                     .build(k),
             )
             .child(
-                Button::new("Delete Page")
+                Button::new("Delete Note")
                     .variant(ButtonVariant::Danger)
                     .control_size(ControlSize::Regular)
                     .on_press(move |s: &mut State| {
@@ -906,28 +931,18 @@ fn page_view(s: &State, page: &Page, p: &Palette, k: &Kit, layer: &mut Vec<El>) 
         doc = doc.child(confirm);
     }
 
+    // Spacious Notion/Obsidian article header: title + single quiet metadata line.
     let mut title_line = col().w_full().gap(8.0).child(text(page.title.clone()).font(style::TITLE).color(p.text).wrap());
     if page.is_archived() {
         title_line = title_line.child(row().child(Badge::new("Archived").variant(BadgeVariant::Neutral).standard().build(k)));
     }
     doc = doc.child(title_line);
 
-    // Notion-style document Properties block.
-    let prop_row = |label: &str, value: El| {
-        row()
-            .w_full()
-            .min_h(26.0)
-            .gap(12.0)
-            .center_y()
-            .child(text(label.to_string()).font(style::META).color(p.text_3).w(84.0))
-            .child(row().grow(1.0).min_w(0.0).flex_wrap().gap(6.0).center_y().child(value))
-    };
-
     let topic_slug = page.topic.clone();
     let topic_pill = row()
         .key("nb-prop-topic")
         .role("button")
-        .label(format!("Open topic {}", topic_label(&topic_slug)))
+        .label(format!("Open category {}", topic_label(&topic_slug)))
         .h(22.0)
         .px(8.0)
         .center_y()
@@ -938,142 +953,95 @@ fn page_view(s: &State, page: &Page, p: &Palette, k: &Kit, layer: &mut Vec<El>) 
         .on_press(move |s: &mut State| s.notebook_shelf(Shelf::Topic(topic_slug.clone())))
         .child(text(topic_label(&page.topic).to_string()).font(style::META).color(p.text));
 
-    let kind_val = row()
-        .gap(6.0)
-        .center_y()
-        .child(el().size(7.0, 7.0).radius(3.5).fill(ink))
-        .child(text(page.kind.label().to_string()).font(style::META).color(p.text));
+    let revised = if page.revision > 1 {
+        format!("rev {} · updated {}", page.revision, ago(page.updated_at, s.now))
+    } else {
+        ago(page.created_at, s.now)
+    };
 
-    let mut tags_val = row().w_full().min_w(0.0).gap(5.0).flex_wrap().center_y();
-    let page_topic = page.topic.clone();
-    for tag in &page.tags {
-        let t = tag.clone();
-        let topic_for_tag = page_topic.clone();
-        tags_val = tags_val.child(
+    let mut meta = row().key("nb-meta").w_full().mt(12.0).gap(8.0).center_y().flex_wrap().child(topic_pill);
+    if page.kind != Kind::Note {
+        let ink = kind_color(page.kind, p);
+        meta = meta.child(
             row()
-                .key(format!("nb-chip-{tag}"))
-                .role("button")
-                .label(format!("Search the notebook for {tag}"))
-                .h(22.0)
-                .px(8.0)
+                .gap(5.0)
                 .center_y()
-                .radius(6.0)
-                .fill(k.c.layer_01)
-                .border(1.0, k.c.border_muted)
-                .hover(k.c.hover)
-                .cursor(Cursor::Pointer)
-                .on_press(move |s: &mut State| {
-                    s.notebook_shelf(Shelf::Topic(topic_for_tag.clone()));
-                    s.notebook.query = TextEdit::new(&t);
-                    s.notebook.apply_tree_filter();
-                })
-                .child(text(tag.clone()).font(style::META).color(p.text_2)),
+                .child(el().size(6.0, 6.0).radius(3.0).fill(ink))
+                .child(text(page.kind.label().to_string()).font(style::META).color(ink)),
         );
     }
-
-    let revised = if page.revision > 1 {
-        format!("rev {} · revised {}", page.revision, ago(page.updated_at, s.now))
-    } else {
-        format!("written {}", ago(page.created_at, s.now))
-    };
-    let source_val = row()
-        .gap(8.0)
-        .center_y()
-        .flex_wrap()
-        .child(byline(s, page, p, 13.0))
+    meta = meta
+        .child(text("·").font(style::META).color(p.text_3))
+        .child(byline(s, page, p, 12.0))
         .child(text("·").font(style::META).color(p.text_3))
         .child(text(revised).font(style::META).color(p.text_3));
 
-    let mut props = col()
-        .key("nb-properties")
-        .w_full()
-        .mt(18.0)
-        .py(12.0)
-        .gap(4.0)
-        .child(prop_row("Topic", topic_pill))
-        .child(prop_row("Kind", kind_val));
     if !page.tags.is_empty() {
-        props = props.child(prop_row("Tags", tags_val));
+        let page_topic = page.topic.clone();
+        for tag in &page.tags {
+            let t = tag.clone();
+            let topic_for_tag = page_topic.clone();
+            meta = meta.child(
+                row()
+                    .key(format!("nb-chip-{tag}"))
+                    .role("button")
+                    .label(format!("Search notebook for {tag}"))
+                    .h(20.0)
+                    .px(7.0)
+                    .center_y()
+                    .radius(5.0)
+                    .fill(k.c.layer_01)
+                    .border(1.0, k.c.border_muted)
+                    .hover(k.c.hover)
+                    .cursor(Cursor::Pointer)
+                    .on_press(move |s: &mut State| {
+                        s.notebook_shelf(Shelf::Topic(topic_for_tag.clone()));
+                        s.notebook.query = TextEdit::new(&t);
+                        s.notebook.apply_tree_filter();
+                    })
+                    .child(text(format!("#{tag}")).font(style::META).color(p.text_3)),
+            );
+        }
     }
-    props = props.child(prop_row("Source", source_val));
 
-    doc = doc.child(Divider::horizontal().build(k).mt(18.0)).child(props).child(Divider::horizontal().build(k));
+    doc = doc.child(meta).child(Divider::horizontal().build(k).mt(18.0));
 
-    // Document prose sections: sentence-case headings, no uppercase scream labels.
-    doc = doc.child(
-        col()
-            .w_full()
-            .mt(26.0)
-            .gap(8.0)
-            .child(text("What happened").font(style::HEADING).color(p.text))
-            .child(Markdown::new(page.context.clone()).selectable(true).render(&md)),
-    );
-
-    if let Some(cause) = &page.cause {
-        doc = doc.child(
-            col()
-                .w_full()
-                .mt(22.0)
-                .gap(8.0)
-                .child(text("Why").font(style::HEADING).color(p.text))
-                .child(Markdown::new(cause.clone()).selectable(true).render(&md)),
-        );
-    }
-
-    // Obsidian / Notion left-accented callout for the actionable rule.
-    let callout = row()
-        .key("nb-rule")
-        .w_full()
-        .mt(26.0)
-        .radius(8.0)
-        .fill(k.c.layer_01)
-        .items_stretch()
-        .child(el().w(3.0).my(12.0).ml(14.0).radius(1.5).fill(ink))
-        .child(
-            col()
-                .grow(1.0)
-                .min_w(0.0)
-                .pl(12.0)
-                .pr(16.0)
-                .py(14.0)
-                .gap(6.0)
-                .child(text("Takeaway").font(style::CONTROL).color(ink))
-                .child(text(page.rule.clone()).font(style::EMPHASIS).color(p.text).wrap().selectable(true)),
-        );
-    doc = doc.child(callout);
+    // Freeform Markdown article body with callouts, tables, syntax highlighting, and interactive tasks.
+    doc = doc.child(render_article_markdown(&page.body, Some(id), p, k).mt(24.0));
 
     let related = related_pages(&s.notebook, page);
     if !related.is_empty() {
-        let mut rel = col().w_full().mt(32.0).gap(4.0).child(text("Related").font(style::HEADING).color(p.text_2).mb(6.0));
+        let mut rel = col().w_full().mt(36.0).gap(4.0).child(text("Related").font(style::HEADING).color(p.text_2).mb(6.0));
         for r in related {
             let rid = r.id;
-            rel = rel.child(
-                row()
-                    .key(format!("nb-related-{rid}"))
-                    .role("button")
-                    .label(r.title.clone())
-                    .w_full()
-                    .px(8.0)
-                    .py(8.0)
-                    .gap(10.0)
-                    .center_y()
-                    .radius(6.0)
-                    .hover(p.hover)
-                    .cursor(Cursor::Pointer)
-                    .on_press(move |s: &mut State| s.notebook_open_page(rid))
-                    .child(el().size(6.0, 6.0).radius(3.0).fill(kind_color(r.kind, p)))
-                    .child(text(r.title.clone()).font(style::NAME).color(p.text).truncate().grow(1.0).min_w(0.0))
-                    .child(Badge::new(topic_label(&r.topic)).variant(BadgeVariant::Subtle).build(k))
-                    .child(text(r.kind.label().to_string()).font(style::META).color(p.text_3)),
-            );
+            let mut row_item = row()
+                .key(format!("nb-related-{rid}"))
+                .role("button")
+                .label(r.title.clone())
+                .w_full()
+                .px(8.0)
+                .py(8.0)
+                .gap(10.0)
+                .center_y()
+                .radius(6.0)
+                .hover(p.hover)
+                .cursor(Cursor::Pointer)
+                .on_press(move |s: &mut State| s.notebook_open_page(rid));
+            if r.kind != Kind::Note {
+                row_item = row_item.child(el().size(6.0, 6.0).radius(3.0).fill(kind_color(r.kind, p)));
+            }
+            row_item = row_item
+                .child(text(r.title.clone()).font(style::NAME).color(p.text).truncate().grow(1.0).min_w(0.0))
+                .child(Badge::new(topic_label(&r.topic)).variant(BadgeVariant::Subtle).build(k));
+            rel = rel.child(row_item);
         }
-        doc = doc.child(Divider::horizontal().build(k).mt(32.0)).child(rel);
+        doc = doc.child(Divider::horizontal().build(k).mt(36.0)).child(rel);
     }
 
     doc
 }
 
-/// Up to three current pages related by shared tags or matching topic.
+/// Up to three current pages related by shared tags or matching category.
 fn related_pages<'a>(nb: &'a Notebook, page: &Page) -> Vec<&'a Page> {
     let mut scored: Vec<(usize, &Page)> = nb
         .current()
@@ -1089,48 +1057,242 @@ fn related_pages<'a>(nb: &'a Notebook, page: &Page) -> Vec<&'a Page> {
     scored.into_iter().take(3).map(|(_, p)| p).collect()
 }
 
+// ── Rich Article Renderer (GFM + Obsidian Callouts + Interactive Tasks) ──
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CalloutKind {
+    Note,
+    Tip,
+    Warning,
+    Important,
+    Caution,
+}
+
+impl CalloutKind {
+    fn parse(raw: &str) -> Option<Self> {
+        match raw.to_ascii_lowercase().as_str() {
+            "note" | "info" => Some(Self::Note),
+            "tip" | "hint" | "takeaway" => Some(Self::Tip),
+            "warning" | "warn" => Some(Self::Warning),
+            "important" => Some(Self::Important),
+            "caution" | "danger" | "bug" => Some(Self::Caution),
+            _ => None,
+        }
+    }
+
+    fn default_title(self) -> &'static str {
+        match self {
+            Self::Note => "Note",
+            Self::Tip => "Tip",
+            Self::Warning => "Warning",
+            Self::Important => "Important",
+            Self::Caution => "Caution",
+        }
+    }
+
+    fn accent(self, p: &Palette) -> Color {
+        let (hue, light_c, dark_c) = match self {
+            Self::Note => (252.0, 0.14, 0.13),
+            Self::Tip => (155.0, 0.13, 0.13),
+            Self::Warning => (55.0, 0.15, 0.14),
+            Self::Important => (300.0, 0.13, 0.125),
+            Self::Caution => (26.0, 0.17, 0.15),
+        };
+        if p.dark { oklch(0.76, dark_c, hue) } else { oklch(0.52, light_c, hue) }
+    }
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum ArticleChunk {
+    Markdown { text: String, task_offset: usize },
+    Callout { kind: CalloutKind, title: String, body: String, task_offset: usize },
+}
+
+fn is_task_list_line(line: &str) -> bool {
+    let trimmed = line.trim_start();
+    let Some(rest) = trimmed.strip_prefix("- ").or_else(|| trimmed.strip_prefix("* ")).or_else(|| trimmed.strip_prefix("+ ")) else {
+        return false;
+    };
+    rest.starts_with("[ ] ") || rest.starts_with("[x] ") || rest.starts_with("[X] ")
+}
+
+fn count_tasks(md: &str) -> usize {
+    let mut in_fence = false;
+    let mut count = 0;
+    for line in md.lines() {
+        if line.trim_start().starts_with("```") {
+            in_fence = !in_fence;
+            continue;
+        }
+        if !in_fence && is_task_list_line(line) {
+            count += 1;
+        }
+    }
+    count
+}
+
+fn parse_callout_header(line: &str) -> Option<(CalloutKind, String)> {
+    let rest = line.trim_start().strip_prefix('>')?.trim_start();
+    let after_open = rest.strip_prefix("[!")?;
+    let end = after_open.find(']')?;
+    let tag = &after_open[..end];
+    let kind = CalloutKind::parse(tag)?;
+    let custom = after_open[end + 1..].trim();
+    let title = if custom.is_empty() { kind.default_title().to_string() } else { custom.to_string() };
+    Some((kind, title))
+}
+
+fn split_article_chunks(src: &str) -> Vec<ArticleChunk> {
+    let lines: Vec<&str> = src.lines().collect();
+    let mut chunks = Vec::new();
+    let mut buf: Vec<&str> = Vec::new();
+    let mut in_fence = false;
+    let mut task_offset = 0usize;
+    let mut i = 0;
+
+    let flush_md = |buf: &mut Vec<&str>, chunks: &mut Vec<ArticleChunk>, task_offset: &mut usize| {
+        while buf.first().is_some_and(|l| l.trim().is_empty()) {
+            buf.remove(0);
+        }
+        while buf.last().is_some_and(|l| l.trim().is_empty()) {
+            buf.pop();
+        }
+        if buf.is_empty() {
+            return;
+        }
+        let text = buf.join("\n");
+        buf.clear();
+        let n = count_tasks(&text);
+        chunks.push(ArticleChunk::Markdown { text, task_offset: *task_offset });
+        *task_offset += n;
+    };
+
+    while i < lines.len() {
+        let line = lines[i];
+        if line.trim_start().starts_with("```") {
+            in_fence = !in_fence;
+            buf.push(line);
+            i += 1;
+            continue;
+        }
+        if !in_fence && let Some((kind, title)) = parse_callout_header(line) {
+            flush_md(&mut buf, &mut chunks, &mut task_offset);
+            let mut body_lines = Vec::new();
+            i += 1;
+            while i < lines.len() {
+                if let Some(after) = lines[i].trim_start().strip_prefix('>') {
+                    body_lines.push(after.strip_prefix(' ').unwrap_or(after));
+                    i += 1;
+                } else {
+                    break;
+                }
+            }
+            let body = body_lines.join("\n").trim().to_string();
+            let n = count_tasks(&body);
+            chunks.push(ArticleChunk::Callout { kind, title, body, task_offset });
+            task_offset += n;
+            continue;
+        }
+        buf.push(line);
+        i += 1;
+    }
+    flush_md(&mut buf, &mut chunks, &mut task_offset);
+    chunks
+}
+
+fn render_article_markdown(src: &str, page_id: Option<i64>, p: &Palette, k: &Kit) -> El {
+    let md_style = feed::markdown_style(p, k).body_font(style::PROSE);
+    let chunks = split_article_chunks(src);
+    if chunks.is_empty() {
+        return el().w_full();
+    }
+    let mut stack = col().w_full().gap(14.0);
+    for (idx, chunk) in chunks.into_iter().enumerate() {
+        match chunk {
+            ArticleChunk::Markdown { text, task_offset } => {
+                let mut md = Markdown::new(text).selectable(true);
+                if let Some(pid) = page_id {
+                    md = md.on_task(move |s: &mut State, _key, local_idx, checked| {
+                        s.notebook_toggle_task(pid, task_offset + local_idx, checked);
+                    });
+                } else {
+                    md = md.tasks_read_only();
+                }
+                stack = stack.child(md.render(&md_style).key(format!("nb-md-{idx}")));
+            }
+            ArticleChunk::Callout { kind, title, body, task_offset } => {
+                let accent = kind.accent(p);
+                let mut inner =
+                    col().grow(1.0).min_w(0.0).pl(12.0).pr(16.0).py(12.0).gap(6.0).child(text(title).font(style::CONTROL).color(accent));
+                if !body.is_empty() {
+                    let mut md = Markdown::new(body).selectable(true);
+                    if let Some(pid) = page_id {
+                        md = md.on_task(move |s: &mut State, _key, local_idx, checked| {
+                            s.notebook_toggle_task(pid, task_offset + local_idx, checked);
+                        });
+                    } else {
+                        md = md.tasks_read_only();
+                    }
+                    inner = inner.child(md.render(&md_style));
+                }
+                stack = stack.child(
+                    row()
+                        .key(format!("nb-callout-{idx}"))
+                        .w_full()
+                        .radius(8.0)
+                        .fill(k.c.layer_01)
+                        .border(1.0, k.c.border_muted)
+                        .items_stretch()
+                        .child(el().w(3.0).my(10.0).ml(12.0).radius(1.5).fill(accent))
+                        .child(inner),
+                );
+            }
+        }
+    }
+    stack
+}
+
+// ── Borderless Notion/Obsidian Freeform Editor ──
+
+#[derive(Clone, Copy)]
+enum MdAction {
+    Heading(usize),
+    Wrap(&'static str, &'static str, &'static str),
+    Link,
+    LinePrefix(&'static str),
+    Callout,
+    CodeBlock,
+    Table,
+    Rule,
+}
+
 fn editor_view(nb: &Notebook, ed: &Editor, p: &Palette, k: &Kit, layer: &mut Vec<El>) -> El {
-    let ink = kind_color(ed.kind, p);
-    let heading = if ed.id.is_some() { "Revise page" } else { "New page" };
-    let save = Button::new(if ed.id.is_some() { "Save Revision" } else { "Add Page" })
-        .variant(ButtonVariant::Contrast)
-        .control_size(ControlSize::Regular)
-        .on_press(|s: &mut State| s.notebook_save())
+    let mode_toggle = SegmentedControl::new(&["Write", "Preview"], Some(usize::from(ed.preview)))
+        .label("Editor mode")
+        .fit()
+        .on_pick(|s: &mut State, i: usize, _: &mut Tx| {
+            if let Some(ed) = s.notebook.editor.as_mut() {
+                ed.preview = i == 1;
+            }
+        })
         .build(k);
+
     let cancel = Button::new("Cancel")
         .variant(ButtonVariant::Ghost)
         .control_size(ControlSize::Regular)
         .on_press(|s: &mut State| s.notebook.editor = None)
         .build(k);
 
-    let top_bar = row()
-        .w_full()
-        .pb(18.0)
-        .center_y()
-        .child(text(heading).font(style::HEADING).color(p.text_2))
-        .child(rune::spacer())
-        .child(cancel)
-        .child(save.ml(6.0));
+    let save = Button::new(if ed.id.is_some() { "Save" } else { "Save Note" })
+        .variant(ButtonVariant::Contrast)
+        .control_size(ControlSize::Regular)
+        .on_press(|s: &mut State| s.notebook_save())
+        .build(k);
 
-    let title_input = TextInput::new(&ed.title)
-        .plain()
-        .large()
-        .text_style(style::TITLE)
-        .width(None)
-        .placeholder("Untitled page")
-        .label("Page title")
-        .on_edit(|s: &mut State| editor_field(s, |ed| &mut ed.title))
-        .on_submit(|s: &mut State, _| s.notebook_save())
-        .on_key(|s: &mut State, e: &KeyEvent, _| editor_key(s, e))
-        .build(k)
-        .key("nb-f-title");
-
-    // Topic Select options: Auto (new pages), all canonical topics, any existing custom topics, Custom...
+    // Single minimal category selector — borderless inline pill right on the top row.
     let mut topic_options: Vec<(String, TopicChoice)> = Vec::new();
     if ed.id.is_none() {
-        let tags: Vec<String> =
-            ed.tags.text.split([',', ' ']).map(|t| t.trim().trim_start_matches('#').to_lowercase()).filter(|t| !t.is_empty()).collect();
-        let inferred = infer_topic(&tags, &ed.title.text, &ed.what.text);
+        let inferred = infer_topic(&ed.tags, &ed.title.text, &ed.body.text);
         topic_options.push((format!("Auto ({})", topic_label(&inferred)), TopicChoice::Auto));
     }
     for spec in CANONICAL_TOPICS {
@@ -1146,20 +1308,20 @@ fn editor_view(nb: &Notebook, ed: &Editor, p: &Palette, k: &Kit, layer: &mut Vec
     {
         topic_options.push((topic_label(slug).to_string(), TopicChoice::Selected(slug.clone())));
     }
-    topic_options.push(("Custom topic…".to_string(), TopicChoice::Custom));
+    topic_options.push(("New category…".to_string(), TopicChoice::Custom));
 
     let option_labels: Vec<String> = topic_options.iter().map(|(l, _)| l.clone()).collect();
     let current_topic_label = topic_options
         .iter()
         .find(|(_, choice)| *choice == ed.topic_choice)
         .map(|(l, _)| l.clone())
-        .unwrap_or_else(|| "Custom topic…".to_string());
+        .unwrap_or_else(|| "New category…".to_string());
 
     let map_opts = topic_options.clone();
     let topic_select = Select::new("nb-ed-topic", &option_labels)
-        .appearance(SelectAppearance::Field)
-        .width(220.0)
-        .label("Topic")
+        .appearance(SelectAppearance::Inline)
+        .width(190.0)
+        .label("Category")
         .current(Some(&current_topic_label))
         .open(ed.topic_open)
         .placement(Placement::BottomStart)
@@ -1186,190 +1348,166 @@ fn editor_view(nb: &Notebook, ed: &Editor, p: &Palette, k: &Kit, layer: &mut Vec
         })
         .build(k, layer);
 
-    let mut topic_cell = row().gap(8.0).center_y().flex_wrap().child(topic_select);
+    let mut left_meta = row().gap(4.0).center_y().child(text("Category").font(style::META).color(p.text_3)).child(topic_select);
     if matches!(ed.topic_choice, TopicChoice::Custom) {
-        topic_cell = topic_cell.child(
-            TextInput::new(&ed.topic_custom)
-                .placeholder("e.g. graphql, caching")
-                .label("Custom topic")
-                .width(Some(180.0))
+        left_meta = left_meta.child(
+            text_input(&ed.topic_custom, style::META)
+                .key("nb-f-topic-custom")
+                .single_line()
+                .w(150.0)
+                .color(p.text)
+                .placeholder("category name…", p.text_3)
+                .caret(p.text, p.selection)
                 .on_edit(|s: &mut State| editor_field(s, |ed| &mut ed.topic_custom))
-                .on_key(|s: &mut State, e: &KeyEvent, _| editor_key(s, e))
-                .build(k)
-                .key("nb-f-topic-custom"),
+                .on_submit(|s: &mut State, tx: &mut Tx| {
+                    if let Some(ed) = s.notebook.editor.as_mut() {
+                        ed.topic_custom.focused = false;
+                        ed.title.focused = true;
+                        tx.focus_when_shown("nb-f-title", false);
+                    }
+                })
+                .on_key(|s: &mut State, e: &KeyEvent, _| editor_common_key(s, e)),
         );
     }
 
-    let kinds: Vec<&str> = Kind::ALL.iter().map(|k| k.label()).collect();
-    let kind_pick = SegmentedControl::new(&kinds, Kind::ALL.iter().position(|x| *x == ed.kind))
-        .label("Kind of lesson")
-        .fit()
-        .on_pick(|s: &mut State, i: usize, _: &mut Tx| {
-            if let Some(ed) = s.notebook.editor.as_mut() {
-                ed.kind = Kind::ALL[i];
-            }
-        })
-        .build(k);
-
-    let tags_input = TextInput::new(&ed.tags)
-        .placeholder("sqlite, locks, layout")
-        .label("Tags")
-        .width(None)
-        .on_edit(|s: &mut State| editor_field(s, |ed| &mut ed.tags))
-        .on_submit(|s: &mut State, _| s.notebook_save())
-        .on_key(|s: &mut State, e: &KeyEvent, _| editor_key(s, e))
-        .build(k)
-        .key("nb-f-tags");
-
-    let prop_row = |label: &str, control: El| {
-        row()
-            .w_full()
-            .min_h(32.0)
-            .gap(12.0)
-            .center_y()
-            .child(text(label.to_string()).font(style::META).color(p.text_3).w(84.0))
-            .child(row().grow(1.0).min_w(0.0).child(control))
-    };
-
-    let props = col()
+    let top_bar = row()
         .w_full()
-        .py(12.0)
+        .pb(20.0)
         .gap(8.0)
-        .child(prop_row("Topic", topic_cell))
-        .child(prop_row("Kind", kind_pick))
-        .child(prop_row("Tags", tags_input));
+        .center_y()
+        .child(left_meta)
+        .child(rune::spacer())
+        .child(mode_toggle)
+        .child(cancel.ml(4.0))
+        .child(save);
 
-    let what_area = TextArea::new(&ed.what)
-        .placeholder("What went wrong, with the exact error text")
-        .label("What happened")
-        .width(None)
-        .auto_grow(3, 12)
-        .on_edit(|s: &mut State| editor_field(s, |ed| &mut ed.what))
-        .on_key(|s: &mut State, e: &KeyEvent, _| editor_key(s, e))
-        .build(k)
-        .key("nb-f-what");
-
-    let why_area = TextArea::new(&ed.why)
-        .placeholder("Why it happened (optional)")
-        .label("Why")
-        .width(None)
-        .auto_grow(2, 8)
-        .on_edit(|s: &mut State| editor_field(s, |ed| &mut ed.why))
-        .on_key(|s: &mut State, e: &KeyEvent, _| editor_key(s, e))
-        .build(k)
-        .key("nb-f-why");
-
-    let rule_area = TextArea::new(&ed.rule)
-        .placeholder("What to do next time")
-        .label("Takeaway")
-        .width(None)
-        .auto_grow(2, 6)
-        .on_edit(|s: &mut State| editor_field(s, |ed| &mut ed.rule))
-        .on_key(|s: &mut State, e: &KeyEvent, _| editor_key(s, e))
-        .build(k)
-        .key("nb-f-rule");
-
-    let field_head = |title: &str, count: String| {
-        row()
+    // Borderless large Notion/Obsidian title directly on the page surface.
+    let title_el = if ed.preview {
+        let heading = if ed.title.text.trim().is_empty() { "Untitled".to_string() } else { ed.title.text.trim().to_string() };
+        text(heading).font(style::TITLE).color(p.text).wrap()
+    } else {
+        text_input(&ed.title, style::TITLE)
+            .key("nb-f-title")
             .w_full()
-            .center_y()
-            .child(text(title.to_string()).font(style::HEADING).color(p.text))
-            .child(rune::spacer())
-            .child(text(count).font(style::META).color(p.text_3))
+            .color(p.text)
+            .placeholder("Untitled", p.text_3.alpha(0.55))
+            .caret(p.text, p.selection)
+            .label("Note title")
+            .on_edit(|s: &mut State| editor_field(s, |ed| &mut ed.title))
+            .on_submit(|s: &mut State, tx: &mut Tx| {
+                if let Some(ed) = s.notebook.editor.as_mut() {
+                    ed.title.focused = false;
+                    ed.body.focused = true;
+                    tx.focus_when_shown("nb-f-body", false);
+                }
+            })
+            .on_key(|s: &mut State, e: &KeyEvent, _| editor_common_key(s, e))
     };
 
-    let takeaway_box = row()
-        .w_full()
-        .mt(22.0)
-        .radius(8.0)
-        .fill(k.c.layer_01)
-        .items_stretch()
-        .child(el().w(3.0).my(12.0).ml(14.0).radius(1.5).fill(ink))
-        .child(
-            col()
-                .grow(1.0)
-                .min_w(0.0)
-                .pl(12.0)
-                .pr(16.0)
-                .py(14.0)
-                .gap(8.0)
-                .child(
-                    row()
-                        .w_full()
-                        .center_y()
-                        .child(text("Takeaway").font(style::CONTROL).color(ink))
-                        .child(rune::spacer())
-                        .child(text(counter(&ed.rule.text, *feeder_core::RULE_CHARS.end())).font(style::META).color(p.text_3)),
-                )
-                .child(rule_area),
-        );
+    let mut page = col().key("nb-editor").w_full().max_w(DOC_MAX_W).transition(Transition::opacity()).child(top_bar).child(title_el);
 
-    let mut body = col()
-        .key("nb-editor")
-        .w_full()
-        .max_w(DOC_MAX_W)
-        .transition(Transition::opacity())
-        .child(top_bar)
-        .child(title_input)
-        .child(
-            row()
-                .w_full()
-                .mt(4.0)
-                .child(text(ed.kind.hint()).font(style::META).color(p.text_3))
-                .child(rune::spacer())
-                .child(text(counter(&ed.title.text, *feeder_core::TITLE_CHARS.end())).font(style::META).color(p.text_3)),
-        )
-        .child(Divider::horizontal().build(k).mt(14.0))
-        .child(props)
-        .child(Divider::horizontal().build(k))
-        .child(
-            col()
-                .w_full()
-                .mt(22.0)
-                .gap(8.0)
-                .child(field_head("What happened", counter(&ed.what.text, *feeder_core::CONTEXT_CHARS.end())))
-                .child(what_area),
-        )
-        .child(
-            col()
-                .w_full()
-                .mt(18.0)
-                .gap(8.0)
-                .child(field_head("Why (optional)", counter(&ed.why.text, feeder_core::MAX_CAUSE_CHARS)))
-                .child(why_area),
-        )
-        .child(takeaway_box);
+    if !ed.preview {
+        page = page.child(format_toolbar(p, k).mt(14.0));
+    }
+
+    page = page.child(Divider::horizontal().build(k).mt(if ed.preview { 18.0 } else { 8.0 }));
 
     if let Some(err) = &ed.error {
-        body = body.child(text(err.clone()).font(style::META).color(p.amber).wrap().mt(14.0));
+        page = page.child(text(err.clone()).font(style::META).color(p.amber).wrap().mt(12.0));
     }
 
-    body.child(
-        row()
+    let canvas = if ed.preview {
+        if ed.body.text.trim().is_empty() {
+            text("Nothing to preview yet.").font(style::PROSE).color(p.text_3).mt(24.0)
+        } else {
+            render_article_markdown(&ed.body.text, None, p, k).mt(22.0)
+        }
+    } else {
+        let spans = markdown_decorations(&ed.body.text, p, k);
+        text_input(&ed.body, style::PROSE)
+            .key("nb-f-body")
             .w_full()
-            .mt(20.0)
-            .gap(8.0)
-            .center_y()
-            .child(text("⌘↩ to save · Esc to cancel").font(style::META).color(p.text_3))
-            .child(rune::spacer())
-            .child(
-                Button::new("Cancel")
-                    .variant(ButtonVariant::Ghost)
-                    .control_size(ControlSize::Regular)
-                    .on_press(|s: &mut State| s.notebook.editor = None)
-                    .build(k),
+            .min_h(420.0)
+            .pt(18.0)
+            .color(p.text)
+            .placeholder(
+                "Start writing in Markdown…  # headings, **bold**, `code`, - [ ] checklists, > [!tip] callouts, or ```code blocks",
+                p.text_3.alpha(0.55),
             )
-            .child(
-                Button::new(if ed.id.is_some() { "Save Revision" } else { "Add Page" })
-                    .variant(ButtonVariant::Contrast)
-                    .control_size(ControlSize::Regular)
-                    .on_press(|s: &mut State| s.notebook_save())
-                    .build(k),
-            ),
-    )
+            .caret(p.text, p.selection)
+            .decorations(spans)
+            .label("Note body")
+            .on_edit(|s: &mut State| editor_field(s, |ed| &mut ed.body))
+            .on_submit(|s: &mut State, _| smart_enter(s))
+            .on_key(|s: &mut State, e: &KeyEvent, _| body_key(s, e))
+    };
+
+    let word_count = ed.body.text.split_whitespace().count();
+    let footer = row()
+        .w_full()
+        .mt(24.0)
+        .pt(12.0)
+        .center_y()
+        .child(text("⌘B bold · ⌘I italic · ⌘E code · ⌘K link · ⌘⇧P preview · ⌘S save").font(style::META).color(p.text_3))
+        .child(rune::spacer())
+        .child(text(if word_count == 1 { "1 word".to_string() } else { format!("{word_count} words") }).font(style::META).color(p.text_3));
+
+    page.child(canvas).child(Divider::horizontal().build(k).mt(20.0)).child(footer)
 }
 
-fn editor_key(s: &mut State, e: &KeyEvent) -> bool {
+fn format_toolbar(p: &Palette, k: &Kit) -> El {
+    let tool = |key: &'static str, label: &'static str, help: &'static str, action: MdAction| {
+        el().key(key)
+            .role("button")
+            .label(help)
+            .focusable(false)
+            .h(26.0)
+            .px(7.0)
+            .radius(5.0)
+            .center()
+            .hover(k.c.hover)
+            .cursor(Cursor::Pointer)
+            .on_press_tx(move |s: &mut State, tx: &mut Tx| {
+                if let Some(ed) = s.notebook.editor.as_mut() {
+                    ed.preview = false;
+                    ed.title.focused = false;
+                    ed.body.focused = true;
+                    apply_md_action(&mut ed.body, action);
+                    tx.focus_when_shown("nb-f-body", false);
+                }
+            })
+            .child(text(label).font(style::META).color(p.text_2))
+    };
+
+    let sep = || el().w(1.0).h(14.0).mx(3.0).fill(p.hairline);
+
+    row()
+        .key("nb-md-toolbar")
+        .w_full()
+        .gap(2.0)
+        .center_y()
+        .flex_wrap()
+        .child(tool("nb-fmt-h1", "H1", "Heading 1 (⌘1)", MdAction::Heading(1)))
+        .child(tool("nb-fmt-h2", "H2", "Heading 2 (⌘2)", MdAction::Heading(2)))
+        .child(tool("nb-fmt-h3", "H3", "Heading 3 (⌘3)", MdAction::Heading(3)))
+        .child(sep())
+        .child(tool("nb-fmt-b", "B", "Bold (⌘B)", MdAction::Wrap("**", "**", "bold")))
+        .child(tool("nb-fmt-i", "I", "Italic (⌘I)", MdAction::Wrap("*", "*", "italic")))
+        .child(tool("nb-fmt-code", "<>", "Inline code (⌘E)", MdAction::Wrap("`", "`", "code")))
+        .child(tool("nb-fmt-link", "Link", "Insert link (⌘K)", MdAction::Link))
+        .child(sep())
+        .child(tool("nb-fmt-ul", "• List", "Bullet list", MdAction::LinePrefix("- ")))
+        .child(tool("nb-fmt-ol", "1. List", "Numbered list", MdAction::LinePrefix("1. ")))
+        .child(tool("nb-fmt-todo", "☐ Task", "Checklist item", MdAction::LinePrefix("- [ ] ")))
+        .child(sep())
+        .child(tool("nb-fmt-quote", "Quote", "Blockquote", MdAction::LinePrefix("> ")))
+        .child(tool("nb-fmt-callout", "Callout", "Obsidian callout", MdAction::Callout))
+        .child(tool("nb-fmt-fence", "Code", "Fenced code block", MdAction::CodeBlock))
+        .child(tool("nb-fmt-table", "Table", "Markdown table", MdAction::Table))
+        .child(tool("nb-fmt-rule", "—", "Horizontal divider", MdAction::Rule))
+}
+
+fn editor_common_key(s: &mut State, e: &KeyEvent) -> bool {
     if matches!(e.key, Key::Escape) {
         if let Some(ed) = s.notebook.editor.as_mut()
             && ed.topic_open
@@ -1380,15 +1518,449 @@ fn editor_key(s: &mut State, e: &KeyEvent) -> bool {
         }
         return true;
     }
-    if matches!(e.key, Key::Enter) && e.mods.cmd {
+    if (matches!(e.key, Key::Enter) && e.mods.cmd) || e.is_command('s') {
         s.notebook_save();
         return true;
     }
     false
 }
 
-fn counter(text: &str, max: usize) -> String {
-    format!("{}/{max}", text.trim().chars().count())
+fn body_key(s: &mut State, e: &KeyEvent) -> bool {
+    if editor_common_key(s, e) {
+        return true;
+    }
+    let Some(ed) = s.notebook.editor.as_mut() else {
+        return false;
+    };
+    if e.is_command('b') {
+        apply_md_action(&mut ed.body, MdAction::Wrap("**", "**", "bold"));
+        return true;
+    }
+    if e.is_command('i') {
+        apply_md_action(&mut ed.body, MdAction::Wrap("*", "*", "italic"));
+        return true;
+    }
+    if e.is_command('e') {
+        apply_md_action(&mut ed.body, MdAction::Wrap("`", "`", "code"));
+        return true;
+    }
+    if e.is_command('k') {
+        apply_md_action(&mut ed.body, MdAction::Link);
+        return true;
+    }
+    if e.is_command('1') {
+        apply_md_action(&mut ed.body, MdAction::Heading(1));
+        return true;
+    }
+    if e.is_command('2') {
+        apply_md_action(&mut ed.body, MdAction::Heading(2));
+        return true;
+    }
+    if e.is_command('3') {
+        apply_md_action(&mut ed.body, MdAction::Heading(3));
+        return true;
+    }
+    if matches!(e.key, Key::Tab) && !e.mods.cmd && !e.mods.ctrl {
+        indent_current_line(&mut ed.body, !e.mods.shift);
+        return true;
+    }
+    false
+}
+
+fn smart_enter(s: &mut State) {
+    let Some(ed) = s.notebook.editor.as_mut() else { return };
+    smart_enter_edit(&mut ed.body);
+}
+
+fn smart_enter_edit(edit: &mut TextEdit) {
+    let (start, end) = edit.range();
+    if start != end {
+        edit.insert("\n");
+        return;
+    }
+    let line_idx = edit.line_of_byte(start);
+    let line_range = edit.line_range(line_idx);
+    let line = &edit.text[line_range.clone()];
+    let before_caret = &edit.text[line_range.start..start];
+    let indent_len = line.len() - line.trim_start_matches([' ', '\t']).len();
+    let indent = &line[..indent_len];
+    let rest = &line[indent_len..];
+
+    let continuation = if rest.starts_with("- [ ] ") || rest.starts_with("- [x] ") || rest.starts_with("- [X] ") {
+        Some((6usize, format!("{indent}- [ ] ")))
+    } else if rest.starts_with("- ") {
+        Some((2usize, format!("{indent}- ")))
+    } else if rest.starts_with("* ") {
+        Some((2usize, format!("{indent}* ")))
+    } else if rest.starts_with("> ") {
+        Some((2usize, format!("{indent}> ")))
+    } else if let Some((prefix_len, next_num)) = parse_ordered_prefix(rest) {
+        Some((prefix_len, format!("{indent}{next_num}. ")))
+    } else {
+        None
+    };
+
+    if let Some((marker_len, next_prefix)) = continuation {
+        let marker_end = indent_len + marker_len;
+        if before_caret.len() >= marker_end {
+            // Pressing Enter on an empty list/quote line exits the list cleanly.
+            if line[marker_end..].trim().is_empty() && start == line_range.end {
+                let mut updated = edit.text.clone();
+                updated.replace_range(line_range.start..line_range.end, "");
+                edit.replace_text(updated);
+                edit.set_caret(line_range.start);
+                return;
+            }
+            edit.insert(&format!("\n{next_prefix}"));
+            return;
+        }
+    }
+    edit.insert("\n");
+}
+
+fn parse_ordered_prefix(rest: &str) -> Option<(usize, usize)> {
+    let digits_len = rest.bytes().take_while(|b| b.is_ascii_digit()).count();
+    if digits_len == 0 || !rest[digits_len..].starts_with(". ") {
+        return None;
+    }
+    let n: usize = rest[..digits_len].parse().ok()?;
+    Some((digits_len + 2, n + 1))
+}
+
+fn indent_current_line(edit: &mut TextEdit, indent: bool) {
+    let (start, _) = edit.range();
+    let line_idx = edit.line_of_byte(start);
+    let line_range = edit.line_range(line_idx);
+    let mut updated = edit.text.clone();
+    if indent {
+        updated.insert_str(line_range.start, "  ");
+        edit.replace_text(updated);
+        edit.set_caret(start + 2);
+    } else if updated[line_range.clone()].starts_with("  ") {
+        updated.replace_range(line_range.start..line_range.start + 2, "");
+        edit.replace_text(updated);
+        edit.set_caret(start.saturating_sub(2).max(line_range.start));
+    } else if updated[line_range.clone()].starts_with('\t') {
+        updated.replace_range(line_range.start..line_range.start + 1, "");
+        edit.replace_text(updated);
+        edit.set_caret(start.saturating_sub(1).max(line_range.start));
+    }
+}
+
+fn apply_md_action(edit: &mut TextEdit, action: MdAction) {
+    match action {
+        MdAction::Wrap(before, after, placeholder) => {
+            let (start, end) = edit.range();
+            let text_len = edit.text.len();
+            if start < end {
+                // If already wrapped right around selection, unwrap cleanly.
+                let wrapped_around = start >= before.len()
+                    && end + after.len() <= text_len
+                    && &edit.text[start - before.len()..start] == before
+                    && &edit.text[end..end + after.len()] == after;
+                if wrapped_around {
+                    let inner = edit.text[start..end].to_string();
+                    let mut updated = edit.text.clone();
+                    updated.replace_range(start - before.len()..end + after.len(), &inner);
+                    edit.replace_text(updated);
+                    edit.set_selection(start - before.len(), start - before.len() + inner.len());
+                    return;
+                }
+                let selected = edit.selected().to_string();
+                let replacement = format!("{before}{selected}{after}");
+                edit.insert(&replacement);
+                edit.set_selection(start + before.len(), start + before.len() + selected.len());
+            } else {
+                let replacement = format!("{before}{placeholder}{after}");
+                edit.insert(&replacement);
+                edit.set_selection(start + before.len(), start + before.len() + placeholder.len());
+            }
+        }
+        MdAction::Link => {
+            let (start, end) = edit.range();
+            if start < end {
+                let selected = edit.selected().to_string();
+                let replacement = format!("[{selected}](https://)");
+                edit.insert(&replacement);
+                let url_start = start + 1 + selected.len() + 2;
+                edit.set_selection(url_start, url_start + "https://".len());
+            } else {
+                edit.insert("[link](https://)");
+                edit.set_selection(start + 1, start + 5);
+            }
+        }
+        MdAction::Heading(level) => {
+            let (start, _) = edit.range();
+            let line_idx = edit.line_of_byte(start);
+            let line_range = edit.line_range(line_idx);
+            let line = edit.text[line_range.clone()].to_string();
+            let existing_hashes = line.bytes().take_while(|&b| b == b'#').count();
+            let has_heading = existing_hashes > 0 && line[existing_hashes..].starts_with(' ');
+            let target_prefix = format!("{} ", "#".repeat(level));
+            let (new_line, delta): (String, isize) = if has_heading && existing_hashes == level {
+                let stripped = &line[existing_hashes + 1..];
+                (stripped.to_string(), -((existing_hashes + 1) as isize))
+            } else if has_heading {
+                let stripped = &line[existing_hashes + 1..];
+                let old_len = existing_hashes + 1;
+                (format!("{target_prefix}{stripped}"), target_prefix.len() as isize - old_len as isize)
+            } else {
+                (format!("{target_prefix}{line}"), target_prefix.len() as isize)
+            };
+            let mut updated = edit.text.clone();
+            updated.replace_range(line_range.clone(), &new_line);
+            edit.replace_text(updated);
+            let next_caret = ((start as isize + delta).max(line_range.start as isize) as usize).min(edit.text.len());
+            edit.set_caret(next_caret);
+        }
+        MdAction::LinePrefix(prefix) => {
+            let (start, _) = edit.range();
+            let line_idx = edit.line_of_byte(start);
+            let line_range = edit.line_range(line_idx);
+            let line = edit.text[line_range.clone()].to_string();
+            let (new_line, delta): (String, isize) = if let Some(rest) = line.strip_prefix(prefix) {
+                (rest.to_string(), -(prefix.len() as isize))
+            } else {
+                (format!("{prefix}{line}"), prefix.len() as isize)
+            };
+            let mut updated = edit.text.clone();
+            updated.replace_range(line_range.clone(), &new_line);
+            edit.replace_text(updated);
+            let next_caret = ((start as isize + delta).max(line_range.start as isize) as usize).min(edit.text.len());
+            edit.set_caret(next_caret);
+        }
+        MdAction::Callout => {
+            let (start, _) = edit.range();
+            let lead = if start == 0 || edit.text[..start].ends_with('\n') { "" } else { "\n\n" };
+            let snippet = format!("{lead}> [!tip]\n> ");
+            edit.insert(&snippet);
+        }
+        MdAction::CodeBlock => {
+            let (start, end) = edit.range();
+            let lead = if start == 0 || edit.text[..start].ends_with('\n') { "" } else { "\n" };
+            if start < end {
+                let selected = edit.selected().to_string();
+                let snippet = format!("{lead}```\n{selected}\n```\n");
+                edit.insert(&snippet);
+            } else {
+                let snippet = format!("{lead}```\n\n```\n");
+                let caret = start + lead.len() + 4;
+                edit.insert(&snippet);
+                edit.set_caret(caret);
+            }
+        }
+        MdAction::Table => {
+            let (start, _) = edit.range();
+            let lead = if start == 0 || edit.text[..start].ends_with('\n') { "" } else { "\n\n" };
+            let snippet = format!("{lead}| Column A | Column B |\n| --- | --- |\n| Value | Value |\n");
+            edit.insert(&snippet);
+        }
+        MdAction::Rule => {
+            let (start, _) = edit.range();
+            let lead = if start == 0 || edit.text[..start].ends_with('\n') { "" } else { "\n\n" };
+            edit.insert(&format!("{lead}---\n\n"));
+        }
+    }
+}
+
+// ── Live Obsidian-Style Markdown Decorations ──
+
+/// Produces live styled [`Span`] decorations for raw Markdown inside the borderless editor:
+/// larger bold headings with faint `#`, inline bold/italic/code pills, syntax-highlighted fenced
+/// code blocks, callout headers, list/task markers, and underlined links.
+fn markdown_decorations(src: &str, p: &Palette, k: &Kit) -> Vec<Span> {
+    let mut spans = Vec::new();
+    let syntax_theme = SyntaxTheme::from_kit(k);
+    let syntax_dim = p.text_3.alpha(0.75);
+    let code_bg = k.c.layer_02;
+
+    let mut offset = 0usize;
+    let mut in_fence = false;
+    let mut fence_lang: Option<String> = None;
+    let mut fence_body_start = 0usize;
+
+    for raw_line in src.split_inclusive('\n') {
+        let line = raw_line.strip_suffix('\n').unwrap_or(raw_line);
+        let line_start = offset;
+        let line_end = line_start + line.len();
+        offset += raw_line.len();
+
+        let trimmed = line.trim_start();
+        if let Some(after_ticks) = trimmed.strip_prefix("```") {
+            if line_start < line_end {
+                spans.push(Span::new(line_start, line_end).mono().color(syntax_dim));
+            }
+            if !in_fence {
+                in_fence = true;
+                let lang = after_ticks.split_whitespace().next().unwrap_or("");
+                fence_lang = (!lang.is_empty()).then(|| lang.to_string());
+                fence_body_start = offset;
+            } else {
+                if fence_body_start < line_start {
+                    let code_slice = &src[fence_body_start..line_start];
+                    spans.push(Span::new(fence_body_start, line_start).mono().size(13.0));
+                    let hl = syntax::highlight(fence_lang.as_deref(), code_slice);
+                    spans.extend(syntax_theme.spans(&hl, fence_body_start));
+                }
+                in_fence = false;
+                fence_lang = None;
+            }
+            continue;
+        }
+
+        if in_fence {
+            continue;
+        }
+
+        if line.is_empty() {
+            continue;
+        }
+
+        // Horizontal rule
+        if matches!(trimmed, "---" | "***" | "___") {
+            spans.push(Span::new(line_start, line_end).color(syntax_dim));
+            continue;
+        }
+
+        // ATX Headings (# .. ####)
+        let hashes = line.bytes().take_while(|&b| b == b'#').count();
+        if (1..=4).contains(&hashes) && line[hashes..].starts_with(' ') {
+            let size = match hashes {
+                1 => 23.0,
+                2 => 19.0,
+                3 => 16.5,
+                _ => 15.0,
+            };
+            spans.push(Span::new(line_start, line_start + hashes + 1).size(size).color(syntax_dim));
+            if line_start + hashes + 1 < line_end {
+                spans.push(Span::new(line_start + hashes + 1, line_end).size(size).weight(600.0).color(p.text));
+            }
+            continue;
+        }
+
+        // Obsidian callout header: `> [!tip] Optional title`
+        if let Some((kind, _)) = parse_callout_header(line) {
+            let accent = kind.accent(p);
+            spans.push(Span::new(line_start, line_end).weight(600.0).color(accent));
+            continue;
+        }
+
+        // Blockquotes
+        let indent = line.len() - trimmed.len();
+        let mut content_offset = line_start + indent;
+        if let Some(after_q) = trimmed.strip_prefix('>') {
+            let marker_end = content_offset + 1 + usize::from(after_q.starts_with(' '));
+            spans.push(Span::new(content_offset, marker_end).color(syntax_dim));
+            if marker_end < line_end {
+                spans.push(Span::new(marker_end, line_end).color(p.text_2));
+                decorate_inline(&src[marker_end..line_end], marker_end, p, syntax_dim, code_bg, &mut spans);
+            }
+            continue;
+        }
+
+        // Task list or unordered/ordered list marker
+        if trimmed.starts_with("- [ ] ") || trimmed.starts_with("- [x] ") || trimmed.starts_with("- [X] ") {
+            let done = trimmed.as_bytes()[3] != b' ';
+            let marker_end = content_offset + 6;
+            spans.push(Span::new(content_offset, marker_end).mono().color(if done { CalloutKind::Tip.accent(p) } else { syntax_dim }));
+            if done && marker_end < line_end {
+                spans.push(Span::new(marker_end, line_end).color(p.text_3));
+            }
+            content_offset = marker_end;
+        } else if trimmed.starts_with("- ") || trimmed.starts_with("* ") || trimmed.starts_with("+ ") {
+            let marker_end = content_offset + 2;
+            spans.push(Span::new(content_offset, marker_end).color(syntax_dim));
+            content_offset = marker_end;
+        } else if let Some((plen, _)) = parse_ordered_prefix(trimmed) {
+            let marker_end = content_offset + plen;
+            spans.push(Span::new(content_offset, marker_end).color(syntax_dim));
+            content_offset = marker_end;
+        }
+
+        if content_offset < line_end {
+            decorate_inline(&src[content_offset..line_end], content_offset, p, syntax_dim, code_bg, &mut spans);
+        }
+    }
+
+    // Highlight an unclosed code fence while the user is actively typing inside it.
+    if in_fence && fence_body_start < src.len() {
+        let code_slice = &src[fence_body_start..];
+        spans.push(Span::new(fence_body_start, src.len()).mono().size(13.0));
+        let hl = syntax::highlight(fence_lang.as_deref(), code_slice);
+        spans.extend(syntax_theme.spans(&hl, fence_body_start));
+    }
+
+    spans
+}
+
+fn decorate_inline(text: &str, base: usize, p: &Palette, dim: Color, code_bg: Color, out: &mut Vec<Span>) {
+    let bytes = text.as_bytes();
+    let len = bytes.len();
+    let mut i = 0usize;
+
+    while i < len {
+        // Inline code: `code`
+        if bytes[i] == b'`'
+            && let Some(rel) = text[i + 1..].find('`')
+            && rel > 0
+        {
+            let close = i + 1 + rel;
+            out.push(Span::new(base + i, base + i + 1).mono().color(dim));
+            out.push(Span::new(base + i + 1, base + close).mono().size(13.5).bg(code_bg, 2.5));
+            out.push(Span::new(base + close, base + close + 1).mono().color(dim));
+            i = close + 1;
+            continue;
+        }
+
+        // Bold: **text**
+        if i + 3 < len
+            && bytes[i] == b'*'
+            && bytes[i + 1] == b'*'
+            && let Some(rel) = text[i + 2..].find("**")
+            && rel > 0
+        {
+            let close = i + 2 + rel;
+            out.push(Span::new(base + i, base + i + 2).color(dim));
+            out.push(Span::new(base + i + 2, base + close).bold());
+            out.push(Span::new(base + close, base + close + 2).color(dim));
+            i = close + 2;
+            continue;
+        }
+
+        // Italic: *text*
+        if i + 2 < len
+            && bytes[i] == b'*'
+            && bytes[i + 1] != b'*'
+            && bytes[i + 1] != b' '
+            && let Some(rel) = text[i + 1..].find('*')
+            && rel > 0
+        {
+            let close = i + 1 + rel;
+            out.push(Span::new(base + i, base + i + 1).color(dim));
+            out.push(Span::new(base + i + 1, base + close).italic());
+            out.push(Span::new(base + close, base + close + 1).color(dim));
+            i = close + 1;
+            continue;
+        }
+
+        // Markdown link: [label](url)
+        if bytes[i] == b'['
+            && let Some(mid_rel) = text[i + 1..].find("](")
+            && let Some(end_rel) = text[i + 1 + mid_rel + 2..].find(')')
+        {
+            let mid = i + 1 + mid_rel;
+            let end = mid + 2 + end_rel;
+            out.push(Span::new(base + i, base + i + 1).color(dim));
+            if i + 1 < mid {
+                out.push(Span::new(base + i + 1, base + mid).color(p.text).underline(p.text_3));
+            }
+            out.push(Span::new(base + mid, base + end + 1).color(dim));
+            i = end + 1;
+            continue;
+        }
+
+        i += text[i..].chars().next().map_or(1, char::len_utf8);
+    }
 }
 
 fn empty_notebook(p: &Palette, k: &Kit) -> El {
@@ -1398,9 +1970,9 @@ fn empty_notebook(p: &Palette, k: &Kit) -> El {
         .items_center()
         .pt(88.0)
         .gap(14.0)
-        .child(text("The notebook is empty").font(style::DISPLAY).color(p.text))
+        .child(text("Your knowledge library is empty").font(style::DISPLAY).color(p.text))
         .child(
-            text("Agents add a page here when they fix a hard bug, hit a dead end, or settle a design decision.")
+            text("Write freeform Markdown notes or let agents save architecture decisions, gotchas, and patterns here.")
                 .font(style::PROSE)
                 .color(p.text_2)
                 .wrap()
@@ -1408,7 +1980,7 @@ fn empty_notebook(p: &Palette, k: &Kit) -> El {
                 .align(rune::Align::Center),
         )
         .child(
-            Button::new("Write the First Page")
+            Button::new("Write the First Note")
                 .icon(&PLUS_ICON)
                 .variant(ButtonVariant::Contrast)
                 .control_size(ControlSize::Large)
@@ -1430,9 +2002,7 @@ mod tests {
             topic: topic.into(),
             title: title.into(),
             tags: tags.iter().map(|t| t.to_string()).collect(),
-            context: "Something happened while building.".into(),
-            cause: None,
-            rule: "Do the careful thing next time.".into(),
+            body: "## Context\n\nSomething happened while building.\n\n## Takeaway\n\nDo the careful thing next time.".into(),
             project_id: None,
             agent: "Codex".into(),
             created_at: id,
@@ -1481,15 +2051,13 @@ mod tests {
         nb.tree.set_expanded("topic:rust", false);
         assert!(!nb.tree.is_expanded("topic:rust"));
 
-        // Watcher pushes updated pages — topic:rust should remain collapsed.
         nb.set_pages(nb.pages.clone());
         assert!(!nb.tree.is_expanded("topic:rust"));
 
-        // Searching expands matching topics via TreeModel filter, clearing restores collapse.
         nb.query = TextEdit::new("scroll");
         nb.apply_tree_filter();
         assert!(nb.tree.is_filtering());
-        assert_eq!(nb.tree.visible_len(), 2); // topic:rust + page:3
+        assert_eq!(nb.tree.visible_len(), 2);
         nb.query = TextEdit::new("");
         nb.apply_tree_filter();
         assert!(!nb.tree.is_expanded("topic:rust"));
@@ -1499,16 +2067,80 @@ mod tests {
     fn escape_unwinds_menu_editor_page_then_search() {
         let mut s = State::new();
         s.notebook = notebook();
-        s.notebook.query = TextEdit::new("rune");
-        s.notebook.apply_tree_filter();
-        s.notebook.open = Some(3);
+        s.notebook.query = TextEdit::new("sqlite");
+        s.notebook.open = Some(2);
+        s.notebook.editor = Some(Editor::blank(None));
         s.notebook.action_menu_open = true;
-        assert!(s.notebook_escape() && !s.notebook.action_menu_open && s.notebook.open == Some(3));
-        s.notebook_edit(3);
-        assert!(s.notebook.editor.as_ref().is_some_and(|e| e.id == Some(3) && e.title.text.starts_with("Scroll")));
-        assert!(s.notebook_escape() && s.notebook.editor.is_none() && s.notebook.open == Some(3));
-        assert!(s.notebook_escape() && s.notebook.open.is_none());
-        assert!(s.notebook_escape() && s.notebook.query.text.is_empty());
+
+        assert!(s.notebook_escape());
+        assert!(!s.notebook.action_menu_open);
+        assert!(s.notebook_escape());
+        assert!(s.notebook.editor.is_none());
+        assert!(s.notebook_escape());
+        assert!(s.notebook.open.is_none());
+        assert!(s.notebook_escape());
+        assert!(s.notebook.query.text.is_empty());
         assert!(!s.notebook_escape());
+    }
+
+    #[test]
+    fn markdown_toolbar_actions_and_smart_enter_behave_like_obsidian() {
+        let mut edit = TextEdit::new("hello world");
+        edit.set_selection(6, 11);
+        apply_md_action(&mut edit, MdAction::Wrap("**", "**", "bold"));
+        assert_eq!(edit.text, "hello **world**");
+        // Applying again unwraps cleanly.
+        apply_md_action(&mut edit, MdAction::Wrap("**", "**", "bold"));
+        assert_eq!(edit.text, "hello world");
+
+        // Heading toggle & level switch.
+        edit.set_caret(0);
+        apply_md_action(&mut edit, MdAction::Heading(2));
+        assert_eq!(edit.text, "## hello world");
+        apply_md_action(&mut edit, MdAction::Heading(1));
+        assert_eq!(edit.text, "# hello world");
+        apply_md_action(&mut edit, MdAction::Heading(1));
+        assert_eq!(edit.text, "hello world");
+
+        // Smart enter continues checklist & exits on empty item.
+        let mut list = TextEdit::new("- [ ] Ship carousels");
+        list.set_caret(list.text.len());
+        smart_enter_edit(&mut list);
+        assert_eq!(list.text, "- [ ] Ship carousels\n- [ ] ");
+        smart_enter_edit(&mut list);
+        assert_eq!(list.text, "- [ ] Ship carousels\n");
+    }
+
+    #[test]
+    fn article_chunks_split_callouts_and_preserve_task_offsets() {
+        let md = "- [ ] First task\n\n> [!tip] Keep it simple\n> - [ ] Inside callout\n\n- [x] After callout";
+        let chunks = split_article_chunks(md);
+        assert_eq!(chunks.len(), 3);
+        assert_eq!(chunks[0], ArticleChunk::Markdown { text: "- [ ] First task".into(), task_offset: 0 });
+        assert_eq!(
+            chunks[1],
+            ArticleChunk::Callout {
+                kind: CalloutKind::Tip,
+                title: "Keep it simple".into(),
+                body: "- [ ] Inside callout".into(),
+                task_offset: 1,
+            }
+        );
+        assert_eq!(chunks[2], ArticleChunk::Markdown { text: "- [x] After callout".into(), task_offset: 2 });
+    }
+
+    #[test]
+    fn markdown_decorations_stay_on_valid_utf8_boundaries() {
+        let p = style::palette(true);
+        let k = style::kit(&p);
+        let src = "# Heading — café\n\n**bold** and *italic* with `code` and [link](https://example.com)\n\n> [!warning]\n> Watch out\n\n- [ ] Todo item\n- [x] Done item\n\n```rust\nlet x = \"日本語\";\n```\n";
+        let spans = markdown_decorations(src, &p, &k);
+        assert!(!spans.is_empty());
+        for sp in spans {
+            let s = sp.start as usize;
+            let e = sp.end as usize;
+            assert!(s <= e && e <= src.len(), "out of bounds span {s}..{e}");
+            assert!(src.is_char_boundary(s) && src.is_char_boundary(e), "non-char-boundary span {s}..{e}");
+        }
     }
 }

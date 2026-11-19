@@ -104,8 +104,6 @@ pub const NAME: TextStyle = TextStyle::new(14.0, MEDIUM).lh(19.0);
 pub const BODY: TextStyle = TextStyle::new(14.0, 400.0).lh(22.0);
 /// Long-form reading (notebook pages, briefs): the body size, looser.
 pub const PROSE: TextStyle = TextStyle::new(14.0, 400.0).lh(23.0);
-/// The one sentence a reader must not miss: a notebook page's rule.
-pub const EMPHASIS: TextStyle = TextStyle::new(14.0, MEDIUM).lh(22.0);
 /// 13: controls and navigation: buttons, rail rows, segmented labels.
 pub const CONTROL: TextStyle = TextStyle::new(13.0, MEDIUM).lh(18.0);
 /// 12: secondary detail: times, counts, bylines. Tabular so changing figures hold their width.

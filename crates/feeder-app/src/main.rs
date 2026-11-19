@@ -176,13 +176,15 @@ pub struct State {
     pub show_archived: bool,
     /// Context menu open for an orb tile on Home: `(project_id, pointer)`.
     pub orb_menu: Option<(i64, PointerPress)>,
-    /// Update id whose media is open in the lightbox modal.
+    /// Media id (`update_media.id`) open in the lightbox modal.
     pub lightbox: Option<i64>,
     pub lightbox_zoom: ImageZoom,
-    /// Secondary update id for Before/After swipe compare in lightbox.
+    /// Secondary media id for Before/After swipe compare in lightbox.
     pub lightbox_compare: Option<i64>,
     /// Split fraction `0.02..=0.98` for Before/After compare divider.
     pub lightbox_split: f32,
+    /// Active carousel slide index keyed by `update_id`.
+    pub card_slide: HashMap<i64, usize>,
     /// Quick Jump (`⌘K`) command palette state.
     pub palette_open: bool,
     pub palette_query: TextEdit,
@@ -207,7 +209,9 @@ pub struct State {
     watcher: Option<Watcher>,
     wake: Option<Waker>,
     images: Option<ImageCache>,
+    /// Decoded screenshots keyed by `media_id`.
     pub shots: HashMap<i64, Image>,
+    /// Video players keyed by `media_id`.
     pub videos: HashMap<i64, Player>,
     /// App icons for agents without a logo, by agent name.
     pub agent_icons: HashMap<String, Image>,
@@ -216,6 +220,35 @@ pub struct State {
     last_pulse_tick: f64,
     last_video_tick: f64,
     menubar_child: Option<Child>,
+}
+
+/// One visual slide attached to an update (from `update.media`, with fallback to `update.screenshot`).
+#[derive(Clone, Debug)]
+pub struct MediaSlide {
+    pub id: i64,
+    pub path: PathBuf,
+    pub width: Option<u32>,
+    pub height: Option<u32>,
+}
+
+impl MediaSlide {
+    pub fn kind(&self) -> Option<MediaKind> {
+        media_kind_for_path(&self.path)
+    }
+
+    pub fn is_image(&self) -> bool {
+        self.kind() == Some(MediaKind::Image)
+    }
+}
+
+pub fn media_slides(u: &FeedUpdate) -> Vec<MediaSlide> {
+    if !u.media.is_empty() {
+        u.media.iter().map(|m| MediaSlide { id: m.id, path: m.path.clone(), width: m.width, height: m.height }).collect()
+    } else if let Some(path) = &u.screenshot {
+        vec![MediaSlide { id: -u.id, path: path.clone(), width: u.media_w, height: u.media_h }]
+    } else {
+        Vec::new()
+    }
 }
 
 impl Drop for State {
@@ -280,6 +313,7 @@ impl State {
             lightbox_zoom: ImageZoom::new(),
             lightbox_compare: None,
             lightbox_split: 0.5,
+            card_slide: HashMap::new(),
             palette_open: false,
             palette_query: TextEdit::new(""),
             palette_index: 0,
@@ -392,13 +426,44 @@ impl State {
         self.ask();
     }
 
-    pub fn open_lightbox(&mut self, id: i64, tx: &mut Tx) {
-        self.lightbox = Some(id);
+    pub fn card_slide_index(&self, update_id: i64, len: usize) -> usize {
+        if len == 0 {
+            return 0;
+        }
+        self.card_slide.get(&update_id).copied().unwrap_or(0).min(len - 1)
+    }
+
+    pub fn step_card_slide(&mut self, update_id: i64, delta: isize, len: usize) {
+        if len <= 1 {
+            return;
+        }
+        let cur = self.card_slide_index(update_id, len);
+        let next = (cur as isize + delta).rem_euclid(len as isize) as usize;
+        self.card_slide.insert(update_id, next);
+    }
+
+    pub fn set_card_slide(&mut self, update_id: i64, idx: usize) {
+        self.card_slide.insert(update_id, idx);
+    }
+
+    pub fn open_lightbox(&mut self, media_id: i64, tx: &mut Tx) {
+        self.lightbox = Some(media_id);
         self.lightbox_zoom.reset();
         self.lightbox_compare = None;
         self.lightbox_split = 0.5;
         self.clear_copied(CopyTarget::LightboxImage);
         tx.focus_when_shown(rune_kit::image_zoom::KEY, false);
+    }
+
+    pub fn select_lightbox(&mut self, media_id: i64) {
+        self.lightbox = Some(media_id);
+        self.lightbox_zoom.reset();
+        self.lightbox_compare = None;
+        self.clear_copied(CopyTarget::LightboxImage);
+        if let Some((u, slide_idx, _)) = self.find_media(media_id) {
+            let uid = u.id;
+            self.card_slide.insert(uid, slide_idx);
+        }
     }
 
     pub fn close_lightbox(&mut self) {
@@ -414,15 +479,19 @@ impl State {
             return;
         }
         let Some(id) = self.lightbox else { return };
-        let imgs: Vec<i64> = self.lightbox_ids().into_iter().filter(|x| *x != id && self.shots.contains_key(x)).collect();
-        if let Some(&other) = imgs.first() {
+        // Prefer comparing against another slide from the same update first (ideal for before/after pairs).
+        let same_update_other = self
+            .find_media(id)
+            .and_then(|(_, _, slides)| slides.into_iter().map(|s| s.id).find(|&x| x != id && self.shots.contains_key(&x)));
+        let other = same_update_other.or_else(|| self.lightbox_ids().into_iter().find(|&x| x != id && self.shots.contains_key(&x)));
+        if let Some(other) = other {
             self.lightbox_compare = Some(other);
             self.lightbox_split = 0.5;
         }
     }
 
-    pub fn toggle_video(&mut self, id: i64) {
-        if let Some(player) = self.videos.get(&id) {
+    pub fn toggle_video(&mut self, media_id: i64) {
+        if let Some(player) = self.videos.get(&media_id) {
             if player.is_playing() {
                 player.pause();
             } else {
@@ -818,14 +887,18 @@ impl State {
 
     pub fn delete_update(&mut self, id: i64) {
         self.delete_confirm = None;
-        if self.lightbox == Some(id) {
+        let media_ids: Vec<i64> = self.find_update(id).map(|u| media_slides(u).into_iter().map(|m| m.id).collect()).unwrap_or_default();
+        if self.lightbox.is_some_and(|lid| lid == id || media_ids.contains(&lid)) {
             self.close_lightbox();
         }
         self.feed.retain(|u| u.id != id);
         self.timeline.retain(|u| u.id != id);
         self.search_hits.retain(|u| u.id != id);
-        self.shots.remove(&id);
-        self.videos.remove(&id);
+        self.card_slide.remove(&id);
+        for mid in media_ids {
+            self.shots.remove(&mid);
+            self.videos.remove(&mid);
+        }
         if let Some(w) = &self.watcher {
             w.delete_update(id);
         }
@@ -1043,7 +1116,7 @@ impl State {
                     FeedFilter::NeedsYou => {}
                     FeedFilter::Unread if !sum.unseen() || !sum.project.seen_at.is_none_or(|seen| u.created_at > seen) => return None,
                     FeedFilter::Unread => {}
-                    FeedFilter::Shots if u.screenshot.is_none() => return None,
+                    FeedFilter::Shots if !u.has_media() => return None,
                     FeedFilter::Shots => {}
                 }
                 if let Some(agent) = &self.feed_agent
@@ -1074,16 +1147,24 @@ impl State {
         self.feed.iter().chain(&self.timeline).chain(&self.search_hits).find(|u| u.id == id)
     }
 
+    /// Finds the update, 0-based slide index, and full slide list containing `media_id`.
+    pub fn find_media(&self, media_id: i64) -> Option<(&FeedUpdate, usize, Vec<MediaSlide>)> {
+        for u in self.feed.iter().chain(&self.timeline).chain(&self.search_hits) {
+            let slides = media_slides(u);
+            if let Some(pos) = slides.iter().position(|m| m.id == media_id) {
+                return Some((u, pos, slides));
+            }
+        }
+        None
+    }
+
     pub fn lightbox_ids(&self) -> Vec<i64> {
         let has_media = |id: i64| self.shots.contains_key(&id) || self.videos.contains_key(&id);
+        let collect_update = |u: &FeedUpdate| media_slides(u).into_iter().map(|m| m.id).filter(|&id| has_media(id)).collect::<Vec<_>>();
         if let Some(open) = self.open {
-            if self.feed_for == Some(open) {
-                feed::visible_feed(self).into_iter().filter(|u| has_media(u.id)).map(|u| u.id).collect()
-            } else {
-                vec![]
-            }
+            if self.feed_for == Some(open) { feed::visible_feed(self).into_iter().flat_map(collect_update).collect() } else { vec![] }
         } else {
-            self.filtered_timeline().into_iter().filter(|(u, _)| has_media(u.id)).map(|(u, _)| u.id).collect()
+            self.filtered_timeline().into_iter().flat_map(|(u, _)| collect_update(u)).collect()
         }
     }
 
@@ -1095,10 +1176,7 @@ impl State {
             return;
         }
         let next = (pos as isize + delta).rem_euclid(ids.len() as isize) as usize;
-        self.lightbox = Some(ids[next]);
-        self.lightbox_zoom.reset();
-        self.lightbox_compare = None;
-        self.clear_copied(CopyTarget::LightboxImage);
+        self.select_lightbox(ids[next]);
     }
 
     pub fn dark(&self, system_dark: bool) -> bool {
@@ -1125,12 +1203,14 @@ impl State {
 
     fn load_images(&mut self) {
         let Some(cache) = &self.images else { return };
+        let mut live = HashSet::new();
         for u in self.feed.iter().chain(&self.timeline).chain(&self.search_hits) {
-            if let Some(path) = &u.screenshot {
-                match media_kind_for_path(path) {
+            for slide in media_slides(u) {
+                live.insert(slide.id);
+                match media_kind_for_path(&slide.path) {
                     Some(MediaKind::Video) => {
-                        self.videos.entry(u.id).or_insert_with(|| {
-                            let player = Player::file(path);
+                        self.videos.entry(slide.id).or_insert_with(|| {
+                            let player = Player::file(&slide.path);
                             player.set_looping(true);
                             player.preload();
                             if let Some(w) = &self.wake {
@@ -1140,8 +1220,8 @@ impl State {
                         });
                     }
                     Some(MediaKind::Image) | None => {
-                        self.shots.entry(u.id).or_insert_with(|| {
-                            let img = cache.file(path, 960.0, 2.0);
+                        self.shots.entry(slide.id).or_insert_with(|| {
+                            let img = cache.file(&slide.path, 960.0, 2.0);
                             // Headless frames run ahead of the decoder; wait so snapshots show it.
                             if rune::tooling::headless_run().is_some() {
                                 let _ = img.wait();
@@ -1152,7 +1232,6 @@ impl State {
                 }
             }
         }
-        let live: HashSet<i64> = self.feed.iter().chain(&self.timeline).chain(&self.search_hits).map(|u| u.id).collect();
         self.shots.retain(|id, _| live.contains(id));
         self.videos.retain(|id, _| live.contains(id));
     }
@@ -1543,6 +1622,7 @@ mod tests {
             agent: "Claude Code".into(),
             body: body.into(),
             screenshot: None,
+            media: Vec::new(),
             media_w: None,
             media_h: None,
             branch: Some("feat/search".into()),

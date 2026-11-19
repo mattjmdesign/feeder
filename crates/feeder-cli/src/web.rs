@@ -398,6 +398,24 @@ fn build_state_json(store: &Store, project_slug: Option<&str>) -> Result<Value, 
         .map(|u| {
             let summary = proj_lookup.get(&u.project_id).copied();
             let proj: Option<&Project> = summary.map(|s| &s.project);
+            let media_items: Vec<Value> = u
+                .media
+                .iter()
+                .filter_map(|m| {
+                    let name = m.path.file_name()?.to_string_lossy().into_owned();
+                    let kind = m.kind().map(|k| match k {
+                        feeder_core::MediaKind::Image => "image",
+                        feeder_core::MediaKind::Video => "video",
+                    });
+                    Some(json!({
+                        "id": m.id,
+                        "url": format!("/media/{name}"),
+                        "kind": kind,
+                        "w": m.width,
+                        "h": m.height,
+                    }))
+                })
+                .collect();
             let media = u.screenshot.as_ref().and_then(|p| p.file_name()).map(|n| n.to_string_lossy().into_owned());
             let media_kind = u.media_kind().map(|k| match k {
                 feeder_core::MediaKind::Image => "image",
@@ -421,6 +439,7 @@ fn build_state_json(store: &Store, project_slug: Option<&str>) -> Result<Value, 
                 "media_kind": media_kind,
                 "media_w": u.media_w,
                 "media_h": u.media_h,
+                "media": media_items,
                 "ago": ago(u.created_at, now),
                 "created_at": u.created_at,
                 "needs_you": open_attention,
@@ -710,7 +729,16 @@ main{max-width:740px;margin:0 auto;padding:16px;}
 .dot{width:7px;height:7px;border-radius:99px;display:inline-block;}
 .dot.unseen{background:var(--accent);}.dot.needs{background:var(--warn);}.dot.live{background:var(--live);}
 .body{white-space:pre-wrap;margin-top:10px;}
-.media{margin-top:10px;max-width:100%;border-radius:8px;border:1px solid var(--line);}
+.media{margin-top:10px;max-width:100%;border-radius:8px;border:1px solid var(--line);display:block;}
+.carousel{position:relative;margin-top:10px;}
+.carousel .media{margin-top:0;width:100%;}
+.car-btn{position:absolute;top:50%;transform:translateY(-50%);width:30px;height:30px;border-radius:99px;border:1px solid rgba(255,255,255,.22);background:rgba(16,17,20,.68);color:#fff;cursor:pointer;display:flex;align-items:center;justify-content:center;font-size:16px;line-height:1;}
+.car-btn:hover{background:rgba(16,17,20,.88);}
+.car-prev{left:8px;}.car-next{right:8px;}
+.car-count{position:absolute;top:8px;right:8px;padding:2px 8px;border-radius:99px;background:rgba(16,17,20,.72);color:#fff;font-size:11px;font-variant-numeric:tabular-nums;}
+.car-dots{display:flex;justify-content:center;gap:6px;margin-top:8px;}
+.car-dot{width:7px;height:7px;border-radius:99px;border:0;padding:0;background:var(--line);cursor:pointer;}
+.car-dot.on{background:var(--accent);}
 .replies{margin-top:12px;border-top:1px solid var(--line);padding-top:10px;display:flex;flex-direction:column;gap:6px;}
 .reply{font-size:13px;background:var(--hover);padding:7px 10px;border-radius:8px;}
 .reply-form{display:flex;gap:8px;margin-top:8px;}
@@ -740,7 +768,7 @@ main{max-width:740px;margin:0 auto;padding:16px;}
   <div id="content">Loading…</div>
 </main>
 <script>
-let state = null, selected = null, mode = 'feed', pendingRender = false, todoOpen = false, todoClearConfirm = false;
+let state = null, selected = null, mode = 'feed', pendingRender = false, todoOpen = false, todoClearConfirm = false, slideIdx = {};
 if (new URLSearchParams(location.search).has('token')) {
   const clean = new URL(location.href);
   clean.searchParams.delete('token');
@@ -769,6 +797,8 @@ function setMode(m){ mode = m; render(); }
 function pickProject(slug){ selected = selected === slug ? null : slug; mode = 'feed'; todoOpen = false; todoClearConfirm = false; load(false); }
 function openTodos(){ todoOpen = true; todoClearConfirm = false; render(); const el = document.getElementById('todo-input'); if(el) el.focus(); }
 function closeEmptyTodos(){ todoOpen = false; todoClearConfirm = false; render(); }
+function stepSlide(uid, delta, total){ slideIdx[uid] = (((slideIdx[uid] || 0) + delta) % total + total) % total; render(); }
+function setSlide(uid, idx){ slideIdx[uid] = idx; render(); }
 async function markAllRead(){ await fetch('/api/seen', {method:'POST',credentials:'same-origin',headers:{'Content-Type':'application/json'},body:JSON.stringify({all:true})}); load(false); }
 async function sendReply(uid, el){
   const body = el.value.trim(); if(!body) return;
@@ -803,6 +833,19 @@ async function clearAllTodos(pid){
 }
 function cancelClearTodos(){ todoClearConfirm = false; render(); }
 function esc(s){return (s||'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));}
+function renderMedia(u){
+  const list = (u.media && u.media.length) ? u.media : (u.media_url ? [{url:u.media_url, kind:u.media_kind, w:u.media_w, h:u.media_h}] : []);
+  if(!list.length) return '';
+  const idx = Math.min(slideIdx[u.id] || 0, list.length - 1);
+  const m = list[idx];
+  const dims = (m.w && m.h) ? ` width="${m.w}" height="${m.h}" style="height:auto"` : '';
+  const item = m.kind === 'video'
+    ? `<video class="media" controls playsinline src="${esc(m.url)}"></video>`
+    : `<img class="media"${dims} src="${esc(m.url)}" alt="">`;
+  if(list.length === 1) return item;
+  const dots = list.map((_, i) => `<button class="car-dot ${i===idx?'on':''}" aria-label="Slide ${i+1}" onclick="setSlide(${u.id},${i})"></button>`).join('');
+  return `<div class="carousel">${item}<span class="car-count">${idx+1} / ${list.length}</span><button class="car-btn car-prev" aria-label="Previous" onclick="stepSlide(${u.id},-1,${list.length})">‹</button><button class="car-btn car-next" aria-label="Next" onclick="stepSlide(${u.id},1,${list.length})">›</button></div><div class="car-dots">${dots}</div>`;
+}
 function render(){
   if(!state) return;
   document.getElementById('tab-feed').classList.toggle('active', mode==='feed');
@@ -850,12 +893,7 @@ function render(){
     const dismissBtn = u.needs_you ? `<button class="btn" style="padding:2px 8px;font-size:11px;margin-left:auto" onclick="dismissAttention(${u.id})">Dismiss</button>` : '';
     html += `<div class="card"><div class="meta"><strong>${esc(u.project_name)}</strong><span>·</span><span>${esc(u.agent)}</span>${u.branch?`<span class="pill">${esc(u.branch)}</span>`:''}${u.diff_stat?`<span class="pill">${esc(u.diff_stat)}</span>`:''}<span>·</span><span>${esc(u.ago)}</span>${dismissBtn}</div>`;
     html += `<div class="body">${esc(u.body)}</div>`;
-    if(u.media_url){
-      const dims = (u.media_w && u.media_h) ? ` width="${u.media_w}" height="${u.media_h}" style="height:auto"` : '';
-      html += u.media_kind === 'video'
-        ? `<video class="media" controls playsinline src="${esc(u.media_url)}"></video>`
-        : `<img class="media"${dims} src="${esc(u.media_url)}" alt="">`;
-    }
+    html += renderMedia(u);
     html += `<div class="replies">`;
     for(const r of u.replies){
       html += `<div class="reply"><strong>${esc(r.author)}</strong> <span class="meta" style="display:inline">${esc(r.ago)}</span>: ${esc(r.body)}</div>`;

@@ -28,18 +28,18 @@ async function script(a: Act<S>) {
   await a.wait(1200)
 }
 
-const KINDS = [
-  ['All pages', '48'],
-  ['Fix', '21'],
-  ['Pitfall', '12'],
-  ['Pattern', '9'],
-  ['Decision', '6'],
+const CATEGORIES = [
+  ['All notes', '48'],
+  ['Rust', '19'],
+  ['Design & UI', '13'],
+  ['Database', '9'],
+  ['Tooling', '7'],
 ] as const
 
 function Side() {
   return (
     <nav className="nd-side">
-      {KINDS.map(([name, n], i) => (
+      {CATEGORIES.map(([name, n], i) => (
         <span key={name} className="nd-kind" data-on={i === 0 || undefined}>
           <span>{name}</span>
           <span className="nd-count">{n}</span>
@@ -68,12 +68,12 @@ export default function NotebookDemo() {
         <Window className="nd-win" title="Notebook" sidebar={layout === 'compact' ? undefined : <Side />} sidebarWidth={176}>
           <div className="nd-body">
             <div className="nd-list">
-              <Field className="nd-search" value={s.query} placeholder="Search the notebook" focused={!s.found} />
+              <Field className="nd-search" value={s.query} placeholder="Search notebook" focused={!s.found} />
               <div className="nd-rows">
                 <div className="nd-row nd-row--match" data-on={s.found || undefined}>
                   <span className="nd-row__title">Writes fail with SQLITE_BUSY</span>
                   <span className="nd-row__meta">
-                    <span className="nd-tag">Fix</span> From Atlas API
+                    <span className="nd-tag">Rust</span> From Atlas API
                   </span>
                 </div>
                 {[180, 140, 200, 120].map((w, i) => (
@@ -87,14 +87,19 @@ export default function NotebookDemo() {
 
             <article className="nd-page" data-on={s.found || undefined}>
               <div className="nd-page__kind">
-                <span className="nd-tag">Fix</span>
-                <span className="nd-page__from">Written in Atlas API · rust, sqlite</span>
+                <span className="nd-tag">Rust</span>
+                <span className="nd-page__from">Atlas API · Claude Code</span>
               </div>
               <div className="nd-page__title">Writes fail with SQLITE_BUSY</div>
-              <div className="nd-label">What happened</div>
-              <p>The app froze while the CLI posted an update. The write held the lock while it copied a screenshot.</p>
-              <div className="nd-label">Do this</div>
-              <p>Set a busy timeout on each connection, and copy files before you open the transaction.</p>
+              <p>
+                The app froze while the CLI posted an update because the write held a lock while copying media files.
+              </p>
+              <div className="nd-callout">
+                <div className="nd-callout__title">Keep writes atomic</div>
+                <p>
+                  Copy files before opening the transaction and set <code>busy_timeout</code> on every connection.
+                </p>
+              </div>
               <div className="nd-page__foot">Helped 3 times · last in Harbor</div>
             </article>
           </div>

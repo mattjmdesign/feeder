@@ -16,6 +16,22 @@ pub fn step_selection(ids: &[i64], current: Option<i64>, delta: isize) -> Option
 }
 
 pub fn on_key(s: &mut State, e: &KeyEvent, tx: &mut Tx) -> bool {
+    let nb_editing = s.tab == Tab::Notebook && s.open.is_none() && s.notebook.editor.is_some();
+    if nb_editing && !s.palette_open && !s.settings_open {
+        if e.is_command('s') {
+            s.notebook_save();
+            return true;
+        }
+        if e.mods.cmd && e.mods.shift && matches!(&e.key, Key::Text(t) if t.eq_ignore_ascii_case("p")) {
+            if let Some(ed) = s.notebook.editor.as_mut() {
+                ed.preview = !ed.preview;
+            }
+            return true;
+        }
+        if e.is_command('k') && s.notebook.editor.as_ref().is_some_and(|ed| ed.body.focused) {
+            return false;
+        }
+    }
     if e.is_command('k') {
         if s.palette_open {
             s.close_palette();
@@ -54,6 +70,7 @@ pub fn on_key(s: &mut State, e: &KeyEvent, tx: &mut Tx) -> bool {
     }
     if s.open.is_none()
         && s.editing.is_none()
+        && !nb_editing
         && !s.palette_open
         && let Some(tab) = ['1', '2', '3'].iter().position(|c| e.is_command(*c)).map(|i| Tab::ALL[i])
     {

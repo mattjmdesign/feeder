@@ -10,8 +10,8 @@ use std::io::{BufRead, Write};
 use std::path::{Path, PathBuf};
 
 use feeder_core::{
-    FeedUpdate, GUIDE, MAX_CHARS, MAX_PARAGRAPHS, NOTEBOOK_GUIDE, NewUpdate, PageFilter, Project, Reply, Store, agent_display_name,
-    agent_from_env, ago, detect_git_meta, detect_project, now_ms, parse_attention,
+    FeedUpdate, GUIDE, MAX_CHARS, MAX_MEDIA_PER_UPDATE, MAX_PARAGRAPHS, NOTEBOOK_GUIDE, NewUpdate, PageFilter, Project, Reply, Store,
+    agent_display_name, agent_from_env, ago, detect_git_meta, detect_project, now_ms, parse_attention,
 };
 use serde_json::{Value, json};
 
@@ -20,7 +20,7 @@ use crate::{project_json, todo_json, update_json};
 mod notebook;
 
 const PROTOCOL_VERSIONS: [&str; 4] = ["2025-11-25", "2025-06-18", "2025-03-26", "2024-11-05"];
-const MAX_INLINE_SCREENSHOTS: usize = 3;
+const MAX_INLINE_SCREENSHOTS: usize = 6;
 const MAX_INLINE_SCREENSHOT_BYTES: u64 = 5 * 1024 * 1024;
 const MAX_RPC_LINE_BYTES: usize = 16 * 1024 * 1024;
 
@@ -350,7 +350,11 @@ impl Server {
                     let branch = u.branch.as_deref().map(|b| format!(" · `{b}`")).unwrap_or_default();
                     let diff = u.diff_stat.as_deref().map(|d| format!(" · `{d}`")).unwrap_or_default();
                     md.push_str(&format!("\n## {} · {}{branch}{diff} (#{})\n\n{}\n", u.agent, ago(u.created_at, now), u.id, u.body));
-                    if let Some(shot) = &u.screenshot {
+                    if !u.media.is_empty() {
+                        for m in &u.media {
+                            md.push_str(&format!("\n[media: {}]\n", m.path.display()));
+                        }
+                    } else if let Some(shot) = &u.screenshot {
                         md.push_str(&format!("\n[media: {}]\n", shot.display()));
                     }
                     for r in replies.iter().filter(|r| r.update_id == u.id) {
@@ -368,19 +372,31 @@ impl Server {
         let store = self.open_store()?;
         let project = self.project(&store, args, true)?.ok_or("no project")?;
         let agent = self.resolve_agent(args);
-        let screenshot = str_arg(args, "screenshot_path").map(|p| {
-            let p = PathBuf::from(p);
-            if p.is_absolute() { p } else { self.base(args).join(p) }
-        });
-        let meta = detect_git_meta(&self.base(args));
+        let base = self.base(args);
+        let resolve_path = |raw: &str| {
+            let p = PathBuf::from(raw);
+            if p.is_absolute() { p } else { base.join(p) }
+        };
+        let screenshot = str_arg(args, "screenshot_path").map(resolve_path);
+        let screenshots: Vec<PathBuf> = args
+            .get("screenshots")
+            .and_then(Value::as_array)
+            .map(|items| items.iter().filter_map(Value::as_str).map(str::trim).filter(|s| !s.is_empty()).map(resolve_path).collect())
+            .unwrap_or_default();
+        let meta = detect_git_meta(&base);
         let branch = str_arg(args, "branch").map(str::to_string).or(meta.branch);
         let diff_stat = str_arg(args, "diff_stat").map(str::to_string).or(meta.diff_stat);
         let commit_sha = meta.commit_sha;
         let posted = store
-            .post(project.id, NewUpdate { agent, body: summary.to_string(), screenshot, branch, diff_stat, commit_sha })
+            .post(project.id, NewUpdate { agent, body: summary.to_string(), screenshot, screenshots, branch, diff_stat, commit_sha })
             .map_err(|e| e.to_string())?;
         let unread = store.unread_human_replies(Some(project.id)).map_err(|e| e.to_string())?;
-        let mut text = format!("Posted update #{} to {}'s feed as {}.", posted.id, project.name, posted.agent);
+        let media_note = match posted.media.len() {
+            0 => String::new(),
+            1 => " (1 attachment)".to_string(),
+            n => format!(" ({n} attachments)"),
+        };
+        let mut text = format!("Posted update #{} to {}'s feed as {}{media_note}.", posted.id, project.name, posted.agent);
         if !unread.is_empty() {
             let now = now_ms();
             text.push_str(&format!(
@@ -856,7 +872,11 @@ fn format_update_line(project: Option<&str>, u: &FeedUpdate, replies: &[Reply], 
         None => format!("── {} · {}{branch}{diff} (#{})", u.agent, ago(u.created_at, now), u.id),
     };
     let mut out = format!("{header}\n{}", u.body);
-    if let Some(shot) = &u.screenshot {
+    if !u.media.is_empty() {
+        for m in &u.media {
+            out.push_str(&format!("\n[media: {}]", m.path.display()));
+        }
+    } else if let Some(shot) = &u.screenshot {
         out.push_str(&format!("\n[media: {}]", shot.display()));
     }
     for r in replies.iter().filter(|r| r.update_id == u.id) {
@@ -869,12 +889,18 @@ fn format_update_line(project: Option<&str>, u: &FeedUpdate, replies: &[Reply], 
 fn collect_screenshots(updates: &[FeedUpdate]) -> Vec<ImageBlock> {
     let mut out = Vec::new();
     for u in updates {
-        if out.len() >= MAX_INLINE_SCREENSHOTS {
-            break;
-        }
-        let Some(path) = &u.screenshot else { continue };
-        if let Some(block) = read_image_block(path) {
-            out.push(block);
+        let paths: Vec<&Path> = if !u.media.is_empty() {
+            u.media.iter().map(|m| m.path.as_path()).collect()
+        } else {
+            u.screenshot.as_deref().into_iter().collect()
+        };
+        for path in paths {
+            if out.len() >= MAX_INLINE_SCREENSHOTS {
+                return out;
+            }
+            if let Some(block) = read_image_block(path) {
+                out.push(block);
+            }
         }
     }
     out
@@ -944,7 +970,8 @@ fn tools() -> Value {
                  (1) Done:/Shipped:/Fixed: what was done + verification, (2) Why:/Benefit: why it was done \
                  and the benefit, and (3) Next:/Decision needed: what to do next and why. Markdown renders: \
                  **bold** sparingly for the key takeaway, `code` for files, branches and commands. Attach \
-                 one screenshot or short video clip (`screenshot_path`) whenever the work changed something visible."
+                 a screenshot or short clip (`screenshot_path`), or up to {MAX_MEDIA_PER_UPDATE} files in a carousel \
+                 (`screenshots`) whenever the work changed multiple screens or states."
             ),
             "inputSchema": {
                 "type": "object",
@@ -955,7 +982,13 @@ fn tools() -> Value {
                     "agent": { "type": "string", "description": "Leave unset: Feeder detects the tool you're running in." },
                     "branch": { "type": "string", "description": "Optional git branch. Leave unset: Feeder detects it from project_path." },
                     "diff_stat": { "type": "string", "description": "Optional diff stat override (auto-detected from git when omitted)." },
-                    "screenshot_path": { "type": "string", "description": "Optional path to one png, jpg, webp, gif screenshot or mp4/mov/webm clip (1 max per update). Copied into Feeder." }
+                    "screenshot_path": { "type": "string", "description": "Optional path to one png, jpg, webp, gif screenshot or mp4/mov/webm clip. Copied into Feeder." },
+                    "screenshots": {
+                        "type": "array",
+                        "items": { "type": "string" },
+                        "maxItems": MAX_MEDIA_PER_UPDATE,
+                        "description": format!("Optional list of up to {MAX_MEDIA_PER_UPDATE} screenshot/video paths to render as an interactive carousel on the update card.")
+                    }
                 },
                 "required": ["summary"]
             }
@@ -996,7 +1029,7 @@ fn tools() -> Value {
                     "project": project,
                     "project_path": project_path,
                     "limit": { "type": "integer", "minimum": 1, "maximum": 50, "description": "How many updates (default 5)." },
-                    "include_screenshots": { "type": "boolean", "description": "When true, include up to 3 attached screenshots as base64 image blocks." },
+                    "include_screenshots": { "type": "boolean", "description": format!("When true, include up to {MAX_INLINE_SCREENSHOTS} attached screenshots as base64 image blocks.") },
                     "mark_replies_read": { "type": "boolean", "description": "When true, mark returned unread human replies for this project as read." }
                 }
             }
@@ -1009,7 +1042,7 @@ fn tools() -> Value {
                 "type": "object",
                 "properties": {
                     "limit": { "type": "integer", "minimum": 1, "maximum": 50, "description": "How many updates (default 10)." },
-                    "include_screenshots": { "type": "boolean", "description": "When true, include up to 3 attached screenshots as base64 image blocks." }
+                    "include_screenshots": { "type": "boolean", "description": format!("When true, include up to {MAX_INLINE_SCREENSHOTS} attached screenshots as base64 image blocks.") }
                 }
             },
             "annotations": { "readOnlyHint": true }
@@ -1597,6 +1630,86 @@ mod tests {
             .unwrap();
         let page_md = page_res.pointer("/result/contents/0/text").and_then(Value::as_str).unwrap();
         assert!(page_md.contains("PRAGMA busy_timeout = 3000"));
+
+        let _ = std::fs::remove_dir_all(store_dir);
+        let _ = std::fs::remove_dir_all(work_dir);
+    }
+
+    #[test]
+    fn mcp_carousel_and_freeform_notebook_roundtrip() {
+        let store_dir = temp_dir("store-carousel-md");
+        let work_dir = temp_dir("work-carousel-md");
+        let shot1 = work_dir.join("a.png");
+        let shot2 = work_dir.join("b.png");
+        let png = [0x89, b'P', b'N', b'G', 0x0d, 0x0a, 0x1a, 0x0a, 1, 2, 3];
+        std::fs::write(&shot1, png).unwrap();
+        std::fs::write(&shot2, png).unwrap();
+
+        let mut server = Server::new(Some("claude-code".into()), work_dir.clone(), Some(store_dir.clone()));
+
+        let posted = server
+            .handle(&json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "tools/call",
+                "params": {
+                    "name": "post_update",
+                    "arguments": {
+                        "project": "Orbit",
+                        "summary": "Done: redesigned onboarding flow and settings drawer.",
+                        "screenshots": [shot1, shot2]
+                    }
+                }
+            }))
+            .unwrap();
+        assert_eq!(posted.pointer("/result/isError"), Some(&json!(false)));
+        let media = posted.pointer("/result/structuredContent/update/media").and_then(Value::as_array).unwrap();
+        assert_eq!(media.len(), 2);
+
+        let feed = server
+            .handle(&json!({
+                "jsonrpc": "2.0",
+                "id": 2,
+                "method": "tools/call",
+                "params": {
+                    "name": "get_feed",
+                    "arguments": { "project": "Orbit", "include_screenshots": true }
+                }
+            }))
+            .unwrap();
+        let content = feed.pointer("/result/content").and_then(Value::as_array).unwrap();
+        assert_eq!(content.len(), 3); // 1 text + 2 inline images
+
+        let wrote = server
+            .handle(&json!({
+                "jsonrpc": "2.0",
+                "id": 3,
+                "method": "tools/call",
+                "params": {
+                    "name": "write_page",
+                    "arguments": {
+                        "topic": "Rust",
+                        "title": "SQLite multi-image cascade rules",
+                        "body": "## Pattern\n\nAlways copy files before opening the transaction.\n\n- [ ] Verify rollback cleanup"
+                    }
+                }
+            }))
+            .unwrap();
+        assert_eq!(wrote.pointer("/result/isError"), Some(&json!(false)));
+        let pid = wrote.pointer("/result/structuredContent/id").and_then(Value::as_i64).unwrap();
+
+        let page = server
+            .handle(&json!({
+                "jsonrpc": "2.0",
+                "id": 4,
+                "method": "tools/call",
+                "params": { "name": "read_page", "arguments": { "id": pid } }
+            }))
+            .unwrap();
+        assert_eq!(page.pointer("/result/structuredContent/topic"), Some(&json!("rust")));
+        assert!(
+            page.pointer("/result/structuredContent/body").and_then(Value::as_str).is_some_and(|b| b.contains("Verify rollback cleanup"))
+        );
 
         let _ = std::fs::remove_dir_all(store_dir);
         let _ = std::fs::remove_dir_all(work_dir);

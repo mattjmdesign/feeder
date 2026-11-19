@@ -57,23 +57,31 @@ impl Server {
     }
 
     fn write_page(&self, args: &Value) -> Result<ToolOutput, String> {
-        let kind: Kind = str_arg(args, "kind")
-            .ok_or("`kind` is required: fix, pitfall, pattern or decision")?
-            .parse()
-            .map_err(|e: feeder_core::Error| e.to_string())?;
+        let kind: Kind = match str_arg(args, "kind") {
+            Some(raw) => raw.parse().map_err(|e: feeder_core::Error| e.to_string())?,
+            None => Kind::Note,
+        };
         let tags: Vec<String> = match args.get("tags") {
             Some(Value::Array(a)) => a.iter().filter_map(Value::as_str).map(str::to_string).collect(),
             Some(Value::String(s)) => vec![s.clone()],
             _ => vec![],
         };
-        let draft = PageDraft {
-            kind,
-            topic: str_arg(args, "topic").map(str::to_string),
-            title: str_arg(args, "title").ok_or("`title` is required")?.to_string(),
-            tags,
-            context: str_arg(args, "what_happened").ok_or("`what_happened` is required")?.to_string(),
-            cause: str_arg(args, "why").map(str::to_string),
-            rule: str_arg(args, "do_this").ok_or("`do_this` is required")?.to_string(),
+        let title = str_arg(args, "title").ok_or("`title` is required")?.to_string();
+        let topic = str_arg(args, "topic").map(str::to_string);
+        let draft = if let Some(body) = str_arg(args, "body") {
+            PageDraft { kind, topic, title, tags, body: body.to_string() }
+        } else if args.get("what_happened").is_some() || args.get("do_this").is_some() {
+            PageDraft::from_legacy(
+                kind,
+                topic,
+                title,
+                tags,
+                str_arg(args, "what_happened").unwrap_or_default().to_string(),
+                str_arg(args, "why").map(str::to_string),
+                str_arg(args, "do_this").unwrap_or_default().to_string(),
+            )
+        } else {
+            return Err("`body` (Markdown) is required".into());
         };
         let author = self.resolve_agent(args);
         let store = self.open_store()?;
@@ -110,19 +118,19 @@ impl Server {
 }
 
 pub(super) fn tools() -> Vec<Value> {
-    let kind = json!({ "type": "string", "enum": ["fix", "pitfall", "pattern", "decision"], "description": "fix: a bug and how it was solved. pitfall: something that failed or broke, and why to avoid it. pattern: an approach worth reusing. decision: a settled choice and its reasoning." });
+    let kind = json!({ "type": "string", "enum": ["note", "fix", "pitfall", "pattern", "decision"], "description": "Optional kind (`note` default for freeform articles, or `fix`, `pitfall`, `pattern`, `decision`)." });
     let id = json!({ "type": "integer", "description": "Notebook page id." });
     vec![
         json!({
             "name": "search_notebook",
             "title": "Search the notebook",
-            "description": "Search Feeder's shared notebook of lessons from all of the user's projects (bug fixes, pitfalls, patterns, decisions). Call it before non-trivial debugging, when an error is unfamiliar, or before choosing an approach for something tricky. Returns titles and rules; open one with read_page.",
+            "description": "Search Feeder's shared Markdown knowledge library across all projects (notes, fixes, pitfalls, patterns, decisions). Call it before non-trivial debugging, when an error is unfamiliar, or before choosing an approach for something tricky. Returns titles and excerpts; open one in full with read_page.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
                     "query": { "type": "string", "description": "Words to look for: the error text, the technology, the symptom." },
                     "kind": kind,
-                    "topic": { "type": "string", "description": "Only pages in this high-level topic, e.g. `rust`, `react`, `nextjs`, `design`." },
+                    "topic": { "type": "string", "description": "Only pages in this category/topic, e.g. `rust`, `react`, `nextjs`, `design`." },
                     "tag": { "type": "string", "description": "Only pages with this tag, e.g. `sqlite`." },
                     "include_archived": { "type": "boolean", "description": "Include archived (outdated) pages." },
                     "limit": { "type": "integer", "minimum": 1, "maximum": 25, "description": "How many pages (default 8)." }
@@ -134,29 +142,27 @@ pub(super) fn tools() -> Vec<Value> {
         json!({
             "name": "read_page",
             "title": "Read a notebook page",
-            "description": "Read one notebook page in full: what happened, why, and the rule to follow.",
+            "description": "Read one notebook article in full Markdown.",
             "inputSchema": { "type": "object", "properties": { "id": id }, "required": ["id"] },
             "annotations": { "readOnlyHint": true }
         }),
         json!({
             "name": "write_page",
             "title": "Write or revise a notebook page",
-            "description": "Record a lesson worth keeping across projects: a non-obvious bug fix, an approach that failed, a pattern that works, or a settled decision. Search first; to improve an existing page, pass its `id`. Near-duplicates are refused. Write it so it helps in another project; never include secrets.",
+            "description": "Save a freeform Markdown article to Feeder's cross-project knowledge library (a non-obvious fix, pitfall, reusable pattern, architecture decision, or technical guide). Search first; to update an existing article, pass its `id`. Near-duplicates are refused. Never include secrets.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
                     "id": { "type": "integer", "description": "Revise this page instead of adding a new one." },
+                    "title": { "type": "string", "description": "Clear, searchable title (2–120 chars)." },
+                    "body": { "type": "string", "description": "Freeform Markdown content (headings, fenced code blocks, lists, `- [ ]` checklists, tables, `> [!note]` callouts, links)." },
+                    "topic": { "type": "string", "description": "Optional category (`rust`, `react`, `nextjs`, `react-native`, `swift`, `typescript`, `agents`, `data`, `design`, `tooling`, `general`, or a custom slug). Inferred automatically when omitted." },
+                    "tags": { "type": "array", "items": { "type": "string" }, "description": "Optional lowercase tags (0–10)." },
                     "kind": kind,
-                    "topic": { "type": "string", "description": "High-level topic (`rust`, `react`, `nextjs`, `react-native`, `swift`, `typescript`, `agents`, `data`, `design`, `tooling`, or a short custom slug). Inferred from tags when omitted." },
-                    "title": { "type": "string", "description": "The situation in plain words, as someone would search for it (6–90 chars)." },
-                    "tags": { "type": "array", "items": { "type": "string" }, "description": "1–6 short lowercase tags: language, framework, area (`rust`, `sqlite`, `layout`)." },
-                    "what_happened": { "type": "string", "description": "The symptom or situation, with the exact error text if there was one (12–700 chars)." },
-                    "why": { "type": "string", "description": "The root cause or the reasoning (up to 500 chars)." },
-                    "do_this": { "type": "string", "description": "The rule to follow next time, one or two imperative sentences (12–320 chars)." },
                     "project": { "type": "string", "description": "The project it came from. Defaults to the one the server runs in." },
-                    "allow_similar": { "type": "boolean", "description": "File it even though a similar page exists; only for a genuinely different lesson." }
+                    "allow_similar": { "type": "boolean", "description": "File it even though a similar page exists; only for a genuinely different note." }
                 },
-                "required": ["kind", "title", "tags", "what_happened", "do_this"]
+                "required": ["title", "body"]
             }
         }),
         json!({

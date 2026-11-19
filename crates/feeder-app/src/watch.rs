@@ -56,6 +56,7 @@ pub enum FailedWrite {
 pub enum NotebookOp {
     Create(PageDraft),
     Revise(i64, PageDraft),
+    ToggleTask(i64, usize, bool),
     SetStanding(i64, Standing),
     Helped(i64),
     Delete(i64),
@@ -278,6 +279,7 @@ impl Watcher {
                             // resembles another.
                             NotebookOp::Create(draft) => s.create_page(draft, "You", None, OnSimilar::Allow).map(|_| ()),
                             NotebookOp::Revise(id, draft) => s.revise_page(id, draft, "You").map(|_| ()),
+                            NotebookOp::ToggleTask(id, task_index, checked) => s.toggle_page_task(id, task_index, checked).map(|_| ()),
                             NotebookOp::SetStanding(id, standing) => s.set_page_standing(id, standing),
                             NotebookOp::Helped(id) => s.mark_page_helped(id).map(|_| ()),
                             NotebookOp::Delete(id) => s.delete_page(id),

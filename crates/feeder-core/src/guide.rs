@@ -36,9 +36,10 @@ Example:
 - Use concrete numbers (`44/44 tests pass`, `14 ms -> 3 ms`, `3 of 5 screens done`).
 - Avoid `#` headings, tables, long code blocks, logs, secrets (updates, replies, and briefs refuse tokens/keys), or repeating the project name.
 
-## Media: attach one screenshot or short clip when the work is visible
-- Attach **one** screenshot (`png`/`jpg`/`webp`/`gif`) or short clip (`mp4`/`mov`/`webm`) via `screenshot_path` / `--screenshot` whenever the change affects something visible: UI, layout, chart, motion, or rendered output.
-- Use a real capture of the result (app window, browser, recording, or headless snap), cropped cleanly—never a mockup.
+## Media: attach screenshots or clips when the work is visible
+- Attach **one or more** screenshots (`png`/`jpg`/`webp`/`gif`) or short clips (`mp4`/`mov`/`webm`)—up to **8** per update—via `screenshots` (or `screenshot_path`) in MCP, or repeated `--screenshot` flags in CLI, whenever the change affects something visible: UI, layout, before/after, multiple screens, motion, or rendered output.
+- Multiple attachments render as an interactive carousel on the update card and in the lightbox.
+- Use real captures of the result (app window, browser, recording, or headless snap), cropped cleanly—never mockups.
 - Skip media for pure backend, refactor, test, or config changes.
 
 ## Collaborating with the user
@@ -57,19 +58,20 @@ CLI (from the project folder):
 
     Why: …
 
-    Next: …" --screenshot ./shot.png
+    Next: …" --screenshot ./before.png --screenshot ./after.png
 
-MCP: call `post_update` with `summary` (and `screenshot_path` when visible).
+MCP: call `post_update` with `summary` (and `screenshots` or `screenshot_path` when visible).
 "#;
 
-/// How agents should use the notebook: look before digging, write only lessons that will save
-/// someone time, and keep it tidy. Served by the MCP server, `feeder notebook guide` and the
+/// How agents should use the notebook: look before digging, write clean Markdown articles worth
+/// keeping, and keep it tidy. Served by the MCP server, `feeder notebook guide` and the
 /// `feeder-notebook` skill.
-pub const NOTEBOOK_GUIDE: &str = r#"# Feeder's notebook: lessons that carry across projects
+pub const NOTEBOOK_GUIDE: &str = r###"# Feeder's notebook: a shared Markdown knowledge library across projects
 
-The notebook is one shared, searchable record of what was learned while building: bugs and how
-they were fixed, approaches that failed, patterns that work, and decisions with their reasons.
-Every project and every agent reads the same notebook, so a lesson learned once pays off everywhere.
+The notebook is one shared, searchable library of freeform Markdown articles across every project
+and every agent: non-obvious bug fixes, approaches that failed, reusable patterns, architecture
+decisions, and technical notes. Every project and every agent reads the same library, so what you
+learn once pays off everywhere.
 
 ## Look before you dig
 Search the notebook before non-trivial debugging, before picking an approach for something tricky,
@@ -77,55 +79,53 @@ and whenever an error message isn't immediately familiar:
 
     feeder notebook search "sqlite busy timeout"        (MCP: search_notebook)
 
-Results show each page's title and rule. Open one with `feeder notebook show 12` (MCP: `read_page`).
-If a page helped, record it with `feeder notebook helped 12` (MCP: `mark_page_helped`) so good
-pages rise to the top.
+Results show each article's title and excerpt. Open one in full with `feeder notebook show 12`
+(MCP: `read_page`). If an article helped, record it with `feeder notebook helped 12`
+(MCP: `mark_page_helped`) so the most useful notes rise in search.
 
-## Write a page only when it will save someone time later
-- **Fix**: a bug whose cause wasn't obvious (more than a typo), and how it was solved.
-- **Pitfall**: an approach that failed or broke something, and why it would trap someone again.
-- **Pattern**: an approach that worked notably well and applies beyond this one spot.
-- **Decision**: a design or architecture choice that was settled, and the reasoning.
+## Write a note only when it will save someone time later
+Good notes capture things worth carrying into the next project:
+- A non-obvious bug fix (symptom, exact error, root cause, fix)
+- A pitfall or dead end worth avoiding next time
+- A reusable pattern, recipe, or architecture decision with its reasoning
 
-Don't write pages for one-off typos, project trivia (file paths, to-dos), what the docs already say,
-or status (that goes in the feed). Most sessions write no page at all; that's expected.
+Skip one-off typos, project-local trivia, or status updates (those belong in the feed). Most
+sessions write no note at all; that's expected.
 
-## Shape of a page
-- **Topic**: a high-level home for the page (`rust`, `react`, `nextjs`, `react-native`, `swift`, `typescript`, `agents`, `data`, `design`, `tooling`, or a short custom slug). If omitted, Feeder infers one from your tags.
-- **Title**: the situation in plain words, as someone would search for it.
-  "SQLite reads stall while a long write holds the lock", not "DB fix".
-- **What happened**: the symptom or situation, with the exact error text if there was one.
-- **Why**: the root cause or the reasoning (optional, but most good pages have one).
-- **Do this**: the rule to follow next time, one or two imperative sentences.
-- **Tags**: 1–6 specific lowercase sub-tags under that topic: `sqlite`, `locks`, `app-router`, `layout`, `worklets`, `mcp`.
+## Shape of a note: clean, freeform Markdown
+Write natural, well-structured `.md` just like Obsidian or Notion—no rigid form fields required:
+- **Title**: plain, searchable phrasing (e.g. "SQLite reads stall while a long write holds the lock").
+- **Category (`topic`)**: optional high-level home (`rust`, `react`, `nextjs`, `react-native`, `swift`, `typescript`, `agents`, `data`, `design`, `tooling`, `general`, or a short custom slug). Inferred automatically when omitted.
+- **Body (`body`)**: freeform Markdown—use `##` headings, fenced code blocks with language tags, bullet lists, `- [ ]` checklists, tables, links, and `> [!note]` / `> [!tip]` / `> [!warning]` callouts.
+- **Tags & kind**: optional (`tags`, `kind`: `note`, `fix`, `pitfall`, `pattern`, `decision`).
 
-Write it so it helps in a different project: name the technology, not your file names.
-Never include secrets, tokens, keys or customer data; the notebook refuses them.
+Write so it helps in a different project: name the technology and exact error, not local scratch paths.
+Never include secrets, tokens, keys, or customer data; the notebook refuses them.
 
 ## Keep it tidy
-- Search first. If a page covers the same lesson, revise it (`write_page` with its `id`, or
-  `feeder notebook write --id 12 …`) instead of adding another. Feeder refuses near-duplicates.
-- If a page turns out wrong, correct it. If it's outdated, archive it (`archive_page`).
+- Search first. If an article already covers the topic, revise it (`write_page` with its `id`, or
+  `feeder notebook write --id 12 …`) instead of creating a duplicate. Feeder refuses near-duplicates.
+- If a note turns out wrong, update it. If it's outdated, archive it (`archive_page`).
 
 ## Writing one
 
-    feeder notebook write --kind fix --topic data --title "SQLite reads stall while a long write holds the lock" --tags sqlite,rust --what "The app froze for seconds while the CLI posted an update." --why "The write transaction stayed open while a large screenshot was copied." --do "Copy files before opening the write transaction; keep transactions to the insert."
+    feeder notebook write --topic data --title "SQLite reads stall while a long write holds the lock" --body "## Symptom\n\nApp reads froze during media copy.\n\n## Rule\n\nCopy files to disk before opening a SQLite write transaction."
 
-MCP: `write_page` with `kind`, optional `topic`, `title`, `tags`, `what_happened`, `why`, `do_this`.
-"#;
+MCP: `write_page` with `title`, `body` (Markdown), and optional `topic`, `tags`, `kind`.
+"###;
 
 /// The skill that teaches agents to search the notebook before digging and to write the lessons
 /// worth keeping.
 pub fn notebook_skill_markdown() -> String {
     format!(
-        "---\nname: feeder-notebook\ndescription: Search and grow Feeder's shared notebook of engineering lessons (fixes, pitfalls, patterns, decisions) across all of the user's projects. Use before non-trivial debugging, when an error message is unfamiliar, before choosing an approach for something tricky, and after solving a non-obvious bug, hitting a dead end or settling a design decision worth remembering.\n---\n\n{NOTEBOOK_GUIDE}"
+        "---\nname: feeder-notebook\ndescription: Search and grow Feeder's shared Markdown knowledge library (fixes, pitfalls, patterns, decisions, technical notes) across all of the user's projects. Use before non-trivial debugging, when an error message is unfamiliar, before choosing an approach for something tricky, and after solving a non-obvious bug, hitting a dead end or settling a design decision worth remembering.\n---\n\n{NOTEBOOK_GUIDE}"
     )
 }
 
 /// The skill `feeder setup` installs for agents that load skills (Claude Code, Codex, OpenCode…).
 pub fn skill_markdown() -> String {
     format!(
-        "---\nname: feeder-update\ndescription: Post or read a project update in Feeder, the user's local project update centre. Use when finishing a meaningful piece of work, when the user asks for a status/handoff/Feeder update, or when resuming a project (read recent updates first). Format posts in three short blocks (Done, Why & benefit, Next & why) and attach one real screenshot when changes are visible.\n---\n\n{GUIDE}"
+        "---\nname: feeder-update\ndescription: Post or read a project update in Feeder, the user's local project update centre. Use when finishing a meaningful piece of work, when the user asks for a status/handoff/Feeder update, or when resuming a project (read recent updates first). Format posts in three short blocks (Done, Why & benefit, Next & why) and attach one or more real screenshots/clips when changes are visible.\n---\n\n{GUIDE}"
     )
 }
 

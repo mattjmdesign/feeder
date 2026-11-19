@@ -19,6 +19,7 @@ const MAX_VIDEO_BYTES: u64 = 50 * 1024 * 1024;
 const MAX_BRIEF_CHARS: usize = 600;
 const MAX_REPLY_CHARS: usize = 900;
 pub const MAX_TODO_CHARS: usize = 240;
+pub const MAX_MEDIA_PER_UPDATE: usize = 8;
 const IMAGE_TYPES: [&str; 5] = ["png", "jpg", "jpeg", "webp", "gif"];
 const VIDEO_TYPES: [&str; 4] = ["mp4", "mov", "webm", "m4v"];
 
@@ -26,6 +27,33 @@ const VIDEO_TYPES: [&str; 4] = ["mp4", "mov", "webm", "m4v"];
 pub enum MediaKind {
     Image,
     Video,
+}
+
+/// One stored media attachment (screenshot or short clip) belonging to a [`FeedUpdate`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MediaAttachment {
+    pub id: i64,
+    pub update_id: i64,
+    pub position: usize,
+    /// Absolute path of the stored media copy inside `<FEEDER_HOME>/media/`.
+    pub path: PathBuf,
+    pub width: Option<u32>,
+    pub height: Option<u32>,
+    pub caption: Option<String>,
+}
+
+impl MediaAttachment {
+    pub fn kind(&self) -> Option<MediaKind> {
+        media_kind_for_path(&self.path)
+    }
+
+    pub fn is_image(&self) -> bool {
+        self.kind() == Some(MediaKind::Image)
+    }
+
+    pub fn is_video(&self) -> bool {
+        self.kind() == Some(MediaKind::Video)
+    }
 }
 
 pub fn media_kind_for_path(path: &Path) -> Option<MediaKind> {
@@ -218,11 +246,13 @@ pub struct FeedUpdate {
     pub project_id: i64,
     pub agent: String,
     pub body: String,
-    /// Absolute path of the stored media copy (screenshot or short video clip).
+    /// Absolute path of the primary (first) stored media copy, for compatibility with single-image callers.
     pub screenshot: Option<PathBuf>,
-    /// Intrinsic pixel dimensions of an attached image, if known.
+    /// Intrinsic pixel dimensions of the primary image, if known.
     pub media_w: Option<u32>,
     pub media_h: Option<u32>,
+    /// Ordered list of all media attachments (1..=8) for carousel & lightbox rendering.
+    pub media: Vec<MediaAttachment>,
     pub branch: Option<String>,
     pub created_at: i64,
     pub diff_stat: Option<String>,
@@ -233,15 +263,19 @@ pub struct FeedUpdate {
 
 impl FeedUpdate {
     pub fn media_kind(&self) -> Option<MediaKind> {
-        self.screenshot.as_deref().and_then(media_kind_for_path)
+        self.media.first().and_then(MediaAttachment::kind).or_else(|| self.screenshot.as_deref().and_then(media_kind_for_path))
+    }
+
+    pub fn has_media(&self) -> bool {
+        !self.media.is_empty() || self.screenshot.is_some()
     }
 
     pub fn has_image(&self) -> bool {
-        self.media_kind() == Some(MediaKind::Image)
+        if !self.media.is_empty() { self.media.iter().any(MediaAttachment::is_image) } else { self.media_kind() == Some(MediaKind::Image) }
     }
 
     pub fn has_video(&self) -> bool {
-        self.media_kind() == Some(MediaKind::Video)
+        if !self.media.is_empty() { self.media.iter().any(MediaAttachment::is_video) } else { self.media_kind() == Some(MediaKind::Video) }
     }
 }
 
@@ -249,8 +283,10 @@ impl FeedUpdate {
 pub struct NewUpdate {
     pub agent: String,
     pub body: String,
-    /// A screenshot or short video clip to attach; it's copied into the store.
+    /// A single screenshot or short video clip to attach (combined with `screenshots`).
     pub screenshot: Option<PathBuf>,
+    /// Ordered screenshots or short video clips to attach as a carousel (up to `MAX_MEDIA_PER_UPDATE`).
+    pub screenshots: Vec<PathBuf>,
     /// Git branch (or detached short SHA) where the update was posted.
     pub branch: Option<String>,
     pub diff_stat: Option<String>,
@@ -313,6 +349,16 @@ impl Store {
                 attention_dismissed_at INTEGER
             );
             CREATE INDEX IF NOT EXISTS updates_by_project ON updates(project_id, created_at DESC, id DESC);
+            CREATE TABLE IF NOT EXISTS update_media (
+                id INTEGER PRIMARY KEY,
+                update_id INTEGER NOT NULL REFERENCES updates(id) ON DELETE CASCADE,
+                position INTEGER NOT NULL DEFAULT 0,
+                path TEXT NOT NULL,
+                width INTEGER,
+                height INTEGER,
+                caption TEXT
+            );
+            CREATE INDEX IF NOT EXISTS update_media_by_update ON update_media(update_id, position ASC, id ASC);
             CREATE TABLE IF NOT EXISTS replies (
                 id INTEGER PRIMARY KEY,
                 update_id INTEGER NOT NULL REFERENCES updates(id) ON DELETE CASCADE,
@@ -639,25 +685,44 @@ impl Store {
         Ok(true)
     }
 
-    /// Deletes a single update and removes its stored media file if any.
+    /// Deletes a single update and removes all of its stored media files if any.
     pub fn delete_update(&self, id: i64) -> Result<()> {
         let shot: Option<Option<String>> =
             self.conn.query_row("SELECT screenshot FROM updates WHERE id = ?1", params![id], |r| r.get(0)).optional()?;
         let Some(shot) = shot else {
             return Err(Error::NotFound(format!("no update {id}")));
         };
+        let extra_paths: Vec<String> = {
+            let mut stmt = self.conn.prepare("SELECT path FROM update_media WHERE update_id = ?1")?;
+            let rows = stmt.query_map(params![id], |r| r.get(0))?;
+            rows.collect::<rusqlite::Result<_>>()?
+        };
+        let mut to_remove = std::collections::HashSet::new();
         if let Some(rel) = shot {
+            to_remove.insert(rel);
+        }
+        for rel in extra_paths {
+            to_remove.insert(rel);
+        }
+        for rel in to_remove {
             std::fs::remove_file(self.dir.join(rel)).ok();
         }
         self.conn.execute("DELETE FROM updates WHERE id = ?1", params![id])?;
         Ok(())
     }
 
-    /// Deletes a project, its updates and their screenshots.
+    /// Deletes a project, its updates and all their stored screenshots/clips.
     pub fn remove_project(&self, id: i64) -> Result<()> {
         for u in self.feed(id, usize::MAX, None)? {
+            let mut seen = std::collections::HashSet::new();
             if let Some(shot) = u.screenshot {
-                std::fs::remove_file(shot).ok();
+                seen.insert(shot);
+            }
+            for item in u.media {
+                seen.insert(item.path);
+            }
+            for path in seen {
+                std::fs::remove_file(path).ok();
             }
         }
         self.conn.execute("DELETE FROM projects WHERE id = ?1", params![id])?;
@@ -675,49 +740,102 @@ impl Store {
         let commit_sha = update.commit_sha.as_deref().map(str::trim).filter(|s| !s.is_empty()).map(str::to_string);
         let project = self.project(project_id)?.ok_or_else(|| Error::NotFound(format!("no project {project_id}")))?;
         let created_at = now_ms();
-        let stored = match &update.screenshot {
-            Some(src) => Some(self.store_media(&project, src, created_at)?),
-            None => None,
-        };
-        let (media_w, media_h) = stored
-            .as_deref()
-            .map(|rel| self.dir.join(rel))
-            .filter(|p| media_kind_for_path(p) == Some(MediaKind::Image))
-            .and_then(|p| image_dimensions(&p))
-            .map(|(w, h)| (Some(w), Some(h)))
-            .unwrap_or((None, None));
-        let inserted = self.conn.execute(
-            "INSERT INTO updates (project_id, agent, body, screenshot, media_w, media_h, branch, created_at, diff_stat, commit_sha)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
-            params![
-                project_id,
-                agent,
-                body,
-                stored,
-                media_w.map(i64::from),
-                media_h.map(i64::from),
-                branch,
-                created_at,
-                diff_stat,
-                commit_sha
-            ],
-        );
-        if let Err(e) = inserted {
-            if let Some(rel) = &stored {
-                std::fs::remove_file(self.dir.join(rel)).ok();
-            }
-            return Err(e.into());
+
+        // Collect all requested media paths (`screenshot` first if set, followed by `screenshots`).
+        let mut sources: Vec<PathBuf> = Vec::new();
+        if let Some(src) = update.screenshot {
+            sources.push(src);
         }
+        sources.extend(update.screenshots);
+        if sources.len() > MAX_MEDIA_PER_UPDATE {
+            return Err(Error::Invalid(format!("an update can attach at most {MAX_MEDIA_PER_UPDATE} media files (got {})", sources.len())));
+        }
+
+        // Copy and inspect all media files before opening any SQLite write transaction.
+        let mut stored_items: Vec<(String, Option<u32>, Option<u32>)> = Vec::with_capacity(sources.len());
+        for src in &sources {
+            match self.store_media(&project, src, created_at) {
+                Ok(rel) => {
+                    let full = self.dir.join(&rel);
+                    let (w, h) = if media_kind_for_path(&full) == Some(MediaKind::Image) {
+                        image_dimensions(&full).map(|(w, h)| (Some(w), Some(h))).unwrap_or((None, None))
+                    } else {
+                        (None, None)
+                    };
+                    stored_items.push((rel, w, h));
+                }
+                Err(e) => {
+                    for (rel, _, _) in &stored_items {
+                        std::fs::remove_file(self.dir.join(rel)).ok();
+                    }
+                    return Err(e);
+                }
+            }
+        }
+
+        let primary_rel = stored_items.first().map(|(rel, _, _)| rel.clone());
+        let (media_w, media_h) = stored_items.first().map(|(_, w, h)| (*w, *h)).unwrap_or((None, None));
+
+        let tx_res: rusqlite::Result<(i64, Vec<MediaAttachment>)> = (|| {
+            let tx = self.conn.unchecked_transaction()?;
+            tx.execute(
+                "INSERT INTO updates (project_id, agent, body, screenshot, media_w, media_h, branch, created_at, diff_stat, commit_sha)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+                params![
+                    project_id,
+                    agent,
+                    body,
+                    primary_rel,
+                    media_w.map(i64::from),
+                    media_h.map(i64::from),
+                    branch,
+                    created_at,
+                    diff_stat,
+                    commit_sha
+                ],
+            )?;
+            let update_id = tx.last_insert_rowid();
+            let mut media = Vec::with_capacity(stored_items.len());
+            for (pos, (rel, w, h)) in stored_items.iter().enumerate() {
+                tx.execute(
+                    "INSERT INTO update_media (update_id, position, path, width, height, caption)
+                     VALUES (?1, ?2, ?3, ?4, ?5, NULL)",
+                    params![update_id, pos as i64, rel, w.map(i64::from), h.map(i64::from)],
+                )?;
+                media.push(MediaAttachment {
+                    id: tx.last_insert_rowid(),
+                    update_id,
+                    position: pos,
+                    path: self.dir.join(rel),
+                    width: *w,
+                    height: *h,
+                    caption: None,
+                });
+            }
+            tx.commit()?;
+            Ok((update_id, media))
+        })();
+
+        let (update_id, media) = match tx_res {
+            Ok(v) => v,
+            Err(e) => {
+                for (rel, _, _) in &stored_items {
+                    std::fs::remove_file(self.dir.join(rel)).ok();
+                }
+                return Err(e.into());
+            }
+        };
         // Clear any active pulse for this project/agent once the update lands.
         let _ = self.clear_pulse(project_id, agent);
         Ok(FeedUpdate {
-            id: self.conn.last_insert_rowid(),
+            id: update_id,
             project_id,
             agent: agent.to_string(),
             body,
-            screenshot: stored.map(|rel| self.dir.join(rel)),
+            screenshot: primary_rel.map(|rel| self.dir.join(rel)),
             media_w,
             media_h,
+            media,
             branch,
             created_at,
             diff_stat,
@@ -729,7 +847,21 @@ impl Store {
     /// Fetches one update by id.
     pub fn update(&self, id: i64) -> Result<Option<FeedUpdate>> {
         let mut stmt = self.conn.prepare(&format!("SELECT {UPDATE_COLS} FROM updates WHERE id = ?1"))?;
-        Ok(stmt.query_row(params![id], |r| self.update_row(r)).optional()?)
+        let mut found = stmt.query_row(params![id], |r| self.update_row(r)).optional()?;
+        if let Some(u) = found.as_mut() {
+            self.attach_media(std::slice::from_mut(u))?;
+        }
+        Ok(found)
+    }
+
+    /// Fetches one media attachment by its id.
+    pub fn media_item(&self, id: i64) -> Result<Option<MediaAttachment>> {
+        Ok(self
+            .conn
+            .query_row("SELECT id, update_id, position, path, width, height, caption FROM update_media WHERE id = ?1", params![id], |r| {
+                self.media_row(r)
+            })
+            .optional()?)
     }
 
     /// Checks whether a commit SHA has already been recorded for `project_id` (hook deduplication).
@@ -762,7 +894,9 @@ impl Store {
              ORDER BY created_at DESC, id DESC LIMIT ?3"
         ))?;
         let rows = stmt.query_map(params![project_id, before, limit], |r| self.update_row(r))?;
-        Ok(rows.collect::<rusqlite::Result<_>>()?)
+        let mut updates: Vec<FeedUpdate> = rows.collect::<rusqlite::Result<_>>()?;
+        self.attach_media(&mut updates)?;
+        Ok(updates)
     }
 
     /// Every active project's updates in one stream, newest first.
@@ -776,7 +910,9 @@ impl Store {
              ORDER BY u.created_at DESC, u.id DESC LIMIT ?1"
         ))?;
         let rows = stmt.query_map(params![limit], |r| self.update_row(r))?;
-        Ok(rows.collect::<rusqlite::Result<_>>()?)
+        let mut updates: Vec<FeedUpdate> = rows.collect::<rusqlite::Result<_>>()?;
+        self.attach_media(&mut updates)?;
+        Ok(updates)
     }
 
     /// Searches update bodies, agent names, and branches via FTS5 (with SQLite substring
@@ -801,8 +937,9 @@ impl Store {
                  LIMIT ?4"
             ))?;
             let rows = stmt.query_map(params![fts, project_id, inc_arch, limit_i64], |r| self.update_row(r))?;
-            let hits: Vec<FeedUpdate> = rows.collect::<rusqlite::Result<_>>()?;
+            let mut hits: Vec<FeedUpdate> = rows.collect::<rusqlite::Result<_>>()?;
             if !hits.is_empty() {
+                self.attach_media(&mut hits)?;
                 return Ok(hits);
             }
         }
@@ -821,7 +958,9 @@ impl Store {
              LIMIT ?4"
         ))?;
         let rows = stmt.query_map(params![project_id, inc_arch, needle, limit_i64], |r| self.update_row(r))?;
-        Ok(rows.collect::<rusqlite::Result<_>>()?)
+        let mut hits: Vec<FeedUpdate> = rows.collect::<rusqlite::Result<_>>()?;
+        self.attach_media(&mut hits)?;
+        Ok(hits)
     }
 
     /// Adds a reply under an update card (human answer/decision or agent follow-up).
@@ -1077,12 +1216,70 @@ impl Store {
             screenshot: shot.map(|rel| self.dir.join(rel)),
             media_w: media_w.and_then(|v| u32::try_from(v).ok()),
             media_h: media_h.and_then(|v| u32::try_from(v).ok()),
+            media: Vec::new(),
             branch: r.get(7)?,
             created_at: r.get(8)?,
             diff_stat: r.get(9)?,
             commit_sha: r.get(10)?,
             attention_dismissed_at: r.get(11)?,
         })
+    }
+
+    fn media_row(&self, r: &Row<'_>) -> rusqlite::Result<MediaAttachment> {
+        let pos: i64 = r.get(2)?;
+        let rel: String = r.get(3)?;
+        let width: Option<i64> = r.get(4)?;
+        let height: Option<i64> = r.get(5)?;
+        Ok(MediaAttachment {
+            id: r.get(0)?,
+            update_id: r.get(1)?,
+            position: usize::try_from(pos).unwrap_or(0),
+            path: self.dir.join(rel),
+            width: width.and_then(|v| u32::try_from(v).ok()),
+            height: height.and_then(|v| u32::try_from(v).ok()),
+            caption: r.get(6)?,
+        })
+    }
+
+    fn attach_media(&self, updates: &mut [FeedUpdate]) -> Result<()> {
+        const CHUNK: usize = 500;
+        if updates.is_empty() {
+            return Ok(());
+        }
+        let ids: Vec<i64> = updates.iter().map(|u| u.id).collect();
+        let mut by_update: HashMap<i64, Vec<MediaAttachment>> = HashMap::new();
+        for chunk in ids.chunks(CHUNK) {
+            let placeholders = std::iter::repeat_n("?", chunk.len()).collect::<Vec<_>>().join(", ");
+            let sql = format!(
+                "SELECT id, update_id, position, path, width, height, caption
+                 FROM update_media
+                 WHERE update_id IN ({placeholders})
+                 ORDER BY position ASC, id ASC"
+            );
+            let mut stmt = self.conn.prepare(&sql)?;
+            let rows = stmt.query_map(rusqlite::params_from_iter(chunk.iter().copied()), |r| self.media_row(r))?;
+            for row in rows {
+                let item = row?;
+                by_update.entry(item.update_id).or_default().push(item);
+            }
+        }
+        for u in updates.iter_mut() {
+            if let Some(items) = by_update.remove(&u.id) {
+                if let Some(first) = items.first() {
+                    if u.screenshot.is_none() {
+                        u.screenshot = Some(first.path.clone());
+                    }
+                    if u.media_w.is_none() {
+                        u.media_w = first.width;
+                    }
+                    if u.media_h.is_none() {
+                        u.media_h = first.height;
+                    }
+                }
+                u.media = items;
+            }
+        }
+        Ok(())
     }
 
     fn store_media(&self, project: &Project, src: &Path, created_at: i64) -> Result<String> {
@@ -1108,7 +1305,7 @@ impl Store {
         if !matches_media_magic(src, &ext) {
             return Err(Error::Invalid(format!("{} does not look like a valid .{ext} file", src.display())));
         }
-        let rel = format!("media/{}-{}-{:04x}.{ext}", project.slug, created_at, fastrand::u16(..));
+        let rel = format!("media/{}-{}-{:08x}.{ext}", project.slug, created_at, fastrand::u32(..));
         std::fs::copy(src, self.dir.join(&rel))?;
         Ok(rel)
     }
@@ -1205,6 +1402,15 @@ fn migrate_updates(conn: &Connection, dir: &Path) -> Result<()> {
             }
         }
     }
+    // Backfill legacy single-screenshot updates into `update_media` so every update reads uniformly.
+    conn.execute(
+        "INSERT INTO update_media (update_id, position, path, width, height, caption)
+         SELECT u.id, 0, u.screenshot, u.media_w, u.media_h, NULL
+         FROM updates u
+         WHERE u.screenshot IS NOT NULL
+           AND NOT EXISTS (SELECT 1 FROM update_media m WHERE m.update_id = u.id)",
+        [],
+    )?;
     let had_fts: bool =
         conn.query_row("SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'updates_fts')", [], |r| r.get(0))?;
     conn.execute_batch(
@@ -1545,6 +1751,7 @@ mod tests {
                     agent: "Codex".into(),
                     body: "Done: built replies.\n\nWhy: two-way loop.\n\nDecision needed: keep TTL at 120s?".into(),
                     screenshot: Some(clip),
+                    screenshots: Vec::new(),
                     branch: Some("feat/pulse".into()),
                     diff_stat: Some("+80/-12 · 3f".into()),
                     commit_sha: Some("abc1234".into()),
@@ -1761,6 +1968,48 @@ mod tests {
         rids.push(r.id);
         s.mark_replies_read(&rids).unwrap();
         assert!(s.unread_human_replies(Some(p.id)).unwrap().is_empty());
+
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn multi_media_carousel_stores_orders_caps_and_cleans_up() {
+        let (s, dir) = temp_store("carousel");
+        let p = s.project_named("Gallery", None).unwrap();
+        let make_png = |name: &str, w: u32, h: u32| -> PathBuf {
+            let path = dir.join(name);
+            let mut bytes = Vec::from(&b"\x89PNG\r\n\x1a\n\x00\x00\x00\x0dIHDR"[..]);
+            bytes.extend_from_slice(&w.to_be_bytes());
+            bytes.extend_from_slice(&h.to_be_bytes());
+            bytes.extend_from_slice(&[8, 6, 0, 0, 0]);
+            std::fs::write(&path, bytes).unwrap();
+            path
+        };
+        let p1 = make_png("a.png", 640, 400);
+        let p2 = make_png("b.png", 800, 600);
+        let p3 = make_png("c.png", 1200, 900);
+
+        let posted = s
+            .post(p.id, NewUpdate { screenshot: Some(p1.clone()), screenshots: vec![p2.clone(), p3.clone()], ..note("Done: 3 screens.") })
+            .unwrap();
+        assert_eq!(posted.media.len(), 3);
+        assert_eq!(posted.screenshot.as_ref(), Some(&posted.media[0].path));
+        assert_eq!((posted.media_w, posted.media_h), (Some(640), Some(400)));
+        assert_eq!((posted.media[1].width, posted.media[1].height), (Some(800), Some(600)));
+        assert_eq!((posted.media[2].width, posted.media[2].height), (Some(1200), Some(900)));
+
+        let reloaded = s.feed(p.id, 10, None).unwrap();
+        assert_eq!(reloaded[0].media.len(), 3);
+        let stored_paths: Vec<PathBuf> = reloaded[0].media.iter().map(|m| m.path.clone()).collect();
+        assert!(stored_paths.iter().all(|path| path.exists()));
+
+        // Exceeding MAX_MEDIA_PER_UPDATE is rejected cleanly.
+        let too_many: Vec<PathBuf> = (0..=MAX_MEDIA_PER_UPDATE).map(|_| p1.clone()).collect();
+        assert!(s.post(p.id, NewUpdate { screenshots: too_many, ..note("too many") }).is_err());
+
+        // Deleting the update removes all stored copies.
+        s.delete_update(posted.id).unwrap();
+        assert!(stored_paths.iter().all(|path| !path.exists()));
 
         std::fs::remove_dir_all(dir).ok();
     }

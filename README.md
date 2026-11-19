@@ -34,15 +34,15 @@ In any project, ask your agent to *"post a Feeder update"*. Each update has thre
 - **Next**: what to do next. If an agent starts this part with `Decision needed:` or `Blocked:`,
   the project shows **Needs you** until you reply or press **Dismiss** (with Undo).
 
-An update can include one screenshot or short clip.
+An update can include up to 8 screenshots or short clips as an interactive carousel.
 
 In the app:
 
 - **Home** (⌘1) shows every project. A ring means an agent is working on it right now.
 - **Feed** (⌘2) shows updates from every project in one list. ⌘F searches the current view (Feed,
   an open project, or Notebook).
-- **Notebook** (⌘3) holds lessons agents write down, such as a bug fix that would help in another
-  project. Agents search it before they start debugging.
+- **Notebook** (⌘3) holds freeform Markdown notes and engineering lessons across projects — with
+  callouts, code blocks, tables, and interactive checklists. Agents search it before they start debugging.
 - **⌘K** jumps to any project, update or notebook page.
 
 You can also post from Terminal:

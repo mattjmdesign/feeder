@@ -179,18 +179,22 @@ fn format_duration(secs: f64) -> String {
     format!("{mins}:{rem:02}")
 }
 
-/// Interactive media preview: zoom/pan images, Before/After swipe compare, and video playback.
+/// Interactive media preview: zoom/pan images, Before/After swipe compare, carousel filmstrip, and video playback.
 pub fn lightbox(s: &State, inset: f32, p: &Palette, k: &Kit, reduced_motion: bool) -> Option<El> {
     let id = s.lightbox?;
-    let update = s.find_update(id);
-    let media_path = update.and_then(|u| u.screenshot.clone());
-    let caption = update
-        .map(|u| {
+    let found = s.find_media(id);
+    let media_path = found.as_ref().and_then(|(_, idx, slides)| slides.get(*idx).map(|m| m.path.clone()));
+    let carousel_slides = found.as_ref().map(|(_, _, slides)| slides.clone()).unwrap_or_default();
+    let caption = found
+        .as_ref()
+        .map(|(u, idx, slides)| {
             let proj = s.summary(u.project_id).map(|sum| sum.project.name.as_str()).unwrap_or("Project");
             let branch = u.branch.as_deref().map(|b| format!(" · {b}")).unwrap_or_default();
-            format!("{proj} · {} · {}{branch}", u.agent, ago(u.created_at, s.now))
+            let slide = if slides.len() > 1 { format!(" · Slide {} of {}", idx + 1, slides.len()) } else { String::new() };
+            format!("{proj} · {} · {}{branch}{slide}", u.agent, ago(u.created_at, s.now))
         })
         .unwrap_or_default();
+    let strip = lightbox_filmstrip(s, p, id, &carousel_slides);
 
     let ids = s.lightbox_ids();
     let pos = ids.iter().position(|&x| x == id).unwrap_or(0);
@@ -284,18 +288,21 @@ pub fn lightbox(s: &State, inset: f32, p: &Palette, k: &Kit, reduced_motion: boo
                 .on_press(|s: &mut State| s.close_lightbox()),
         );
 
-        return Some(
-            el().key("lightbox-scrim")
-                .absolute(0.0, 0.0)
-                .w_full()
-                .h_full()
-                .fill(backdrop)
-                .center()
-                .transition(Transition::opacity())
-                .on_press(|s: &mut State| s.close_lightbox())
-                .child(col().gap(10.0).items_center().on_press(|_: &mut State| {}).child(vid_el).child(controls))
-                .child(top),
-        );
+        let mut scrim = el()
+            .key("lightbox-scrim")
+            .absolute(0.0, 0.0)
+            .w_full()
+            .h_full()
+            .fill(backdrop)
+            .center()
+            .transition(Transition::opacity())
+            .on_press(|s: &mut State| s.close_lightbox())
+            .child(col().gap(10.0).items_center().on_press(|_: &mut State| {}).child(vid_el).child(controls))
+            .child(top);
+        if let Some(strip) = strip {
+            scrim = scrim.child(strip);
+        }
+        return Some(scrim);
     }
 
     let img = s.shots.get(&id)?;
@@ -422,16 +429,64 @@ pub fn lightbox(s: &State, inset: f32, p: &Palette, k: &Kit, reduced_motion: boo
         .on_close(|s: &mut State, _| s.close_lightbox())
         .build(&s.lightbox_zoom, k, s.window_size, reduced_motion);
 
-    Some(
-        el().key("lightbox-scrim")
-            .absolute(0.0, 0.0)
-            .w_full()
-            .h_full()
-            .fill(backdrop)
-            .transition(Transition::opacity())
-            .child(preview)
-            .child(top),
-    )
+    let mut scrim = el()
+        .key("lightbox-scrim")
+        .absolute(0.0, 0.0)
+        .w_full()
+        .h_full()
+        .fill(backdrop)
+        .transition(Transition::opacity())
+        .child(preview)
+        .child(top);
+    if let Some(strip) = strip {
+        scrim = scrim.child(strip);
+    }
+    Some(scrim)
+}
+
+fn lightbox_filmstrip(s: &State, p: &Palette, active_id: i64, slides: &[crate::MediaSlide]) -> Option<El> {
+    if slides.len() <= 1 {
+        return None;
+    }
+    let mut strip = row()
+        .key("lightbox-filmstrip")
+        .px(8.0)
+        .py(6.0)
+        .gap(6.0)
+        .center_y()
+        .radius(12.0)
+        .fill(p.card.alpha(0.92))
+        .border(1.0, p.hairline)
+        .on_press(|_: &mut State| {});
+    for (idx, slide) in slides.iter().enumerate() {
+        let mid = slide.id;
+        let active = mid == active_id;
+        let border = if active { p.text } else { p.hairline };
+        let thumb_w = 54.0;
+        let thumb_h = 36.0;
+        let inner = if let Some(img) = s.shots.get(&mid) {
+            el().w(thumb_w).h(thumb_h).pixels_fit(img.pixels(), SurfaceFit::Fill)
+        } else if s.videos.contains_key(&mid) {
+            el().w(thumb_w).h(thumb_h).fill(p.hover).center().child(text("▶").font(style::META).color(p.text_2))
+        } else {
+            el().w(thumb_w).h(thumb_h).fill(p.hover).center().child(text(format!("{}", idx + 1)).font(style::META).color(p.text_3))
+        };
+        strip = strip.child(
+            el().key(format!("lb-thumb-{mid}"))
+                .role("button")
+                .label(format!("Slide {}", idx + 1))
+                .focusable(true)
+                .w(thumb_w)
+                .h(thumb_h)
+                .radius(6.0)
+                .border(if active { 2.0 } else { 1.0 }, border)
+                .opacity(if active { 1.0 } else { 0.68 })
+                .cursor(Cursor::Pointer)
+                .on_press(move |s: &mut State| s.select_lightbox(mid))
+                .child(inner),
+        );
+    }
+    Some(row().key("lightbox-filmstrip-wrap").pin(Some(16.0), None, Some(16.0), Some(18.0)).center().child(strip))
 }
 
 #[expect(clippy::too_many_arguments, reason = "one call site; each argument is a separate piece of the lightbox bar")]
@@ -575,11 +630,11 @@ pub fn palette_items(s: &State) -> Vec<PaletteItem> {
         items.push(PaletteItem { action, title: title.into(), subtitle: subtitle.into(), badge: None, project_id: None, unseen: false });
     }
     if !q.is_empty() {
-        // Notebook pages whose title, tags or rule mention the words, so a lesson is one ⌘K away.
+        // Notebook pages whose title, topic, tags, or body mention the query, so any note is one ⌘K away.
         let pages = s.notebook.pages.iter().filter(|pg| {
             !pg.is_archived()
                 && (fold.contains(&pg.title, q)
-                    || fold.contains(&pg.rule, q)
+                    || fold.contains(&pg.body, q)
                     || fold.contains(&pg.topic, q)
                     || fold.contains(&feeder_core::topic_label(&pg.topic), q)
                     || pg.tags.iter().any(|t| fold.contains(t, q)))
@@ -588,8 +643,8 @@ pub fn palette_items(s: &State) -> Vec<PaletteItem> {
             items.push(PaletteItem {
                 action: PaletteAction::OpenPage(pg.id),
                 title: pg.title.clone(),
-                subtitle: feed::first_line(&pg.rule, 60),
-                badge: Some(pg.kind.label().into()),
+                subtitle: pg.excerpt(68),
+                badge: Some(feeder_core::topic_label(&pg.topic)),
                 project_id: pg.project_id,
                 unseen: false,
             });
