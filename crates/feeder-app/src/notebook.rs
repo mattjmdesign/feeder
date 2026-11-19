@@ -500,11 +500,11 @@ pub fn view(s: &State, p: &Palette, k: &Kit, inset: f32, reduced_motion: bool, l
         .sidebar(&nb.pane, |s: &mut State| &mut s.notebook.pane, sidebar_view(s, p, k))
         .toolbar(toolbar)
         .titlebar_inset(inset)
-        .frame_inset(8.0)
+        .frame_inset(style::PANE_INSET)
         .sidebar_toggle(SidebarToggle::new().in_header().past_lights(10.0))
         .sidebar_peek(SidebarPeek::new())
         .reduced_motion(reduced_motion)
-        .build(k)
+        .build(&style::pane_kit(k))
 }
 
 /// A small button's inline padding, so a plain crumb's label sits where a pressable one's does.
@@ -584,7 +584,7 @@ fn sidebar_view(s: &State, p: &Palette, k: &Kit) -> El {
     }
     let search = search_input.build(k).key("nb-search");
 
-    let new_page = Button::new("New page")
+    let new_page = Button::new("New Page")
         .icon(&PLUS_ICON)
         .variant(ButtonVariant::Outline)
         .control_size(ControlSize::Regular)
@@ -674,21 +674,13 @@ fn index_view(s: &State, p: &Palette, k: &Kit) -> El {
         return col().w_full().max_w(INDEX_MAX_W).child(empty_notebook(p, k));
     }
 
-    let (heading, blurb) = match &nb.shelf {
-        Shelf::All => ("Notebook".to_string(), Some("Engineering lessons across projects: fixes, pitfalls, patterns, and decisions.")),
-        Shelf::Topic(slug) => (topic_label(slug).to_string(), None),
-        Shelf::Archived => ("Archived".to_string(), Some("Outdated notes kept for reference and left out of search by default.")),
+    let heading = match &nb.shelf {
+        Shelf::All => "Notebook".to_string(),
+        Shelf::Topic(slug) => topic_label(slug).to_string(),
+        Shelf::Archived => "Archived".to_string(),
     };
 
     let pages = nb.visible();
-    let query = nb.query.text.trim();
-    let count_text = if query.is_empty() {
-        if pages.len() == 1 { "1 page".to_string() } else { format!("{} pages", pages.len()) }
-    } else if pages.len() == 1 {
-        format!("1 match for \"{query}\"")
-    } else {
-        format!("{} matches for \"{query}\"", pages.len())
-    };
 
     let mut kind_labels = vec!["All"];
     for kind in Kind::ALL {
@@ -706,18 +698,10 @@ fn index_view(s: &State, p: &Palette, k: &Kit) -> El {
         })
         .build(k);
 
-    let title_row = row()
-        .w_full()
-        .gap(10.0)
-        .center_y()
-        .child(text(heading).font(style::DISPLAY).color(p.text))
-        .child(Badge::new(count_text).variant(BadgeVariant::Subtle).standard().build(k));
-
-    let mut header = col().key("nb-header").w_full().pb(16.0).gap(8.0).child(title_row);
-    if let Some(blurb) = blurb {
-        header = header.child(text(blurb).font(style::BODY).color(p.text_2).wrap());
-    }
-    let header = header.child(kind_control.mt(12.0));
+    // The heading and the filter are the whole header: the list below already shows how many
+    // pages there are, and a tagline under a heading only restates it.
+    let header =
+        col().key("nb-header").w_full().pb(16.0).gap(20.0).child(text(heading).font(style::DISPLAY).color(p.text)).child(kind_control);
 
     let mut list = col().key("nb-index").w_full();
     if pages.is_empty() {
@@ -864,7 +848,7 @@ fn page_view(s: &State, page: &Page, p: &Palette, k: &Kit, layer: &mut Vec<El>) 
             s.notebook.sync_tree_selection();
         }))
         .separator()
-        .item(MenuItem::new("Delete page…").danger(true).on_select(move |s: &mut State| {
+        .item(MenuItem::new("Delete Page…").danger(true).on_select(move |s: &mut State| {
             s.notebook.action_menu_open = false;
             s.notebook.delete_confirm = Some(id);
         }))
@@ -913,7 +897,7 @@ fn page_view(s: &State, page: &Page, p: &Palette, k: &Kit, layer: &mut Vec<El>) 
                     .build(k),
             )
             .child(
-                Button::new("Delete page")
+                Button::new("Delete Page")
                     .variant(ButtonVariant::Danger)
                     .control_size(ControlSize::Regular)
                     .on_press(move |s: &mut State| {
@@ -1113,7 +1097,7 @@ fn related_pages<'a>(nb: &'a Notebook, page: &Page) -> Vec<&'a Page> {
 fn editor_view(nb: &Notebook, ed: &Editor, p: &Palette, k: &Kit, layer: &mut Vec<El>) -> El {
     let ink = kind_color(ed.kind, p);
     let heading = if ed.id.is_some() { "Revise page" } else { "New page" };
-    let save = Button::new(if ed.id.is_some() { "Save revision" } else { "Add page" })
+    let save = Button::new(if ed.id.is_some() { "Save Revision" } else { "Add Page" })
         .variant(ButtonVariant::Contrast)
         .control_size(ControlSize::Regular)
         .on_press(|s: &mut State| s.notebook_save())
@@ -1381,7 +1365,7 @@ fn editor_view(nb: &Notebook, ed: &Editor, p: &Palette, k: &Kit, layer: &mut Vec
                     .build(k),
             )
             .child(
-                Button::new(if ed.id.is_some() { "Save revision" } else { "Add page" })
+                Button::new(if ed.id.is_some() { "Save Revision" } else { "Add Page" })
                     .variant(ButtonVariant::Contrast)
                     .control_size(ControlSize::Regular)
                     .on_press(|s: &mut State| s.notebook_save())
@@ -1429,7 +1413,7 @@ fn empty_notebook(p: &Palette, k: &Kit) -> El {
                 .align(rune::Align::Center),
         )
         .child(
-            Button::new("Write the first page")
+            Button::new("Write the First Page")
                 .icon(&PLUS_ICON)
                 .variant(ButtonVariant::Contrast)
                 .control_size(ControlSize::Large)

@@ -1,7 +1,7 @@
 //! One project's feed: the orb & brief up top, then every update newest first along a
 //! timeline (or contact-sheet Gallery), plus inline edit, two-way replies, and video playback.
 
-use feeder_core::{AttentionKind, FeedUpdate, Orb, ProjectSummary, ago, build_resume_prompt, day_key, day_label, now_ms, parse_attention};
+use feeder_core::{AttentionKind, FeedUpdate, Orb, ProjectSummary, ago, day_key, day_label, now_ms, parse_attention};
 use rune::tok::motion;
 use rune::{
     Cursor, DragItem, El, Key, KeyEvent, ScrollSpec, Spring, SurfaceFit, Transition, Tx, auto_grow, col, el, row, text, text_input,
@@ -37,45 +37,24 @@ pub fn bar_chrome(s: &State, id: i64, p: &Palette) -> (El, Option<El>) {
         return (back, None);
     };
     let archived = summary.project.archived;
-    let pinned = summary.project.pinned;
     let project_todos = s.project_todos(id);
     let open_todo_count = if s.todos_for == Some(id) {
         project_todos.iter().filter(|t| !t.done).count()
     } else {
         usize::try_from(summary.open_todos.max(0)).unwrap_or(0)
     };
-    let todo_label = if open_todo_count > 0 { format!("To-do · {open_todo_count}") } else { "To-do".to_string() };
+    let todo_label = if open_todo_count > 0 { format!("To-Do · {open_todo_count}") } else { "To-Do".to_string() };
 
+    // Show in Finder and Pin are on the project's orb menu on Home, so the header doesn't repeat
+    // them; Copy Context covers what the old resume prompt did.
     let mut actions = row().gap(4.0).center_y();
-    if let Some(path) = summary.project.path.clone() {
-        actions = actions.child(
-            chrome::bar_button("open-folder", "Finder", p)
-                .label("Show project folder in Finder")
-                .on_press(move |_: &mut State| chrome::reveal_path(&path)),
-        );
-    }
     actions = actions.child(
         chrome::bar_button("project-todo-btn", &todo_label, p)
             .label("Open project to-do list")
             .on_press_tx(move |s: &mut State, tx: &mut Tx| s.open_todo_editor(id, tx)),
     );
-    if (s.feed_for == Some(id) && !s.feed.is_empty()) || summary.project.brief.is_some() || !project_todos.is_empty() {
-        let latest = if s.feed_for == Some(id) { s.feed.first() } else { None };
-        let latest_replies = latest.and_then(|u| s.replies.get(&u.id)).map(Vec::as_slice).unwrap_or(&[]);
-        let prompt = build_resume_prompt(&summary.project, latest, latest_replies, project_todos, s.now);
-        let prompt_label = if s.prompt_copied_recently() { "Copied" } else { "Copy prompt" };
-        actions = actions.child(chrome::bar_button("copy-prompt", prompt_label, p).on_press_tx(move |s: &mut State, tx: &mut Tx| {
-            tx.copy(prompt.clone());
-            s.prompt_copied_at = Some(now_ms());
-            s.push_toast(
-                "copy-prompt",
-                crate::ToastItem { title: "Copied agent resume prompt".into(), description: None, kind: crate::ToastKind::Info },
-                Some(2.5),
-            );
-        }));
-    }
     if s.feed_for == Some(id) && !s.feed.is_empty() {
-        let context_label = if s.context_copied_recently() { "Copied" } else { "Copy context" };
+        let context_label = if s.context_copied_recently() { "Copied" } else { "Copy Context" };
         let payload = handoff_markdown(summary, &s.feed, s.now);
         actions = actions.child(chrome::bar_button("copy-context", context_label, p).on_press_tx(move |s: &mut State, tx: &mut Tx| {
             tx.copy(payload.clone());
@@ -83,10 +62,6 @@ pub fn bar_chrome(s: &State, id: i64, p: &Palette) -> (El, Option<El>) {
         }));
     }
     actions = actions
-        .child(
-            chrome::bar_button("pin-button", if pinned { "Unpin" } else { "Pin" }, p)
-                .on_press(move |s: &mut State| s.set_pinned(id, !pinned)),
-        )
         .child(
             chrome::bar_button("rename-button", if s.editing.is_some() { "Done" } else { "Rename" }, p)
                 .on_press_tx(|s: &mut State, tx: &mut Tx| if s.editing.is_some() { s.commit_rename() } else { s.start_rename(tx) }),
@@ -193,7 +168,7 @@ pub fn view(s: &State, id: i64, p: &Palette, k: &Kit, reduced_motion: bool) -> E
             }
             if s.branch_filter.is_none() && s.feed.len() >= s.limit && (s.feed.len() as i64) < summary.updates {
                 timeline = timeline.child(
-                    chrome::bar_button("older", "Show older", p)
+                    chrome::bar_button("older", "Show Older", p)
                         .self_center()
                         .mt(12.0)
                         .border(1.0, p.hairline)
@@ -222,23 +197,14 @@ fn intro_extras(s: &State, p: &Palette, k: &Kit, summary: &ProjectSummary, mut i
     let todos = s.project_todos(id);
     let show_todo = s.todo_open == Some(id) || !todos.is_empty();
 
+    // The header's To-Do button adds to-dos, so this row only offers the brief.
     if !has_brief && !show_todo {
         return intro.child(
-            row()
-                .key("intro-actions")
-                .mt(4.0)
-                .gap(8.0)
-                .center_y()
-                .child(
-                    chrome::bar_button("add-brief", "+ Add project brief", p)
-                        .border(1.0, p.hairline)
-                        .on_press_tx(move |s: &mut State, tx: &mut Tx| s.start_brief_edit(id, tx)),
-                )
-                .child(
-                    chrome::bar_button("add-todo", "+ To-do", p)
-                        .border(1.0, p.hairline)
-                        .on_press_tx(move |s: &mut State, tx: &mut Tx| s.open_todo_editor(id, tx)),
-                ),
+            row().key("intro-actions").mt(4.0).center_y().child(
+                chrome::bar_button("add-brief", "+ Add Project Brief", p)
+                    .border(1.0, p.hairline)
+                    .on_press_tx(move |s: &mut State, tx: &mut Tx| s.start_brief_edit(id, tx)),
+            ),
         );
     }
 
@@ -273,7 +239,7 @@ fn todo_card(s: &State, p: &Palette, k: &Kit, id: i64, todos: &[feeder_core::Tod
                 chrome::bar_button("todo-clear-cancel", "Cancel", p).h(22.0).px(8.0).on_press(|s: &mut State| s.todo_clear_confirm = None),
             )
             .child(
-                chrome::bar_button("todo-clear-confirm", "Clear all", p)
+                chrome::bar_button("todo-clear-confirm", "Clear All", p)
                     .h(22.0)
                     .px(8.0)
                     .border(1.0, p.amber.alpha(0.5))
@@ -282,7 +248,7 @@ fn todo_card(s: &State, p: &Palette, k: &Kit, id: i64, todos: &[feeder_core::Tod
     } else {
         if done_count > 0 {
             header = header.child(
-                chrome::bar_button("todo-clear-done", "Clear done", p)
+                chrome::bar_button("todo-clear-done", "Clear Done", p)
                     .h(22.0)
                     .px(8.0)
                     .on_press(move |s: &mut State| s.clear_completed_todos(id)),
@@ -290,7 +256,7 @@ fn todo_card(s: &State, p: &Palette, k: &Kit, id: i64, todos: &[feeder_core::Tod
         }
         if !todos.is_empty() {
             header = header.child(
-                chrome::bar_button("todo-clear-all", "Clear all", p)
+                chrome::bar_button("todo-clear-all", "Clear All", p)
                     .h(22.0)
                     .px(8.0)
                     .on_press(move |s: &mut State| s.todo_clear_confirm = Some(id)),
@@ -461,7 +427,7 @@ fn brief_card(s: &State, p: &Palette, k: &Kit, summary: &ProjectSummary) -> El {
                     )
                     .child(rune::spacer())
                     .child(Button::new("Cancel").variant(ButtonVariant::Ghost).on_press(|s: &mut State| s.brief_editing = None).build(k))
-                    .child(Button::new("Save brief").variant(ButtonVariant::Submit).on_press(|s: &mut State| s.save_brief()).build(k)),
+                    .child(Button::new("Save Brief").variant(ButtonVariant::Submit).on_press(|s: &mut State| s.save_brief()).build(k)),
             );
     }
 
@@ -490,7 +456,7 @@ fn brief_card(s: &State, p: &Palette, k: &Kit, summary: &ProjectSummary) -> El {
                     .child(text("Edit brief").font(style::META).color(p.text_3)),
             )
     } else {
-        chrome::bar_button("add-brief", "+ Add project brief", p)
+        chrome::bar_button("add-brief", "+ Add Project Brief", p)
             .mt(4.0)
             .border(1.0, p.hairline)
             .on_press_tx(move |s: &mut State, tx: &mut Tx| s.start_brief_edit(id, tx))

@@ -181,7 +181,7 @@ fn filter_row(s: &State, p: &Palette) -> El {
     }
     if unseen > 0 {
         row_el = row_el.child(
-            chrome::bar_button("timeline-mark-read", "Mark read", p).border(1.0, p.hairline).on_press(|s: &mut State| s.mark_all_seen()),
+            chrome::bar_button("timeline-mark-read", "Mark Read", p).border(1.0, p.hairline).on_press(|s: &mut State| s.mark_all_seen()),
         );
     }
     row_el

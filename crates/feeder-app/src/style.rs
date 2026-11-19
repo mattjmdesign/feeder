@@ -67,6 +67,19 @@ pub fn kit(p: &Palette) -> Kit {
     k
 }
 
+/// How far the Notebook's main pane sits inside the window's edge.
+pub const PANE_INSET: f32 = 8.0;
+
+/// The kit for a pane inset [`PANE_INSET`] from the window, with its corner radius set so the
+/// pane's bottom corners run parallel to the window's. macOS draws a 16 pt *continuous* window
+/// corner, which starts curving earlier than a circular arc; the arithmetic 16 − 8 = 8 pt looks
+/// pinched next to it, so the pane takes a slightly wider circular radius.
+pub fn pane_kit(k: &Kit) -> Kit {
+    let mut k = k.clone();
+    k.radius.lg = 12.0;
+    k
+}
+
 // Type scale. One family, the macOS system font (SF Pro, behind the sans slot in `main`), five
 // sizes (24, 16, 14, 13, 12) and nothing heavier than medium (500): hierarchy comes from size
 // and colour, not weight. Each role fixes size, line height and weight together so a role is

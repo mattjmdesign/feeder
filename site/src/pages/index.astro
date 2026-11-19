@@ -60,7 +60,7 @@ const ballStyle = `background:${orbBackground(hero)}`;
           </a>
         </div>
         <p class="meta">
-          <span id="version">Apple Silicon</span> · macOS 13 or later · MIT license
+          <span id="version">For Apple silicon Macs (M1 or later, arm64)</span> · macOS 13 or later · Free and open source
         </p>
       </section>
 
@@ -316,7 +316,7 @@ const ballStyle = `background:${orbBackground(hero)}`;
       .then((res) => (res.ok ? res.json() : null))
       .then((release: { tag_name?: string } | null) => {
         if (release?.tag_name) {
-          versionEl.textContent = `v${release.tag_name.replace(/^v/, '')} · Apple Silicon`;
+          versionEl.textContent = `v${release.tag_name.replace(/^v/, '')} for Apple silicon Macs (M1 or later, arm64)`;
         }
       })
       .catch(() => {});

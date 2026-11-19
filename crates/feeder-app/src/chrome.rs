@@ -134,13 +134,13 @@ pub fn menu(s: &State, p: &Palette, k: &Kit, layer: &mut Vec<El>) -> El {
             s.settings_open = true;
         }));
     if unseen_count > 0 {
-        m = m.item(MenuItem::new(format!("Mark all read ({unseen_count})")).on_select(|s: &mut State| {
+        m = m.item(MenuItem::new(format!("Mark All Read ({unseen_count})")).on_select(|s: &mut State| {
             s.menu_open = false;
             s.mark_all_seen();
         }));
     }
     if archived_count > 0 {
-        let label = if s.show_archived { "Hide archived projects".to_string() } else { format!("Show archived ({archived_count})") };
+        let label = if s.show_archived { "Hide Archived Projects".to_string() } else { format!("Show Archived ({archived_count})") };
         m = m.item(MenuItem::new(label).on_select(|s: &mut State| {
             s.menu_open = false;
             s.open = None;
@@ -148,11 +148,11 @@ pub fn menu(s: &State, p: &Palette, k: &Kit, layer: &mut Vec<El>) -> El {
             s.show_archived = !s.show_archived;
         }));
     }
-    m.item(MenuItem::new("Connect agents…").on_select_tx(|s: &mut State, tx: &mut Tx| {
+    m.item(MenuItem::new("Connect Agents…").on_select_tx(|s: &mut State, tx: &mut Tx| {
         s.menu_open = false;
         open_agent_setup(s, tx);
     }))
-    .item(MenuItem::new("Show data in Finder").on_select(|s: &mut State| {
+    .item(MenuItem::new("Show Data in Finder").on_select(|s: &mut State| {
         s.menu_open = false;
         reveal_path(&feeder_core::data_dir());
     }))
@@ -259,7 +259,7 @@ pub fn lightbox(s: &State, inset: f32, p: &Palette, k: &Kit, reduced_motion: boo
         let mut top = lightbox_top_chrome(s, inset, p, &caption, pos, total, false, None);
         if let Some(path) = media_path {
             top = top.child(
-                bar_button("lightbox-open", "Open file", p)
+                bar_button("lightbox-open", "Open File", p)
                     .fill(p.card)
                     .border(1.0, p.hairline)
                     .on_press(move |_: &mut State| reveal_path(&path)),
@@ -297,7 +297,7 @@ pub fn lightbox(s: &State, inset: f32, p: &Palette, k: &Kit, reduced_motion: boo
 
     let mut top = lightbox_top_chrome(s, inset, p, &caption, pos, total, can_compare, compare_target);
     if let Some(path) = media_path {
-        let copy_label = if s.image_copied_recently() { "Copied" } else { "Copy image" };
+        let copy_label = if s.image_copied_recently() { "Copied" } else { "Copy Image" };
         top = top.child(
             bar_button("lightbox-copy-image", copy_label, p)
                 .fill(p.card)
@@ -449,7 +449,7 @@ fn lightbox_top_chrome(
     if can_compare {
         let active = compare_target.is_some();
         top = top.child(
-            bar_button("lightbox-compare", if active { "Exit compare" } else { "Compare" }, p)
+            bar_button("lightbox-compare", if active { "Exit Compare" } else { "Compare" }, p)
                 .fill(p.card)
                 .border(1.0, if active { p.text_2 } else { p.hairline })
                 .label("Compare before and after screenshots")
@@ -543,10 +543,10 @@ pub fn palette_items(s: &State) -> Vec<PaletteItem> {
         (PaletteAction::GoHome, "Go to Home", "Project orb shelf · ⌘1"),
         (PaletteAction::GoFeed, "Go to Feed", "All active updates · ⌘2"),
         (PaletteAction::GoNotebook, "Go to Notebook", "Lessons learned across projects · ⌘3"),
-        (PaletteAction::MarkAllRead, "Mark all read", "Clear unseen project dots"),
+        (PaletteAction::MarkAllRead, "Mark All Read", "Clear unseen project dots"),
         (
             PaletteAction::ToggleArchived,
-            if s.show_archived { "Hide archived projects" } else { "Show archived projects" },
+            if s.show_archived { "Hide Archived Projects" } else { "Show Archived Projects" },
             "Toggle archived shelf on Home",
         ),
         (PaletteAction::OpenSettings, "Open Settings", "Appearance, order, agent setup · ⌘,"),
@@ -1000,7 +1000,7 @@ pub fn settings(s: &State, p: &Palette, k: &Kit) -> Option<El> {
 }
 
 /// Opens Settings scrolled to Agents, for the places that are about connecting a tool: the empty
-/// Home and "Connect agents…". Agents sits below Appearance and Projects, out of first view.
+/// Home and "Connect Agents…". Agents sits below Appearance and Projects, out of first view.
 pub fn open_agent_setup(s: &mut State, tx: &mut Tx) {
     s.settings_open = true;
     tx.scroll_key_to(AGENTS_SECTION_KEY, 0.0);
@@ -1022,7 +1022,7 @@ fn agents_section(s: &State, p: &Palette, k: &Kit) -> El {
         }
         Some(found) => rows.extend(found.iter().map(|(tool, link)| agent_row(s, p, k, *tool, link))),
     }
-    let copy_label = if s.copied_recently() { "Copied" } else { "Copy config" };
+    let copy_label = if s.copied_recently() { "Copied" } else { "Copy Config" };
     rows.push(
         row()
             .w_full()
@@ -1111,7 +1111,7 @@ fn uninstall_section(s: &State, p: &Palette, k: &Kit) -> El {
         rows.push(note("Feeder is out of your tools. Quit Feeder and move it to the Trash. To delete your projects and notebook too, delete the data folder above."));
     } else {
         rows.push(
-            Button::new("Remove Feeder from all tools")
+            Button::new("Remove Feeder from All Tools")
                 .variant(ButtonVariant::Outline)
                 .control_size(ControlSize::Small)
                 .on_press(|s: &mut State| {

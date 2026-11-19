@@ -143,7 +143,7 @@ fn shelf(s: &State, p: &Palette, k: &Kit, reduced_motion: bool, layer: &mut Vec<
         if unseen > 0 {
             has_footer_pills = true;
             footer_pills = footer_pills.child(
-                chrome::bar_button("mark-all-read", &format!("Mark all read ({unseen})"), p)
+                chrome::bar_button("mark-all-read", &format!("Mark All Read ({unseen})"), p)
                     .border(1.0, p.hairline)
                     .on_press(|s: &mut State| s.mark_all_seen()),
             );
@@ -305,9 +305,9 @@ fn tile(s: &State, summary: &ProjectSummary, p: &Palette, k: &Kit, reduced_motio
     let mut ctx =
         context_menu(format!("orb-ctx-{id}"), card, point).item(MenuItem::new("Open").on_select(move |s: &mut State| s.open_project(id)));
     if unseen {
-        ctx = ctx.item(MenuItem::new("Mark as read").on_select(move |s: &mut State| s.mark_seen(id)));
+        ctx = ctx.item(MenuItem::new("Mark as Read").on_select(move |s: &mut State| s.mark_seen(id)));
     }
-    ctx = ctx.item(MenuItem::new(if pinned { "Unpin" } else { "Pin to front" }).on_select(move |s: &mut State| s.set_pinned(id, !pinned)));
+    ctx = ctx.item(MenuItem::new(if pinned { "Unpin" } else { "Pin to Front" }).on_select(move |s: &mut State| s.set_pinned(id, !pinned)));
     if let Some(path) = summary.project.path.clone() {
         ctx = ctx.item(MenuItem::new("Show in Finder").on_select(move |s: &mut State| {
             s.orb_menu = None;
@@ -340,7 +340,7 @@ fn all_archived(p: &Palette, size: f32, count: usize) -> El {
                 .max_w(380.0),
         )
         .child(
-            chrome::bar_button("show-archived", &format!("Show archived ({count})"), p)
+            chrome::bar_button("show-archived", &format!("Show Archived ({count})"), p)
                 .border(1.0, p.hairline)
                 .on_press(|s: &mut State| s.show_archived = true),
         )

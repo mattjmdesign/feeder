@@ -153,7 +153,7 @@ pub fn view(s: &State, p: &style::Palette, k: &Kit, layer: &mut Vec<El>) {
         && matches!(update.phase, Phase::Downloading | Phase::Preparing)
     {
         let kit = accent.clone();
-        Button::new("Feeder updates")
+        Button::new("Feeder Updates")
             .control_size(ControlSize::Large)
             .help(format!("{status} {}%", (progress * 100.0).round()))
             .label_with(move |_, _| ProgressCircle::new(progress).build(&kit).a11y_hidden())
@@ -166,7 +166,7 @@ pub fn view(s: &State, p: &style::Palette, k: &Kit, layer: &mut Vec<El>) {
         IconButton::new(icon)
             .variant(IconButtonVariant::Neutral)
             .control_size(ControlSize::Large)
-            .label("Feeder updates")
+            .label("Feeder Updates")
             .help(status)
             .on_press(toggle)
             .build(&accent)

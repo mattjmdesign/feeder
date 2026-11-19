@@ -191,8 +191,6 @@ pub struct State {
     pub copied_at: Option<i64>,
     /// When project handoff context was last copied, for the button's "Copied".
     pub context_copied_at: Option<i64>,
-    /// When Resume in Agent prompt was last copied.
-    pub prompt_copied_at: Option<i64>,
     /// Bottom-right toast notifications (undo archive, copy image, watcher errors).
     pub toasts: ToastStack<ToastItem>,
     pub pending_url: Option<String>,
@@ -285,7 +283,6 @@ impl State {
             update_copied: None,
             copied_at: None,
             context_copied_at: None,
-            prompt_copied_at: None,
             toasts: ToastStack::default(),
             pending_url: None,
             last_badge: None,
@@ -865,10 +862,6 @@ impl State {
         self.context_copied_at.is_some_and(|t| now_ms() - t < 2_000)
     }
 
-    pub fn prompt_copied_recently(&self) -> bool {
-        self.prompt_copied_at.is_some_and(|t| now_ms() - t < 2_000)
-    }
-
     pub fn image_copied_recently(&self) -> bool {
         self.image_copied_at.is_some_and(|t| now_ms() - t < 2_000)
     }
@@ -1304,12 +1297,6 @@ fn poll(s: &mut State, clock: f64, tx: &mut Tx) -> bool {
         s.context_copied_at = None;
         changed = true;
     } else if s.context_copied_at.is_some() {
-        tx.wake_after(Duration::from_millis(2_100));
-    }
-    if s.prompt_copied_at.is_some() && !s.prompt_copied_recently() {
-        s.prompt_copied_at = None;
-        changed = true;
-    } else if s.prompt_copied_at.is_some() {
         tx.wake_after(Duration::from_millis(2_100));
     }
     if s.image_copied_at.is_some() && !s.image_copied_recently() {
