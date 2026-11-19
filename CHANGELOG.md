@@ -3,6 +3,15 @@
 What changed in each version of Feeder, newest first. Each section is copied from
 `release-notes/<version>.md` by `scripts/changelog.sh`; edit those files, not this one.
 
+## 0.4.2
+
+- **Cleaner Needs you handling.** Open decision or blocker cards now include a one-click Dismiss button with Undo, answered cards show a quiet Answered pill instead of staying amber, and bare `Decision:` lines no longer cause false alarms. You can also clear flags with `feeder dismiss` or the new `dismiss_attention` MCP tool.
+- **Scoped search & accurate Unread filter.** Pressing ⌘F inside a project filters that project's updates inline instead of switching tabs, and the Feed's Unread filter only shows updates newer than when you last opened each project.
+- **Copy replies & safer drafts.** Human replies have a one-click Copy button, and reply, edit, or brief drafts are preserved if saving fails.
+- **Deeper links & Notebook MCP resources.** Clicking notifications opens the exact update card (`feeder://project/<slug>/update/<id>`), `feeder://settings` opens Settings, and MCP clients can read `feeder://notebook` and `feeder://notebook/{id}` directly.
+- **Menu bar & performance polish.** The menu bar companion now shares the exact Needs you rules with the app and polls SQLite off the main thread; the MCP server reuses its database connection; and the app skips reloading the Notebook on feed-only updates.
+- **Local security hardening.** Secret scanning now protects updates, replies, and project briefs; data directories and config backups use restricted permissions; media imports reject symlinks and check file headers; and `feeder serve` enforces Host, Origin, size, and CSP guards.
+
 ## 0.4.1
 
 - **A cleaner project page.** The header holds To-Do, Copy Context, Rename and Archive. Show in Finder and Pin are on the project's orb menu on Home, and Copy Context does what Copy Prompt did.
