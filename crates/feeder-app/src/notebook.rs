@@ -1059,6 +1059,36 @@ fn related_pages<'a>(nb: &'a Notebook, page: &Page) -> Vec<&'a Page> {
 
 // ── Rich Article Renderer (GFM + Obsidian Callouts + Interactive Tasks) ──
 
+static CALLOUT_NOTE_ICON: Icon = Icon {
+    name: "nb-callout-note",
+    view: 16.0,
+    body: r#"<circle cx="8" cy="8" r="5.75" fill="none" stroke="currentColor" stroke-width="1.35"/><path d="M8 7.5V10.75" stroke="currentColor" stroke-width="1.35" stroke-linecap="round"/><circle cx="8" cy="5.35" r="0.75" fill="currentColor"/>"#,
+};
+
+static CALLOUT_TIP_ICON: Icon = Icon {
+    name: "nb-callout-tip",
+    view: 16.0,
+    body: r#"<path d="M6.25 11.75H9.75M6.75 13.75H9.25M5.5 9.25C4.55 8.45 4 7.3 4 6A4 4 0 1 1 12 6C12 7.3 11.45 8.45 10.5 9.25C10.05 9.65 9.75 10.2 9.75 10.85V11.25H6.25V10.85C6.25 10.2 5.95 9.65 5.5 9.25Z" fill="none" stroke="currentColor" stroke-width="1.35" stroke-linecap="round" stroke-linejoin="round"/>"#,
+};
+
+static CALLOUT_WARN_ICON: Icon = Icon {
+    name: "nb-callout-warn",
+    view: 16.0,
+    body: r#"<path d="M8 2.6L13.7 12.6C14 13.1 13.65 13.75 13.05 13.75H2.95C2.35 13.75 2 13.1 2.3 12.6L8 2.6Z" fill="none" stroke="currentColor" stroke-width="1.35" stroke-linejoin="round"/><path d="M8 6.4V9.3" stroke="currentColor" stroke-width="1.35" stroke-linecap="round"/><circle cx="8" cy="11.45" r="0.7" fill="currentColor"/>"#,
+};
+
+static CALLOUT_IMPORTANT_ICON: Icon = Icon {
+    name: "nb-callout-important",
+    view: 16.0,
+    body: r#"<path d="M4.5 2.75H11.5C11.9 2.75 12.25 3.1 12.25 3.5V13.4L8 10.85L3.75 13.4V3.5C3.75 3.1 4.1 2.75 4.5 2.75Z" fill="none" stroke="currentColor" stroke-width="1.35" stroke-linejoin="round"/>"#,
+};
+
+static CALLOUT_CAUTION_ICON: Icon = Icon {
+    name: "nb-callout-caution",
+    view: 16.0,
+    body: r#"<path d="M5.75 2.5H10.25L13.5 5.75V10.25L10.25 13.5H5.75L2.5 10.25V5.75L5.75 2.5Z" fill="none" stroke="currentColor" stroke-width="1.35" stroke-linejoin="round"/><path d="M8 5.5V8.7" stroke="currentColor" stroke-width="1.35" stroke-linecap="round"/><circle cx="8" cy="10.85" r="0.7" fill="currentColor"/>"#,
+};
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum CalloutKind {
     Note,
@@ -1090,15 +1120,25 @@ impl CalloutKind {
         }
     }
 
-    fn accent(self, p: &Palette) -> Color {
-        let (hue, light_c, dark_c) = match self {
-            Self::Note => (252.0, 0.14, 0.13),
-            Self::Tip => (155.0, 0.13, 0.13),
-            Self::Warning => (55.0, 0.15, 0.14),
-            Self::Important => (300.0, 0.13, 0.125),
-            Self::Caution => (26.0, 0.17, 0.15),
-        };
-        if p.dark { oklch(0.76, dark_c, hue) } else { oklch(0.52, light_c, hue) }
+    fn icon(self) -> &'static Icon {
+        match self {
+            Self::Note => &CALLOUT_NOTE_ICON,
+            Self::Tip => &CALLOUT_TIP_ICON,
+            Self::Warning => &CALLOUT_WARN_ICON,
+            Self::Important => &CALLOUT_IMPORTANT_ICON,
+            Self::Caution => &CALLOUT_CAUTION_ICON,
+        }
+    }
+
+    /// Quiet, low-chroma tint for the callout's small leading glyph — never neon, never a left bar.
+    fn icon_color(self, p: &Palette) -> Color {
+        match self {
+            Self::Note => p.text_2,
+            Self::Tip => if p.dark { oklch(0.73, 0.085, 155.0) } else { oklch(0.49, 0.095, 155.0) },
+            Self::Warning => if p.dark { oklch(0.76, 0.10, 68.0) } else { oklch(0.54, 0.11, 64.0) },
+            Self::Important => if p.dark { oklch(0.74, 0.09, 255.0) } else { oklch(0.50, 0.10, 255.0) },
+            Self::Caution => if p.dark { oklch(0.73, 0.11, 26.0) } else { oklch(0.52, 0.12, 26.0) },
+        }
     }
 }
 
@@ -1221,9 +1261,8 @@ fn render_article_markdown(src: &str, page_id: Option<i64>, p: &Palette, k: &Kit
                 stack = stack.child(md.render(&md_style).key(format!("nb-md-{idx}")));
             }
             ArticleChunk::Callout { kind, title, body, task_offset } => {
-                let accent = kind.accent(p);
-                let mut inner =
-                    col().grow(1.0).min_w(0.0).pl(12.0).pr(16.0).py(12.0).gap(6.0).child(text(title).font(style::CONTROL).color(accent));
+                let glyph = el().pt(2.0).child(icon(kind.icon(), 15.0).color(kind.icon_color(p)));
+                let mut inner = col().grow(1.0).min_w(0.0).gap(4.0).child(text(title).font(style::NAME).color(p.text));
                 if !body.is_empty() {
                     let mut md = Markdown::new(body).selectable(true);
                     if let Some(pid) = page_id {
@@ -1239,11 +1278,14 @@ fn render_article_markdown(src: &str, page_id: Option<i64>, p: &Palette, k: &Kit
                     row()
                         .key(format!("nb-callout-{idx}"))
                         .w_full()
-                        .radius(8.0)
+                        .px(14.0)
+                        .py(12.0)
+                        .gap(10.0)
+                        .radius(10.0)
                         .fill(k.c.layer_01)
                         .border(1.0, k.c.border_muted)
-                        .items_stretch()
-                        .child(el().w(3.0).my(10.0).ml(12.0).radius(1.5).fill(accent))
+                        .items_start()
+                        .child(glyph)
                         .child(inner),
                 );
             }
@@ -1839,9 +1881,12 @@ fn markdown_decorations(src: &str, p: &Palette, k: &Kit) -> Vec<Span> {
         }
 
         // Obsidian callout header: `> [!tip] Optional title`
-        if let Some((kind, _)) = parse_callout_header(line) {
-            let accent = kind.accent(p);
-            spans.push(Span::new(line_start, line_end).weight(600.0).color(accent));
+        if parse_callout_header(line).is_some() {
+            let tag_end = line.find(']').map(|idx| line_start + idx + 1).unwrap_or(line_end);
+            spans.push(Span::new(line_start, tag_end).mono().color(syntax_dim));
+            if tag_end < line_end {
+                spans.push(Span::new(tag_end, line_end).weight(style::MEDIUM).color(p.text));
+            }
             continue;
         }
 
@@ -1862,7 +1907,7 @@ fn markdown_decorations(src: &str, p: &Palette, k: &Kit) -> Vec<Span> {
         if trimmed.starts_with("- [ ] ") || trimmed.starts_with("- [x] ") || trimmed.starts_with("- [X] ") {
             let done = trimmed.as_bytes()[3] != b' ';
             let marker_end = content_offset + 6;
-            spans.push(Span::new(content_offset, marker_end).mono().color(if done { CalloutKind::Tip.accent(p) } else { syntax_dim }));
+            spans.push(Span::new(content_offset, marker_end).mono().color(if done { CalloutKind::Tip.icon_color(p) } else { syntax_dim }));
             if done && marker_end < line_end {
                 spans.push(Span::new(marker_end, line_end).color(p.text_3));
             }

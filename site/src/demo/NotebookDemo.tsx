@@ -1,3 +1,4 @@
+import { Lightbulb } from 'lucide-react'
 import { Stage } from '../stageshow/kit/stage'
 import type { Act } from '../stageshow/kit/act'
 import { Window } from '../stageshow/kit/window'
@@ -10,8 +11,8 @@ import './demos.css'
 // Beats, once in view:
 // 1. Opens directly on a borderless Markdown canvas (Category picker + title + toolbar, zero form boxes).
 // 2. Live-types an Obsidian callout (`> [!tip]`) and a task checklist item with live syntax styling.
-// 3. Cursor glides to Preview and clicks -> switches to rendered Markdown with green callout,
-//    syntax-highlighted Rust code fence, and interactive checklist.
+// 3. Cursor glides to Preview and clicks -> switches to rendered Markdown with a clean icon-led
+//    callout, syntax-highlighted Rust code fence, and interactive checklist.
 // 4. Cursor clicks the unchecked task checkbox -> ticks smoothly to done. Holds on payoff.
 
 const LINE_CALLOUT = '> [!tip] Keep writes atomic'
@@ -87,7 +88,7 @@ function LiveCalloutLine({ text, showCaret }: { text: string; showCaret: boolean
     return (
       <div className="nd-md-line">
         <span className="nd-md-dim">{prefix}</span>
-        <span className="nd-md-tip">{text.slice(prefix.length)}</span>
+        <span className="nd-md-callout-title">{text.slice(prefix.length)}</span>
         {showCaret && <span className="nd-caret" aria-hidden="true" />}
       </div>
     )
@@ -215,8 +216,13 @@ export default function NotebookDemo() {
                 </p>
 
                 <div className="nd-callout">
-                  <div className="nd-callout__title">Keep writes atomic</div>
-                  <p>Copy media files before opening the transaction so disk and SQLite never drift.</p>
+                  <span className="nd-callout__icon" aria-hidden="true">
+                    <Lightbulb size={15} strokeWidth={1.7} />
+                  </span>
+                  <div className="nd-callout__body">
+                    <div className="nd-callout__title">Keep writes atomic</div>
+                    <p>Copy media files before opening the transaction so disk and SQLite never drift.</p>
+                  </div>
                 </div>
 
                 <pre className="nd-codeblock">
