@@ -1,7 +1,9 @@
 //! Notebook flags, Curator sessions, and local Curator chat history.
 
 use std::io::{BufRead, IsTerminal, Write};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
+use std::time::Duration;
 
 use clap::Subcommand;
 use feeder_core::gardener::{
@@ -134,12 +136,21 @@ pub fn run(store: &Store, cmd: GardenerCmd) -> Result<(), String> {
             let runs = store.gardener_runs(5).map_err(|e| e.to_string())?;
             let open = store.open_flag_count().map_err(|e| e.to_string())?;
             if json {
+                let runs = runs
+                    .iter()
+                    .map(|run| {
+                        let mut value = run_json(run);
+                        value["dismissed_flag_ids"] = json!(store.curator_dismissed_flag_ids(run.id)?);
+                        Ok(value)
+                    })
+                    .collect::<feeder_core::Result<Vec<_>>>()
+                    .map_err(|e| e.to_string())?;
                 println!(
                     "{}",
                     json!({
                         "backends": installed.iter().map(|b| b.as_str()).collect::<Vec<_>>(),
                         "open_flags": open,
-                        "runs": runs.iter().map(run_json).collect::<Vec<_>>(),
+                        "runs": runs,
                     })
                 );
             } else {
@@ -267,6 +278,7 @@ fn print_run(r: &Run) {
 
 /// Runs a session in the terminal: streams events, then reads follow-ups until an empty line.
 fn chat(backend: Backend, scope: Scope, mode: SessionMode, opening: ChatOpening<'_>) -> Result<(), String> {
+    let _signals = StopSignals::install().map_err(|e| e.to_string())?;
     let (tx, rx) = mpsc::channel();
     let session = Session::start_curator_chat(backend, SessionEnv::detect(), scope, mode, opening, move |e| {
         let _ = tx.send(e);
@@ -279,7 +291,7 @@ fn chat(backend: Backend, scope: Scope, mode: SessionMode, opening: ChatOpening<
     eprintln!("{task} · {}", backend.label());
     let interactive = std::io::stdin().is_terminal();
     let mut out = std::io::stdout().lock();
-    for event in rx {
+    while let Some(event) = receive(&rx)? {
         match event {
             Event::Started => {}
             Event::Thinking(t) => write!(out, "\x1b[2m{t}\x1b[0m").map_err(|e| e.to_string())?,
@@ -316,9 +328,71 @@ fn chat(backend: Backend, scope: Scope, mode: SessionMode, opening: ChatOpening<
 
 fn prompt() -> Result<String, String> {
     eprint!("\nyou (Enter to finish) › ");
-    let mut line = String::new();
-    std::io::stdin().lock().read_line(&mut line).map_err(|e| e.to_string())?;
-    Ok(line)
+    let (tx, rx) = mpsc::channel();
+    std::thread::Builder::new()
+        .name("feeder-curator-input".into())
+        .spawn(move || {
+            let mut line = String::new();
+            let result = std::io::stdin().lock().read_line(&mut line).map(|_| line).map_err(|e| e.to_string());
+            let _ = tx.send(result);
+        })
+        .map_err(|e| e.to_string())?;
+    receive(&rx)?.unwrap_or_else(|| Err("Curator input closed".into()))
+}
+
+static INTERRUPTED: AtomicBool = AtomicBool::new(false);
+
+extern "C" fn stop_signal(_: libc::c_int) {
+    INTERRUPTED.store(true, Ordering::Relaxed);
+}
+
+fn receive<T>(rx: &mpsc::Receiver<T>) -> Result<Option<T>, String> {
+    loop {
+        if INTERRUPTED.load(Ordering::Relaxed) {
+            return Err("Curator stopped".into());
+        }
+        match rx.recv_timeout(Duration::from_millis(30)) {
+            Ok(value) => return Ok(Some(value)),
+            Err(mpsc::RecvTimeoutError::Timeout) => {}
+            Err(mpsc::RecvTimeoutError::Disconnected) => return Ok(None),
+        }
+    }
+}
+
+struct StopSignals(Vec<(libc::c_int, libc::sigaction)>);
+
+impl StopSignals {
+    fn install() -> std::io::Result<Self> {
+        INTERRUPTED.store(false, Ordering::Relaxed);
+        let mut guard = Self(Vec::new());
+        for signal in [libc::SIGINT, libc::SIGTERM] {
+            // SAFETY: sigaction is a C structure with a valid all-zero representation. The
+            // installed handler only sets a lock-free atomic on Feeder's supported targets.
+            let (mut action, mut previous): (libc::sigaction, libc::sigaction) = unsafe { std::mem::zeroed() };
+            action.sa_sigaction = stop_signal as *const () as usize;
+            // SAFETY: both pointers are live and the handler matches the C signature.
+            if unsafe {
+                libc::sigemptyset(&mut action.sa_mask);
+                libc::sigaction(signal, &action, &mut previous)
+            } != 0
+            {
+                return Err(std::io::Error::last_os_error());
+            }
+            guard.0.push((signal, previous));
+        }
+        Ok(guard)
+    }
+}
+
+impl Drop for StopSignals {
+    fn drop(&mut self) {
+        for (signal, previous) in &self.0 {
+            // SAFETY: this is the action returned by sigaction in install.
+            unsafe {
+                libc::sigaction(*signal, previous, std::ptr::null_mut());
+            }
+        }
+    }
 }
 
 fn flag_json(f: &Flag) -> Value {

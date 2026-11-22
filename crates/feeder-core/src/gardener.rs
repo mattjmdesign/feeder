@@ -8,6 +8,7 @@
 mod acp;
 mod chat;
 mod parse;
+mod profile;
 mod session;
 
 use std::path::PathBuf;
@@ -35,7 +36,7 @@ Rules:
 - Write only what the sources support. If evidence is missing or conflicts without a clear resolution, leave the flag open.
 - If a note looks outdated, call out the evidence and suggest what should replace it. Age or a low helpful count alone does not justify an archive.
 - For human_edited pages, keep the existing title, metadata and body exactly as they are. You may append to the body. Never archive these pages.
-- At most 5 Notebook edits per session. Changing nothing is a good result when nothing needs it.
+- At most 5 changes per session, including flag dismissals. Changing nothing is a good result when nothing needs it.
 - Bodies are short, specific Markdown: the symptom, the cause, what to do. No secrets or personal data.
 - The chat shows tool activity. Skip play-by-play and give a short final reply. Say what changed or why nothing changed. Link affected pages as [page title](feeder://notebook/ID), using IDs returned by tools. If a missing fact prevents an edit, ask one concrete question.";
 
@@ -130,8 +131,8 @@ impl Backend {
     /// What the person runs in Terminal to sign in, when the CLI says it isn't.
     pub fn sign_in_command(self) -> &'static str {
         match self {
-            Backend::ClaudeCode => "claude",
-            Backend::Codex => "codex login",
+            Backend::ClaudeCode => "feeder curator connect --with claude",
+            Backend::Codex => "feeder curator connect --with codex",
             Backend::OpenCode => "feeder curator connect --with opencode",
             Backend::Antigravity => "feeder curator connect --with antigravity",
         }
@@ -153,23 +154,12 @@ impl Backend {
     /// Returns an error if the CLI cannot be found or sign-in fails.
     pub fn connect(self, state_dir: &std::path::Path) -> Result<()> {
         let bin = self.binary().ok_or_else(|| Error::NotFound(format!("{} isn't installed", self.label())))?;
-        let mut cmd = match self {
-            Self::OpenCode | Self::Antigravity => {
-                let mut cmd = acp::profile_command(self, &bin, state_dir)?;
-                cmd.args(["acp", "--login"]);
-                cmd
-            }
-            Self::ClaudeCode => {
-                let mut cmd = std::process::Command::new(&bin);
-                cmd.args(["auth", "login"]);
-                cmd
-            }
-            Self::Codex => {
-                let mut cmd = std::process::Command::new(&bin);
-                cmd.arg("login");
-                cmd
-            }
-        };
+        let mut cmd = profile::command(self, &bin, state_dir)?;
+        cmd.args(match self {
+            Self::OpenCode | Self::Antigravity => &["acp", "--login"][..],
+            Self::ClaudeCode => &["auth", "login"],
+            Self::Codex => &["login"],
+        });
         if cmd.status()?.success() { Ok(()) } else { Err(Error::Invalid(format!("{} sign-in did not finish", self.label()))) }
     }
 
@@ -412,7 +402,14 @@ pub(crate) fn migrate(conn: &Connection) -> Result<()> {
         }
     }
     tx.execute_batch(
-        "CREATE INDEX IF NOT EXISTS notebook_changes_by_run ON notebook_changes(gardener_run_id) WHERE gardener_run_id IS NOT NULL;",
+        "CREATE INDEX IF NOT EXISTS notebook_changes_by_run ON notebook_changes(gardener_run_id) WHERE gardener_run_id IS NOT NULL;
+         CREATE TABLE IF NOT EXISTS curator_flag_dismissals (
+            run_id INTEGER NOT NULL REFERENCES gardener_runs(id),
+            flag_id INTEGER NOT NULL REFERENCES knowledge_flags(id),
+            reason TEXT NOT NULL,
+            dismissed_at INTEGER NOT NULL,
+            PRIMARY KEY (run_id, flag_id)
+         );",
     )?;
     chat::migrate(&tx)?;
     tx.commit()?;

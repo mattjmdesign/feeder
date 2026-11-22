@@ -442,12 +442,7 @@ impl Store {
     /// Rejects inactive runs, out-of-scope inputs and edits over the session limit.
     pub fn curate_gardener_run(&self, run_id: i64, mut curation: Curation, provenance: &Provenance) -> Result<Curated> {
         let tx = Transaction::new_unchecked(&self.conn, TransactionBehavior::Immediate)?;
-        let run = self.active_curator_review(run_id)?;
-        if usize::try_from(run.edits).unwrap_or(usize::MAX) >= MAX_EDITS_PER_RUN {
-            return Err(Error::Invalid(format!(
-                "this session has made its {MAX_EDITS_PER_RUN} changes; leave the rest for the next session"
-            )));
-        }
+        let run = self.curator_run_with_budget(run_id)?;
         let mut evidence = provenance.clone();
         let mut project = run.scope.project_id();
         for &id in &evidence.flags {
@@ -487,16 +482,37 @@ impl Store {
     /// Dismisses an in-scope flag while the session is still active.
     pub fn dismiss_gardener_flag(&self, run_id: i64, id: i64, reason: String) -> Result<Flag> {
         let tx = Transaction::new_unchecked(&self.conn, TransactionBehavior::Immediate)?;
-        self.gardener_flag(self.active_curator_review(run_id)?.scope, id)?;
-        let flag = self.close_flag(id, FlagOutcome::Dismissed { note: reason }, GARDENER)?;
+        let run = self.curator_run_with_budget(run_id)?;
+        self.gardener_flag(run.scope, id)?;
+        let reason = reason.trim();
+        if reason.is_empty() || reason.chars().count() > REASON_MAX_CHARS || secret_in(reason).is_some() {
+            return Err(Error::Invalid(format!("give a reason of 1–{REASON_MAX_CHARS} characters without secrets")));
+        }
+        let flag = self.close_flag(id, FlagOutcome::Dismissed { note: reason.to_string() }, GARDENER)?;
+        tx.execute(
+            "INSERT INTO curator_flag_dismissals (run_id, flag_id, reason, dismissed_at) VALUES (?1, ?2, ?3, ?4)",
+            params![run_id, id, reason, now_ms()],
+        )?;
+        tx.execute("UPDATE gardener_runs SET edits = edits + 1 WHERE id = ?1", [run_id])?;
         tx.commit()?;
         Ok(flag)
     }
 
-    fn active_curator_review(&self, run_id: i64) -> Result<Run> {
+    /// Flag IDs dismissed by this Curator run, in dismissal order.
+    pub fn curator_dismissed_flag_ids(&self, run_id: i64) -> Result<Vec<i64>> {
+        let mut statement = self.conn.prepare("SELECT flag_id FROM curator_flag_dismissals WHERE run_id = ?1 ORDER BY rowid")?;
+        Ok(statement.query_map([run_id], |row| row.get(0))?.collect::<rusqlite::Result<_>>()?)
+    }
+
+    fn curator_run_with_budget(&self, run_id: i64) -> Result<Run> {
         let run = self.active_gardener_run(run_id)?;
         if run.mode == SessionMode::Ask {
             return Err(Error::Invalid("this Curator session is read-only".into()));
+        }
+        if usize::try_from(run.edits).unwrap_or(usize::MAX) >= MAX_EDITS_PER_RUN {
+            return Err(Error::Invalid(format!(
+                "this session has made its {MAX_EDITS_PER_RUN} changes; leave the rest for the next session"
+            )));
         }
         Ok(run)
     }
@@ -1051,6 +1067,35 @@ mod tests {
 
         // The person can still do anything by hand.
         s.curate(Curation::Archive { page_id: mine.id }, crate::HUMAN_AUTHOR, &Provenance::default()).expect("person archives");
+    }
+
+    #[test]
+    fn curator_dismissals_are_logged_and_share_the_page_edit_budget() {
+        use crate::gardener::Backend;
+
+        let scratch = temp_store("dismissal-budget");
+        let store = &scratch.store;
+        let run = store.start_gardener_run(Backend::Codex).unwrap();
+        let mut dismissed = Vec::new();
+        for n in 0..MAX_EDITS_PER_RUN - 1 {
+            let flag = store.flag_knowledge(missing(&format!("Potential evidence gap {n}")), "Codex").unwrap();
+            assert!(store.dismiss_gardener_flag(run, flag.id, " ".into()).is_err());
+            store.dismiss_gardener_flag(run, flag.id, "The current internal guide already answers it.".into()).unwrap();
+            dismissed.push(flag.id);
+        }
+        let gap = store.flag_knowledge(missing("A new release step"), "Codex").unwrap();
+        store
+            .curate_gardener_run(
+                run,
+                Curation::Create { draft: draft("Release smoke test", "Run the smoke test before signing."), project_id: None },
+                &cites("Record the new step", &[gap.id]),
+            )
+            .unwrap();
+        let extra = store.flag_knowledge(missing("Something else to check"), "Codex").unwrap();
+        assert!(store.dismiss_gardener_flag(run, extra.id, "The release guide covers it.".into()).is_err());
+        assert_eq!(store.flag(extra.id).unwrap().unwrap().status, FlagStatus::Open);
+        assert_eq!(store.curator_dismissed_flag_ids(run).unwrap(), dismissed);
+        assert_eq!(store.gardener_run(run).unwrap().unwrap().edits, 5);
     }
 
     #[test]

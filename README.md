@@ -72,10 +72,10 @@ You can ask follow-up questions in the same session or press **Stop** to end it.
 
 Curator can use an installed [Claude Code](https://claude.com/claude-code),
 [Codex](https://developers.openai.com/codex), [OpenCode](https://opencode.ai/) or
-[Antigravity CLI](https://antigravity.google/docs/cli/acp/). Claude Code and Codex reuse their
-normal CLI sign-in. OpenCode and Antigravity use separate Curator profiles. Sign in to them
-with `feeder curator connect --with opencode` or `feeder curator connect --with antigravity`.
-The CLI manages its own credentials and the account or model configured there determines usage.
+[Antigravity CLI](https://antigravity.google/docs/cli/acp/). Each provider has a separate Curator
+profile. Sign in once with `feeder curator connect --with claude`, `--with codex`, `--with opencode`,
+or `--with antigravity`. The provider CLI manages its credentials and the account or model
+configured there determines usage.
 
 From Terminal, use `feeder curator run --ask "How do we sign releases?"` for a read-only
 answer or `feeder curator run --project "My Project" --with codex` to review a project.

@@ -8,9 +8,11 @@ use std::io::{BufRead, BufReader, Read, Write};
 use std::os::unix::fs::DirBuilderExt;
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
-use std::process::{Child, ChildStdin, Command, Stdio};
+use std::process::{Child, ChildStderr, ChildStdin, ChildStdout, Command, ExitStatus, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
+use std::thread::JoinHandle;
+use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -18,7 +20,7 @@ use serde_json::{Value, json};
 use super::acp::{self, Action as AcpAction};
 use super::chat::{ChatOpening, Recorder, StoredEvent};
 use super::parse::{StreamState, claude_line, codex_line, failure};
-use super::{Backend, Scope, SessionMode, clip};
+use super::{Backend, Scope, SessionMode, clip, profile};
 use crate::{Error, Result, Store, data_dir, setup};
 
 /// Something the session did, in the order it happened.
@@ -109,8 +111,22 @@ impl SessionEnv {
 
 /// Codex features that give the model a tool of its own. A session turns all of them off, so
 /// its only tools are the gardener's.
-const CODEX_TOOL_FEATURES: [&str; 7] =
-    ["shell_tool", "unified_exec", "apps", "browser_use", "browser_use_external", "in_app_browser", "view_image"];
+const CODEX_DISABLED_FEATURES: &[&str] = &[
+    "shell_tool",
+    "unified_exec",
+    "apps",
+    "browser_use",
+    "browser_use_external",
+    "in_app_browser",
+    "view_image",
+    "hooks",
+    "plugins",
+    "remote_plugin",
+    "multi_agent",
+    "goals",
+    "memories",
+    "skill_mcp_dependency_install",
+];
 
 /// How much stderr to keep for an error message.
 const STDERR_CHARS: usize = 400;
@@ -140,8 +156,17 @@ struct Inner {
     send_lock: Mutex<()>,
     /// The agent's latest reply, for the run log's summary.
     last_reply: Mutex<String>,
+    stopping: AtomicBool,
     ended: AtomicBool,
 }
+
+struct ChildPipes {
+    stdin: Option<ChildStdin>,
+    stdout: Option<ChildStdout>,
+    stderr: Option<ChildStderr>,
+}
+
+type ProcessMonitor = JoinHandle<std::io::Result<Option<ExitStatus>>>;
 
 impl Session {
     /// Starts a session with `opening` as the person's first message. Events arrive on `sink`
@@ -214,19 +239,27 @@ impl Session {
             recording: Mutex::new(Recorder::new(store, run_id)),
             send_lock: Mutex::new(()),
             last_reply: Mutex::new(String::new()),
+            stopping: AtomicBool::new(false),
             ended: AtomicBool::new(false),
         });
-        let prompt = opening.prompt();
-        let started = match backend {
-            Backend::ClaudeCode => inner.start_claude(&bin).and_then(|()| inner.send_claude(prompt)),
-            Backend::Codex => inner.codex_turn(&bin, &format!("{}\n\n{prompt}", mode.instructions())),
-            Backend::OpenCode | Backend::Antigravity => inner.start_acp(&bin, prompt),
-        };
-        if let Err(e) = started {
-            let _ = lock(&inner.recording).record(StoredEvent::Event(Event::Failed(e.to_string())));
-            inner.kill();
+        let prompt = opening.prompt().to_string();
+        let worker = Arc::clone(&inner);
+        if let Err(e) = std::thread::Builder::new().name("feeder-curator-start".into()).spawn(move || {
+            let started = match backend {
+                Backend::ClaudeCode => worker.start_claude(&bin).and_then(|()| worker.send_claude(&prompt)),
+                Backend::Codex => worker.codex_turn(&bin, &format!("{}\n\n{prompt}", mode.instructions())),
+                Backend::OpenCode | Backend::Antigravity => worker.start_acp(&bin, &prompt),
+            };
+            if let Err(e) = started {
+                worker.terminate();
+                if !worker.stopping.load(Ordering::Acquire) && !worker.ended.load(Ordering::Acquire) {
+                    worker.forward(failure(e.to_string()));
+                    worker.end(Some(&e.to_string()));
+                }
+            }
+        }) {
             inner.end(Some(&e.to_string()));
-            return Err(e);
+            return Err(e.into());
         }
         Ok(Session { backend, inner })
     }
@@ -241,7 +274,7 @@ impl Session {
     /// Returns an error when the session has ended, the message cannot be saved, or submission fails.
     pub fn send(&self, text: &str) -> Result<()> {
         let _send = lock(&self.inner.send_lock);
-        if self.inner.ended.load(Ordering::SeqCst) {
+        if self.inner.stopping.load(Ordering::Acquire) || self.inner.ended.load(Ordering::SeqCst) {
             return Err(Error::Invalid("this gardener session has ended; start a new one".into()));
         }
         let sent = match self.backend {
@@ -279,7 +312,8 @@ impl Session {
 
     /// Ends the session now, stopping the CLI mid-turn if need be.
     pub fn stop(&self) {
-        self.inner.kill();
+        self.inner.stopping.store(true, Ordering::Release);
+        self.inner.terminate();
         self.inner.end(None);
     }
 }
@@ -298,43 +332,42 @@ impl Inner {
             "name": "feeder", "command": helper, "args": ["mcp", "--gardener", "--gardener-run", self.run_id.to_string()],
             "env": [{ "name": "FEEDER_HOME", "value": data_dir }],
         });
-        let mut cmd = acp::command(self.backend, bin, &self.env.data_dir, self.scratch.path(), self.mode, &server)?;
-        cmd.process_group(0);
+        let mut probe = profile::command(self.backend, bin, &self.env.data_dir)?;
+        probe.arg("--version");
+        let (pipes, monitor) = self.spawn_provider(probe, false, Some(Duration::from_secs(5)))?;
+        drop(pipes.stdin);
+        let mut version = String::new();
+        pipes.stdout.ok_or_else(|| Error::Invalid("The provider has no version output".into()))?.take(512).read_to_string(&mut version)?;
+        let status = process_status(monitor)?;
+        acp::check_version(self.backend, status, &version)?;
+        let cmd = acp::command(self.backend, bin, &self.env.data_dir, self.scratch.path(), self.mode, &server)?;
         let servers = if self.backend == Backend::Antigravity { json!([]) } else { json!([server]) };
-        let mut child = spawn(cmd)?;
-        *lock(&self.stdin) = child.stdin.take();
-        let stdout = child.stdout.take();
-        let stderr = child.stderr.take();
-        *lock(&self.child) = Some(child);
-        let stdout = stdout.ok_or_else(|| Error::Invalid("The provider has no ACP output".into()))?;
+        let (pipes, monitor) = self.spawn_provider(cmd, true, None)?;
+        let stdout = pipes.stdout.ok_or_else(|| Error::Invalid("The provider has no ACP output".into()))?;
         let opening = format!("{}\n\n{opening}", self.mode.instructions());
         let inner = Arc::clone(self);
         let worker = std::thread::Builder::new().name("feeder-curator-acp".into()).spawn(move || {
-            let errors = stderr.map(|mut stderr| {
+            let errors = pipes.stderr.map(|mut stderr| {
                 std::thread::spawn(move || {
                     let _ = std::io::copy(&mut stderr, &mut std::io::sink());
                 })
             });
             let outcome = inner.read_acp(BufReader::new(stdout), &servers, &opening);
-            inner.kill();
-            let child = lock(&inner.child).take();
-            if let Some(mut child) = child {
-                let _ = child.wait();
-            }
+            inner.terminate();
+            let _ = process_status(monitor);
             if let Some(errors) = errors {
                 let _ = errors.join();
             }
-            if let Err(e) = outcome {
+            if let Err(e) = outcome
+                && !inner.stopping.load(Ordering::Acquire)
+            {
                 let error = e.to_string();
                 inner.forward(failure(error.clone()));
                 inner.end(Some(&error));
             }
         });
         if let Err(error) = worker {
-            self.kill();
-            if let Some(mut child) = lock(&self.child).take() {
-                let _ = child.wait();
-            }
+            self.terminate();
             return Err(error.into());
         }
         self.send_acp(&acp::State::initialize())
@@ -373,7 +406,7 @@ impl Inner {
 
     fn record_user(&self, text: &str) -> Result<()> {
         let mut recording = lock(&self.recording);
-        if self.ended.load(Ordering::SeqCst) {
+        if self.stopping.load(Ordering::Acquire) || self.ended.load(Ordering::SeqCst) {
             return Err(Error::Invalid("this Curator session has ended".into()));
         }
         recording.record(StoredEvent::You(text.to_string()))?;
@@ -389,18 +422,17 @@ impl Inner {
         } } });
         let config_path = self.scratch.path().join("mcp.json");
         std::fs::write(&config_path, config.to_string())?;
-        let mut cmd = Command::new(bin);
+        let mut cmd = profile::command(self.backend, bin, &self.env.data_dir)?;
         cmd.current_dir(self.scratch.path())
             .args(["-p", "--input-format", "stream-json", "--output-format", "stream-json", "--verbose", "--include-partial-messages"])
             // No built-in tools, only the gardener's server, none of the person's settings or hooks.
-            .args(["--tools", "", "--strict-mcp-config", "--allowedTools", "mcp__feeder", "--setting-sources", ""])
+            .args(["--restricted", "--tools", "", "--strict-mcp-config", "--allowedTools", "mcp__feeder", "--setting-sources", ""])
+            .args(["--settings", r#"{"disableAllHooks":true}"#])
             .args(["--no-session-persistence", "--append-system-prompt", self.mode.instructions()])
             .arg("--mcp-config")
             .arg(&config_path);
-        let mut child = spawn(cmd)?;
-        *lock(&self.stdin) = child.stdin.take();
-        self.watch(child, claude_line);
-        Ok(())
+        let (pipes, monitor) = self.spawn_provider(cmd, true, None)?;
+        self.watch(pipes, monitor, claude_line)
     }
 
     fn send_claude(&self, text: &str) -> Result<()> {
@@ -414,13 +446,13 @@ impl Inner {
 
     fn codex_turn(self: &Arc<Self>, bin: &Path, text: &str) -> Result<()> {
         let thread = lock(&self.state).thread_id.clone();
-        let mut cmd = Command::new(bin);
+        let mut cmd = profile::command(self.backend, bin, &self.env.data_dir)?;
         cmd.current_dir(self.scratch.path()).arg("exec");
         if let Some(thread) = &thread {
             cmd.args(["resume", thread]);
         }
-        cmd.args(["--json", "--skip-git-repo-check"]);
-        for feature in CODEX_TOOL_FEATURES {
+        cmd.args(["--json", "--skip-git-repo-check", "--ignore-user-config"]);
+        for &feature in CODEX_DISABLED_FEATURES {
             cmd.args(["--disable", feature]);
         }
         // One inline table replaces the person's own MCP servers for this run.
@@ -438,33 +470,25 @@ impl Inner {
             "-c",
             "sandbox_mode=\"read-only\"",
             "-c",
+            "approval_policy=\"never\"",
+            "-c",
             "model_reasoning_summary=\"auto\"",
         ]);
         cmd.arg("-");
-        let mut child = spawn(cmd)?;
-        let mut stdin = child.stdin.take().ok_or_else(|| Error::Invalid("Codex has no input".into()))?;
+        let (mut pipes, monitor) = self.spawn_provider(cmd, false, None)?;
+        let mut stdin = pipes.stdin.take().ok_or_else(|| Error::Invalid("Codex has no input".into()))?;
+        self.watch(pipes, monitor, codex_line)?;
         stdin.write_all(text.as_bytes())?;
-        drop(stdin);
-        self.watch(child, codex_line);
         Ok(())
     }
 
     /// Reads the child's stream on a thread and forwards events until it exits.
-    fn watch(self: &Arc<Self>, mut child: Child, parse: fn(&str, &mut StreamState) -> Vec<Event>) {
-        let stdout = child.stdout.take();
-        let stderr = child.stderr.take();
-        *lock(&self.child) = Some(child);
+    fn watch(self: &Arc<Self>, pipes: ChildPipes, monitor: ProcessMonitor, parse: fn(&str, &mut StreamState) -> Vec<Event>) -> Result<()> {
         let inner = Arc::clone(self);
         let spawned = std::thread::Builder::new().name("feeder-gardener-stream".into()).spawn(move || {
-            let errors = stderr.map(|mut e| {
-                std::thread::spawn(move || {
-                    let mut text = String::new();
-                    let _ = e.read_to_string(&mut text);
-                    text
-                })
-            });
+            let errors = pipes.stderr.map(|e| std::thread::spawn(move || stderr_tail(e)));
             let mut turn_done = false;
-            for line in stdout.into_iter().flat_map(|out| BufReader::new(out).lines().map_while(std::io::Result::ok)) {
+            for line in pipes.stdout.into_iter().flat_map(|out| BufReader::new(out).lines().map_while(std::io::Result::ok)) {
                 let events = parse(&line, &mut lock(&inner.state));
                 for event in events {
                     if matches!(event, Event::TurnFinished) {
@@ -476,12 +500,12 @@ impl Inner {
                     inner.forward(event);
                 }
             }
-            let status = lock(&inner.child).take().and_then(|mut c| c.wait().ok());
+            let status = process_status(monitor);
             let stderr = errors.and_then(|t| t.join().ok()).unwrap_or_default();
-            if inner.ended.load(Ordering::SeqCst) {
+            if inner.stopping.load(Ordering::Acquire) || inner.ended.load(Ordering::SeqCst) {
                 return;
             }
-            let crashed = !status.is_some_and(|s| s.success());
+            let crashed = !status.is_ok_and(|status| status.is_some_and(|s| s.success()));
             match inner.backend {
                 // Claude Code exiting ends the session.
                 Backend::ClaudeCode => {
@@ -502,8 +526,10 @@ impl Inner {
             }
         });
         if let Err(e) = spawned {
-            self.forward(Event::Failed(format!("couldn't read the CLI's output: {e}")));
+            self.terminate();
+            return Err(e.into());
         }
+        Ok(())
     }
 
     fn forward(&self, event: Event) {
@@ -514,7 +540,7 @@ impl Inner {
 
     fn record_event(&self, event: &Event) -> bool {
         let mut recording = lock(&self.recording);
-        if self.ended.load(Ordering::SeqCst) {
+        if self.stopping.load(Ordering::Acquire) || self.ended.load(Ordering::SeqCst) {
             return false;
         }
         match event {
@@ -530,19 +556,66 @@ impl Inner {
         true
     }
 
-    fn kill(&self) {
-        *lock(&self.stdin) = None;
-        if let Some(child) = lock(&self.child).as_mut() {
-            if matches!(self.backend, Backend::OpenCode | Backend::Antigravity)
-                && let Ok(group) = libc::pid_t::try_from(child.id())
-                && group > 0
-            {
-                // SAFETY: ACP children lead their own process groups. The unreaped child
-                // is still owned by this mutex, so its group ID can't be reused here.
-                unsafe { libc::kill(-group, libc::SIGKILL) };
-            }
-            let _ = child.kill();
+    fn spawn_provider(
+        self: &Arc<Self>,
+        mut cmd: Command,
+        keep_stdin: bool,
+        timeout: Option<Duration>,
+    ) -> Result<(ChildPipes, ProcessMonitor)> {
+        let mut slot = lock(&self.child);
+        if self.stopping.load(Ordering::Acquire) || self.ended.load(Ordering::Acquire) || slot.is_some() {
+            return Err(Error::Invalid("Curator cannot start another provider process".into()));
         }
+        let mut child = cmd.process_group(0).stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped()).spawn()?;
+        let mut pipes = ChildPipes { stdin: child.stdin.take(), stdout: child.stdout.take(), stderr: child.stderr.take() };
+        if keep_stdin {
+            *lock(&self.stdin) = pipes.stdin.take();
+        }
+        let id = child.id();
+        *slot = Some(child);
+        let inner = Arc::clone(self);
+        let monitor = std::thread::Builder::new().name("feeder-curator-process".into()).spawn(move || inner.monitor(id, timeout));
+        match monitor {
+            Ok(monitor) => Ok((pipes, monitor)),
+            Err(error) => {
+                drop(slot);
+                self.terminate();
+                Err(error.into())
+            }
+        }
+    }
+
+    fn monitor(&self, id: u32, timeout: Option<Duration>) -> std::io::Result<Option<ExitStatus>> {
+        let started = Instant::now();
+        loop {
+            {
+                let mut slot = lock(&self.child);
+                let Some(child) = slot.as_mut().filter(|child| child.id() == id) else { return Ok(None) };
+                if timeout.is_some_and(|limit| started.elapsed() >= limit) {
+                    let _ = terminate_child(child);
+                    *slot = None;
+                    return Err(std::io::Error::new(std::io::ErrorKind::TimedOut, "provider startup timed out"));
+                }
+                if child_exited(id)? {
+                    let status = terminate_child(child);
+                    *slot = None;
+                    return status.map(Some);
+                }
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+
+    fn terminate(&self) {
+        {
+            let mut slot = lock(&self.child);
+            if let Some(child) = slot.as_mut() {
+                let _ = terminate_child(child);
+                *slot = None;
+            }
+        }
+        // A writer may be blocked in the pipe. Kill the reader before trying to close it.
+        *lock(&self.stdin) = None;
     }
 
     /// Logs the end and tells the view, once.
@@ -564,8 +637,47 @@ impl Inner {
     }
 }
 
-fn spawn(mut cmd: Command) -> Result<Child> {
-    Ok(cmd.stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped()).spawn()?)
+fn process_status(monitor: ProcessMonitor) -> std::io::Result<Option<ExitStatus>> {
+    monitor.join().map_err(|_| std::io::Error::other("provider monitor stopped unexpectedly"))?
+}
+
+fn child_exited(id: u32) -> std::io::Result<bool> {
+    // SAFETY: zero is valid for siginfo_t and provides a zero pid when no child is ready.
+    let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
+    // SAFETY: `info` is writable, id belongs to an owned child, and WNOWAIT leaves the leader
+    // unreaped so its process group can be signalled before its PID becomes reusable.
+    let result = unsafe { libc::waitid(libc::P_PID, id, &mut info, libc::WEXITED | libc::WNOHANG | libc::WNOWAIT) };
+    if result == 0 {
+        // SAFETY: waitid populates this field on exit and leaves the zero pid for no result.
+        return Ok(unsafe { info.si_pid() } != 0);
+    }
+    let error = std::io::Error::last_os_error();
+    if error.kind() == std::io::ErrorKind::Interrupted { Ok(false) } else { Err(error) }
+}
+
+fn terminate_child(child: &mut Child) -> std::io::Result<ExitStatus> {
+    if let Ok(group) = libc::pid_t::try_from(child.id())
+        && group > 0
+    {
+        // SAFETY: every launched provider leads its own group; the caller exclusively owns the
+        // Child and has not yet reaped it, so the group ID cannot be reused before kill.
+        unsafe { libc::kill(-group, libc::SIGKILL) };
+    }
+    let _ = child.kill();
+    child.wait()
+}
+
+fn stderr_tail(mut reader: impl Read) -> String {
+    let mut tail = Vec::new();
+    let mut chunk = [0; 1024];
+    while let Ok(count) = reader.read(&mut chunk) {
+        if count == 0 {
+            break;
+        }
+        tail.extend_from_slice(&chunk[..count]);
+        tail.drain(..tail.len().saturating_sub(STDERR_CHARS * 4));
+    }
+    String::from_utf8_lossy(&tail).into_owned()
 }
 
 /// Lock poisoning means a stream thread panicked; the session can't continue sensibly.
@@ -647,5 +759,28 @@ mod tests {
     fn stderr_tails_are_short_and_never_empty() {
         assert_eq!(last_lines(""), "the CLI stopped unexpectedly");
         assert_eq!(last_lines("one\n\ntwo\nthree\nfour\n"), "two three four");
+        let output = format!("{}\nlast diagnostic", "x".repeat(16_384));
+        let tail = stderr_tail(output.as_bytes());
+        assert!(tail.len() <= STDERR_CHARS * 4);
+        assert!(tail.ends_with("last diagnostic"));
+    }
+
+    #[test]
+    fn reaping_the_provider_closes_pipes_held_by_its_children() {
+        let mut child = Command::new("/bin/sh")
+            .args(["-c", "/bin/sleep 5 & printf 'provider finished\\n'"])
+            .process_group(0)
+            .stdout(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let started = Instant::now();
+        while !child_exited(child.id()).unwrap() && started.elapsed() < Duration::from_secs(2) {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(terminate_child(&mut child).unwrap().success());
+        let mut output = String::new();
+        child.stdout.take().unwrap().read_to_string(&mut output).unwrap();
+        assert_eq!(output, "provider finished\n");
+        assert!(started.elapsed() < Duration::from_secs(3));
     }
 }

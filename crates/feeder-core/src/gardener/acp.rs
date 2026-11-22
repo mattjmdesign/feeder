@@ -1,51 +1,30 @@
 //! Restricted ACP sessions for OpenCode and Antigravity.
 
 use std::collections::HashSet;
-use std::os::unix::fs::DirBuilderExt;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::process::Command;
+use std::process::ExitStatus;
 
 use serde_json::{Value, json};
 
 use super::{Backend, Event, SessionMode, ToolCall};
 use crate::{Error, Result};
 
-/// Run with the CLI's own login in a Curator-specific profile, without inheriting shell secrets.
-pub(super) fn profile_command(backend: Backend, binary: &Path, data: &Path) -> Result<Command> {
-    let home = profile_dir(backend, data)?;
-    let mut cmd = Command::new(binary);
-    cmd.env_clear().env("HOME", &home);
-    for var in ["PATH", "LANG", "LC_ALL", "TERM"] {
-        if let Some(value) = std::env::var_os(var) {
-            cmd.env(var, value);
-        }
-    }
-    for (name, dir) in [("XDG_CONFIG_HOME", "config"), ("XDG_DATA_HOME", "data"), ("XDG_STATE_HOME", "state"), ("XDG_CACHE_HOME", "cache")]
-    {
-        cmd.env(name, home.join(dir));
-    }
-    Ok(cmd)
-}
-
-fn profile_dir(backend: Backend, data: &Path) -> Result<PathBuf> {
-    let path = std::path::absolute(data)?.join("curator-profiles").join(backend.as_str());
-    std::fs::DirBuilder::new().recursive(true).mode(0o700).create(&path)?;
-    Ok(path)
-}
-
-pub(super) fn command(backend: Backend, binary: &Path, data: &Path, cwd: &Path, mode: SessionMode, server: &Value) -> Result<Command> {
-    let mut cmd = profile_command(backend, binary, data)?;
-    let output = profile_command(backend, binary, data)?.arg("--version").output()?;
-    let version = String::from_utf8_lossy(&output.stdout);
+pub(super) fn check_version(backend: Backend, status: Option<ExitStatus>, version: &str) -> Result<()> {
     let minimum = match backend {
         Backend::OpenCode => (2, 3, 2),
         Backend::Antigravity => (1, 5, 5),
         _ => return Err(Error::Invalid("invalid ACP backend".into())),
     };
-    if !output.status.success() || !supported_version(&version, minimum) {
+    if !status.is_some_and(|status| status.success()) || !supported_version(version, minimum) {
         let (major, minor, patch) = minimum;
         return Err(Error::Invalid(format!("Update {} to {major}.{minor}.{patch} or a later {major}.x release.", backend.label())));
     }
+    Ok(())
+}
+
+pub(super) fn command(backend: Backend, binary: &Path, data: &Path, cwd: &Path, mode: SessionMode, server: &Value) -> Result<Command> {
+    let mut cmd = super::profile::command(backend, binary, data)?;
     cmd.current_dir(cwd).arg("acp");
     match backend {
         Backend::OpenCode => {
@@ -106,7 +85,7 @@ fn policy(action: &str, resource: &str, effect: &str) -> Value {
 }
 
 fn configure_antigravity(data: &Path, mode: SessionMode, server: &Value) -> Result<()> {
-    let home = profile_dir(Backend::Antigravity, data)?.join(".gemini");
+    let home = super::profile::profile_dir(Backend::Antigravity, data)?.join(".gemini");
     let profile = home.join("antigravity-cli");
     std::fs::create_dir_all(&profile)?;
     let file = profile.join("settings.json");
