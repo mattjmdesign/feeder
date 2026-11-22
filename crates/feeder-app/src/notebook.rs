@@ -692,7 +692,8 @@ fn sidebar_view(s: &State, p: &Palette, k: &Kit) -> El {
         .gap(8.0)
         .child(search)
         .child(new_page)
-        .child(col().w_full().gap(2.0).child(all_row).child(gardener_row));
+        // A list parent so VoiceOver reads the shelf rows as a list (SidebarRow is a listitem).
+        .child(col().w_full().gap(2.0).role("list").label("Notebook").child(all_row).child(gardener_row));
 
     // In Curator the sidebar lists its chats, the way AI apps keep threads beside the conversation.
     if gardener_selected {
@@ -1613,7 +1614,7 @@ fn editor_view(nb: &Notebook, ed: &Editor, p: &Palette, k: &Kit, layer: &mut Vec
             .key("nb-f-title")
             .w_full()
             .color(p.text)
-            .placeholder("Untitled", p.text_3.alpha(0.55))
+            .placeholder("Untitled", p.text_3)
             .caret(p.text, p.selection)
             .label("Note title")
             .on_edit(|s: &mut State| editor_field(s, |ed| &mut ed.title))
@@ -1653,10 +1654,7 @@ fn editor_view(nb: &Notebook, ed: &Editor, p: &Palette, k: &Kit, layer: &mut Vec
             .min_h(420.0)
             .pt(18.0)
             .color(p.text)
-            .placeholder(
-                "Start writing in Markdown…  # headings, **bold**, `code`, - [ ] checklists, > [!tip] callouts, or ```code blocks",
-                p.text_3.alpha(0.55),
-            )
+            .placeholder("Start writing…", p.text_3)
             .caret(p.text, p.selection)
             .decorations(spans)
             .label("Note body")

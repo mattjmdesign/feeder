@@ -773,7 +773,8 @@ pub fn attention_badge(p: &Palette, kind: Option<AttentionKind>) -> El {
         .center_y()
         .fill(p.amber.alpha(0.14))
         .child(el().size(5.0, 5.0).radius(2.5).fill(p.amber))
-        .child(text(label).font(style::META).color(p.amber))
+        // Amber stays in the dot and tint; the label uses body ink so it holds 4.5:1 on the tint.
+        .child(text(label).font(style::META).color(p.text))
 }
 
 /// Renders the attention status for a card:
@@ -1154,7 +1155,8 @@ pub fn media_view(s: &State, p: &Palette, u: &FeedUpdate, width: f32) -> Option<
         .child(arrow_btn(format!("car-prev-{uid}"), "‹", "Previous slide", -1).absolute(10.0, btn_y))
         .child(arrow_btn(format!("car-next-{uid}"), "›", "Next slide", 1).pin(None, Some(btn_y), Some(10.0), None));
 
-    let mut dots = row().key(format!("car-dots-{uid}")).w_full().center().gap(2.0).pt(6.0);
+    // Each dot's hit area is at least 24 x 24 pt (WCAG 2.5.8); the visible dot stays small.
+    let mut dots = row().key(format!("car-dots-{uid}")).w_full().center().pt(2.0);
     for i in 0..total {
         let active = i == idx;
         dots = dots.child(
@@ -1162,7 +1164,8 @@ pub fn media_view(s: &State, p: &Palette, u: &FeedUpdate, width: f32) -> Option<
                 .role("button")
                 .label(format!("Show slide {}", i + 1))
                 .focusable(true)
-                .h(16.0)
+                .h(24.0)
+                .min_w(24.0)
                 .px(4.0)
                 .center()
                 .cursor(Cursor::Pointer)

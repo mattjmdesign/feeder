@@ -268,7 +268,7 @@ fn tile(s: &State, summary: &ProjectSummary, p: &Palette, k: &Kit, reduced_motio
         );
     } else if !archived && summary.needs_you {
         words = words
-            .child(el().px(6.0).py(1.0).radius(5.0).fill(p.amber.alpha(0.14)).child(text("Needs you").font(style::META).color(p.amber)));
+            .child(el().px(6.0).py(1.0).radius(5.0).fill(p.amber.alpha(0.14)).child(text("Needs you").font(style::META).color(p.text)));
     }
     if s.settings.show_folders
         && summary.project.renamed()
