@@ -9,10 +9,12 @@ use feeder_core::gardener::{
     Backend, ChatOpening, ChatSummary, Event, OPENING, RunStatus, Scope, Session, SessionEnv, SessionMode, StoredEvent, ToolCall,
 };
 use feeder_core::{Change, Flag, ago};
-use rune::{Cursor, El, Key, KeyEvent, TextEdit, Tx, col, el, icon, row, text};
+use rune::{Cursor, El, Icon, Key, KeyEvent, TextEdit, Tx, col, el, icon, row, text};
 use rune_kit::diff::{FileDiff, LineKind};
 use rune_kit::shell::{Sidebar, SidebarRow, SidebarSection};
-use rune_kit::{Badge, BadgeVariant, Button, ButtonVariant, Card, ControlSize, Divider, Kit, Placement, Select, Spinner, TextArea};
+use rune_kit::{
+    Badge, BadgeVariant, Button, ButtonVariant, Card, ControlSize, Divider, IconButton, IconButtonVariant, Kit, Placement, Select, Spinner,
+};
 
 use crate::State;
 use crate::style::{self, Palette};
@@ -300,7 +302,7 @@ impl State {
         }
     }
 
-    /// Carries a Notebook search with no matches over to Curator as a question.
+    /// Carries a Notebook search with no matches over to Curator and asks it.
     pub fn ask_curator(&mut self, question: String) {
         self.notebook.query = TextEdit::new("");
         self.notebook_shelf(crate::notebook::Shelf::Gardener);
@@ -310,9 +312,9 @@ impl State {
         if self.notebook.chat.phase != Phase::Idle {
             self.gardener_close();
         }
-        let input = &mut self.notebook.chat.input;
-        *input = TextEdit::new(question);
-        input.focused = true;
+        // Start the answer right away: the search already said what the person wants to know.
+        self.notebook.chat.input = TextEdit::new(question);
+        self.gardener_submit();
     }
 
     /// Opens the Curator page pre-scoped to `project_id` so the user can review scope before starting.
@@ -404,27 +406,27 @@ pub fn selected_backend(s: &State) -> Option<Backend> {
 }
 
 /// The provider picker beside the send button. Locked to the running chat's provider mid-chat.
-fn provider_picker(s: &State, k: &Kit, layer: &mut Vec<El>) -> Option<El> {
+fn provider_picker(s: &State, p: &Palette, k: &Kit, layer: &mut Vec<El>) -> Option<El> {
     let installed = &s.notebook.gardener.backends;
     let chat = &s.notebook.chat;
     let locked = matches!(chat.phase, Phase::Working | Phase::Ready);
     let current = if locked { chat.backend } else { selected_backend(s) }?;
     let labels: Vec<&str> = if locked { vec![current.label()] } else { installed.iter().map(|b| b.label()).collect() };
     let choices = installed.clone();
-    Some(
-        Select::new("gardener-provider", &labels)
-            .label("Provider")
-            .current(Some(current.label()))
-            .open(s.notebook.provider_open && !locked)
-            .placement(Placement::TopEnd)
-            .on_toggle(|s: &mut State| s.notebook.provider_open = !s.notebook.provider_open)
-            .on_close(|s: &mut State| s.notebook.provider_open = false)
-            .on_choose(move |s: &mut State, chosen: &str, _| {
-                s.notebook.curator_backend = choices.iter().copied().find(|b| b.label() == chosen);
-                s.notebook.provider_open = false;
-            })
-            .build(k, layer),
-    )
+    let mark = crate::agents::mark(current.label(), p, 14.0, s.agent_icon(current.label()));
+    let select = Select::new("gardener-provider", &labels)
+        .label("Provider")
+        .current(Some(current.label()))
+        .open(s.notebook.provider_open && !locked)
+        .placement(Placement::TopEnd)
+        .on_toggle(|s: &mut State| s.notebook.provider_open = !s.notebook.provider_open)
+        .on_close(|s: &mut State| s.notebook.provider_open = false)
+        .on_choose(move |s: &mut State, chosen: &str, _| {
+            s.notebook.curator_backend = choices.iter().copied().find(|b| b.label() == chosen);
+            s.notebook.provider_open = false;
+        })
+        .build(k, layer);
+    Some(row().gap(2.0).center_y().child(mark).child(select))
 }
 
 /// Current live status text while Curator is working.
@@ -519,7 +521,7 @@ fn status_line(s: &State, p: &Palette) -> Option<El> {
 }
 
 /// Pinned composer using native `rune_kit::TextInput` and `Button`.
-pub fn composer(s: &State, _p: &Palette, k: &Kit, max_w: f32, layer: &mut Vec<El>) -> El {
+pub fn composer(s: &State, p: &Palette, k: &Kit, max_w: f32, layer: &mut Vec<El>) -> El {
     let chat = &s.notebook.chat;
     // A saved thread is a record; New Chat in the sidebar starts the next conversation.
     if chat.viewing.is_some() {
@@ -531,46 +533,46 @@ pub fn composer(s: &State, _p: &Palette, k: &Kit, max_w: f32, layer: &mut Vec<El
         Phase::Ready => "Ask a follow-up…",
         Phase::Idle | Phase::Ended => "Ask Curator…",
     };
-    let input = TextArea::new(&chat.input)
-        .placeholder(placeholder)
-        .label("Message Curator")
-        .auto_grow(1, 8)
-        .width(None)
-        .disabled(backend.is_none() || chat.phase == Phase::Working)
-        .on_edit(|s: &mut State| &mut s.notebook.chat.input)
-        .on_submit(|s: &mut State, _tx: &mut Tx| s.gardener_submit())
-        .on_key(|s: &mut State, e: &KeyEvent, _tx: &mut Tx| match e.key {
-            // Enter sends and Shift-Enter starts a new line, as in every AI chat.
-            Key::Enter if !e.mods.shift => {
-                s.gardener_submit();
-                true
-            }
-            Key::Escape if s.notebook.chat.phase == Phase::Working => {
-                s.gardener_stop();
-                true
-            }
-            _ => false,
-        })
-        .build(k)
+    let disabled = backend.is_none() || chat.phase == Phase::Working;
+    // The field sits borderless inside the composer box, as in T3 Code and Claude: Return sends,
+    // Shift-Return breaks the line, Esc stops a run.
+    let mut field = rune::text_input(&chat.input, style::BODY)
+        .key("gardener-input")
         .w_full()
-        .key("gardener-input");
+        .color(p.text)
+        .placeholder(placeholder, p.text_3)
+        .caret(p.text, p.selection)
+        .label("Message Curator")
+        .disabled(disabled);
+    if !disabled {
+        field = field
+            .on_edit(|s: &mut State| &mut s.notebook.chat.input)
+            .on_submit(|s: &mut State, _tx: &mut Tx| s.gardener_submit())
+            .on_input_key(|s: &mut State, e: &KeyEvent, _tx: &mut Tx| {
+                if matches!(e.key, Key::Escape) && s.notebook.chat.phase == Phase::Working {
+                    s.gardener_stop();
+                    return true;
+                }
+                false
+            });
+    }
+    let input = rune::auto_grow(field, 1, 8);
 
     let draft = chat.draft();
-    let send_label = match (chat.phase, draft.map(|(mode, _)| mode)) {
-        (Phase::Idle | Phase::Ended, Some(SessionMode::Review)) => "Update Note",
-        (Phase::Idle | Phase::Ended, _) => "Ask",
-        _ => "Send",
-    };
     let send = if chat.phase == Phase::Working {
-        // Stop takes Send's place while Curator works.
-        Button::new("Stop").variant(ButtonVariant::Outline).on_press(|s: &mut State| s.gardener_stop()).build(k).key("gardener-stop")
+        IconButton::new(&STOP_ICON)
+            .variant(IconButtonVariant::Neutral)
+            .label("Stop")
+            .on_press(|s: &mut State| s.gardener_stop())
+            .build(k)
+            .key("gardener-stop")
     } else {
-        Button::new(send_label)
-            .variant(ButtonVariant::Submit)
+        IconButton::new(&SEND_ICON)
+            .variant(IconButtonVariant::Submit)
+            .label(if matches!(chat.phase, Phase::Idle | Phase::Ended) { "Ask" } else { "Send" })
             .disabled(
                 backend.is_none()
                     || s.notebook.gardener.running.is_some() && matches!(chat.phase, Phase::Idle | Phase::Ended)
-                    || chat.phase == Phase::Working
                     || draft.is_none(),
             )
             .on_press(|s: &mut State| s.gardener_submit())
@@ -578,34 +580,55 @@ pub fn composer(s: &State, _p: &Palette, k: &Kit, max_w: f32, layer: &mut Vec<El
             .key("gardener-send")
     };
 
-    // One row under the box: Curator's jobs on the left before a chat starts, provider and send on the right.
-    let mut actions = row().w_full().gap(8.0).center_y();
-    if is_fresh(s) {
-        actions = actions.child(jobs(s, k).grow(1.0).min_w(0.0));
-    } else {
-        actions = actions.child(rune::spacer());
+    // The toolbar lives inside the box: jobs on the left before a chat starts, then the agent
+    // and send on the right.
+    let mut toolbar = row().w_full().gap(6.0).center_y();
+    toolbar = if is_fresh(s) { toolbar.child(jobs(s, k).grow(1.0).min_w(0.0)) } else { toolbar.child(rune::spacer()) };
+    if let Some(picker) = provider_picker(s, p, k, layer) {
+        toolbar = toolbar.child(picker);
     }
-    if let Some(picker) = provider_picker(s, k, layer) {
-        actions = actions.child(picker);
-    }
-    let bar = col().w_full().gap(8.0).child(input).child(actions.child(send));
-    let stack = col().w_full().max_w(max_w.min(CHAT_MAX_W)).child(bar);
-    col().w_full().items_center().px(40.0).pt(8.0).pb(12.0).child(stack)
+    let card = col()
+        .key("gardener-composer")
+        .w_full()
+        .max_w(max_w.min(CHAT_MAX_W))
+        .gap(8.0)
+        .pl(14.0)
+        .pr(8.0)
+        .pt(12.0)
+        .pb(8.0)
+        .radius(COMPOSER_RADIUS)
+        .fill(p.card)
+        .border(1.0, if chat.input.focused { p.text_3 } else { p.hairline })
+        .child(col().w_full().pr(6.0).child(input))
+        .child(toolbar.child(send));
+    col().w_full().items_center().px(40.0).pt(8.0).pb(14.0).child(card)
 }
+
+/// The composer box's corners, a step rounder than controls so the box reads as one surface.
+const COMPOSER_RADIUS: f32 = 12.0;
+
+pub(crate) static SEND_ICON: Icon = Icon {
+    name: "curator-send",
+    view: 16.0,
+    body: r#"<path d="M8 12.75V3.5M3.75 7.5L8 3.25L12.25 7.5" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" fill="none"/>"#,
+};
+
+static STOP_ICON: Icon =
+    Icon { name: "curator-stop", view: 16.0, body: r#"<rect x="4.5" y="4.5" width="7" height="7" rx="1.5" fill="currentColor"/>"# };
 
 /// Curator's preset jobs, shown above the composer before a chat starts.
 fn jobs(s: &State, k: &Kit) -> El {
     let g = &s.notebook.gardener;
     let ready = !g.backends.is_empty() && g.running.is_none();
     let has_flags = !scoped_flags(s).is_empty();
-    let mut jobs = row().gap(8.0).wrap();
+    let mut jobs = row().gap(2.0).wrap();
     for job in [Job::ReviewFlags, Job::FindDuplicates] {
         if job == Job::ReviewFlags && !has_flags {
             continue;
         }
         jobs = jobs.child(
             Button::new(job.label())
-                .variant(ButtonVariant::Outline)
+                .variant(ButtonVariant::GhostMuted)
                 .control_size(ControlSize::Small)
                 .disabled(!ready)
                 .on_press(move |s: &mut State| s.gardener_job(job))

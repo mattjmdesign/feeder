@@ -824,19 +824,11 @@ fn index_view(s: &State, p: &Palette, k: &Kit, reduced_motion: bool) -> El {
 
     let mut list = col().key("nb-index").w_full();
     if pages.is_empty() {
-        let mut empty = col().w_full().py(36.0).gap(8.0).child(text("No matching notes").font(style::NAME).color(p.text));
         let question = nb.query.text.trim().to_string();
-        if !question.is_empty() && !nb.gardener.backends.is_empty() {
-            empty = empty.child(
-                row().pt(4.0).child(
-                    Button::new("Ask Curator")
-                        .variant(ButtonVariant::Outline)
-                        .control_size(ControlSize::Small)
-                        .on_press(move |s: &mut State| s.ask_curator(question.clone()))
-                        .build(k)
-                        .key("nb-ask-curator"),
-                ),
-            );
+        let heading = if question.is_empty() { "No matching notes".to_string() } else { format!("No notes match “{question}”") };
+        let mut empty = col().w_full().py(32.0).gap(14.0).child(text(heading).font(style::NAME).color(p.text_2));
+        if let (false, Some(agent)) = (question.is_empty(), crate::gardener::selected_backend(s)) {
+            empty = empty.child(ask_curator_card(s, &question, agent, p, k));
         }
         list = list.child(empty);
     } else {
@@ -1126,6 +1118,33 @@ fn page_view(s: &State, page: &Page, p: &Palette, k: &Kit, layer: &mut Vec<El>) 
     }
 
     doc
+}
+
+/// The empty-search hand-off to Curator: the question, the agent that will answer, one press.
+fn ask_curator_card(s: &State, question: &str, agent: feeder_core::gardener::Backend, p: &Palette, k: &Kit) -> El {
+    let q = question.to_string();
+    row()
+        .key("nb-ask-curator")
+        .role("button")
+        .label(format!("Ask Curator: {question}"))
+        .focusable(true)
+        .focus_ring(2.0, 0.0, k.c.border_focus)
+        .w_full()
+        .gap(12.0)
+        .px(14.0)
+        .py(12.0)
+        .center_y()
+        .radius(10.0)
+        .fill(p.card)
+        .border(1.0, p.hairline)
+        .hover(p.hover)
+        .cursor(Cursor::Pointer)
+        .on_press(move |s: &mut State| s.ask_curator(q.clone()))
+        .child(agents::mark(agent.label(), p, 16.0, s.agent_icon(agent.label())))
+        .child(col().grow(1.0).min_w(0.0).gap(2.0).child(text("Ask Curator").font(style::NAME).color(p.text)).child(
+            text(format!("“{question}” · answers from your notes with {}", agent.label())).font(style::META).color(p.text_2).truncate(),
+        ))
+        .child(icon(&crate::gardener::SEND_ICON, 14.0).color(p.text_3).a11y_hidden())
 }
 
 /// A titled list of note rows, used for Linked from and Related.
