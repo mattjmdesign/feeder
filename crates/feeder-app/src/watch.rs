@@ -8,7 +8,11 @@ use std::sync::mpsc::{self, RecvTimeoutError, Sender};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use feeder_core::{FeedUpdate, OnSimilar, Page, PageDraft, PageFilter, ProjectSummary, Reply, Settings, Standing, Store, TodoItem, now_ms};
+use feeder_core::gardener::{Backend, ChatSummary, Run, RunStatus};
+use feeder_core::{
+    Change, FeedUpdate, Flag, FlagStatus, GARDENER, HUMAN_AUTHOR, OnSimilar, Page, PageDraft, PageFilter, ProjectSummary, Reply, Settings,
+    Standing, Store, TodoItem, now_ms,
+};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
 pub struct Want {
@@ -60,6 +64,40 @@ pub enum NotebookOp {
     SetStanding(i64, Standing),
     Helped(i64),
     Delete(i64),
+    /// Undo a logged change (see the Curator page).
+    Revert(i64),
+    /// Flag a Feed update for the Curator to review (idempotent).
+    FlagUpdate(i64),
+    /// Delete a saved Curator chat's transcript; its Notebook edits stay.
+    DeleteChat(i64),
+}
+
+/// What the Notebook's Gardener page shows.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct GardenerView {
+    /// The gardener's latest changes, newest first, with any reverts of them.
+    pub changes: Vec<Change>,
+    pub open_flags: Vec<Flag>,
+    pub last_run: Option<Run>,
+    pub running: Option<Run>,
+    /// Saved Curator chats, newest first.
+    pub chats: Vec<ChatSummary>,
+    /// The installed CLIs that can run it, Claude Code first.
+    pub backends: Vec<Backend>,
+}
+
+/// How many of the gardener's changes and open flags the page lists.
+const GARDENER_LIST: usize = 30;
+
+fn gardener_view(s: &Store, backends: &[Backend]) -> feeder_core::Result<GardenerView> {
+    Ok(GardenerView {
+        changes: s.changes(Some(GARDENER), None, GARDENER_LIST)?,
+        open_flags: s.flags(Some(FlagStatus::Open), GARDENER_LIST)?,
+        last_run: s.gardener_runs(1)?.into_iter().find(|r| r.status != RunStatus::Running),
+        running: s.running_gardener()?,
+        chats: s.curator_chats(GARDENER_LIST)?,
+        backends: backends.to_vec(),
+    })
 }
 
 pub struct Snapshot {
@@ -76,6 +114,7 @@ pub struct Snapshot {
     pub search_hits: Vec<FeedUpdate>,
     /// Every notebook page, archived ones included, when the notebook changed since the last snapshot.
     pub pages: Option<Vec<Page>>,
+    pub gardener: Option<GardenerView>,
     /// Agents without a logo whose app is installed, with the app to take the icon from.
     pub agent_apps: Vec<(String, PathBuf)>,
     pub error: Option<String>,
@@ -112,9 +151,11 @@ impl Watcher {
                 let mut timeline_limit = TIMELINE_PAGE;
                 let mut apps: HashMap<String, Option<PathBuf>> = Default::default();
                 let mut seen: Option<i64> = None;
-                let mut last_notebook_stamp: Option<(i64, i64, i64)> = None;
+                let mut last_notebook_stamp: Option<(i64, i64, i64, i64)> = None;
                 let mut next_pulse_expiry: Option<i64> = None;
                 let mut dirty = true;
+                // Which CLIs are installed only changes when the person installs one; check at start.
+                let backends = Backend::installed();
                 loop {
                     let mut renames = Vec::new();
                     let mut briefs = Vec::new();
@@ -193,6 +234,7 @@ impl Watcher {
                                         search_query: search_query.clone(),
                                         search_hits: vec![],
                                         pages: None,
+                                        gardener: None,
                                         agent_apps: vec![],
                                         error: Some(e.to_string()),
                                         mutation_error,
@@ -283,6 +325,9 @@ impl Watcher {
                             NotebookOp::SetStanding(id, standing) => s.set_page_standing(id, standing),
                             NotebookOp::Helped(id) => s.mark_page_helped(id).map(|_| ()),
                             NotebookOp::Delete(id) => s.delete_page(id),
+                            NotebookOp::Revert(id) => s.revert_change(id, HUMAN_AUTHOR).map(|_| ()),
+                            NotebookOp::FlagUpdate(update_id) => s.flag_update_for_notebook(update_id, HUMAN_AUTHOR).map(|_| ()),
+                            NotebookOp::DeleteChat(run_id) => s.delete_curator_chat(run_id),
                         };
                         if let Err(e) = res {
                             mutation_error = Some(format!("Notebook change failed: {e}"));
@@ -316,10 +361,11 @@ impl Watcher {
                         }
                         let pages =
                             if need_pages { Some(s.pages(&PageFilter { include_archived: true, ..PageFilter::default() })?) } else { None };
-                        Ok((projects, feed, todos, timeline, replies, search_hits, pages))
+                        let gardener = gardener_view(s, &backends)?;
+                        Ok((projects, feed, todos, timeline, replies, search_hits, pages, gardener))
                     });
                     let snapshot = match loaded {
-                        Ok((projects, feed, todos, timeline, replies, search_hits, pages)) => {
+                        Ok((projects, feed, todos, timeline, replies, search_hits, pages, gardener)) => {
                             if pages.is_some() {
                                 last_notebook_stamp = nb_stamp;
                             }
@@ -349,6 +395,7 @@ impl Watcher {
                                 search_query: search_query.clone(),
                                 search_hits,
                                 pages,
+                                gardener: Some(gardener),
                                 agent_apps,
                                 error: None,
                                 mutation_error,
@@ -368,6 +415,7 @@ impl Watcher {
                                 search_query: search_query.clone(),
                                 search_hits: vec![],
                                 pages: None,
+                                gardener: None,
                                 agent_apps: vec![],
                                 error: Some(e.to_string()),
                                 mutation_error,

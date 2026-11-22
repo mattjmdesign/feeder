@@ -7,6 +7,7 @@ mod agents;
 mod chrome;
 mod connect;
 mod feed;
+mod gardener;
 mod home;
 mod icon;
 mod keys;
@@ -199,6 +200,8 @@ pub struct State {
     pub search_hits: Vec<FeedUpdate>,
     /// Update id awaiting delete confirmation.
     pub delete_confirm: Option<i64>,
+    /// The Feed post whose ⋯ menu is open.
+    pub post_menu: Option<i64>,
     /// Unified `(target, copied_at_ms)` for transient "Copied" button labels.
     pub copy_feedback: Option<(CopyTarget, i64)>,
     /// Bottom-right toast notifications (undo archive, copy image, watcher errors).
@@ -324,6 +327,7 @@ impl State {
             search_snapshot_query: String::new(),
             search_hits: vec![],
             delete_confirm: None,
+            post_menu: None,
             copy_feedback: None,
             toasts: ToastStack::default(),
             pending_url: None,
@@ -1268,7 +1272,7 @@ fn view(s: &State, cx: &mut Cx<State>) -> El {
         let header = chrome::bar(s, &p, &k, &mut layer, inset, leading, trailing);
         let page = match s.open {
             Some(id) => feed::view(s, id, &p, &k, reduced_motion),
-            None if s.tab == Tab::Feed => timeline::view(s, &p, &k),
+            None if s.tab == Tab::Feed => timeline::view(s, &p, &k, &mut layer),
             None => home::view(s, &p, &k, reduced_motion, &mut layer),
         };
         col().key("shell").w_full().h_full().child(header).child(page)
@@ -1312,6 +1316,7 @@ fn poll(s: &mut State, clock: f64, tx: &mut Tx) -> bool {
         changed |= updater::poll(s);
     }
     s.sync_search();
+    changed |= s.notebook.chat.drain();
     s.agents.follow_settings(s.settings_open, s.wake.as_ref());
     changed |= s.agents.take();
     if let Some(cache) = &s.images {
@@ -1382,6 +1387,15 @@ fn poll(s: &mut State, clock: f64, tx: &mut Tx) -> bool {
             if s.notebook.open.is_some_and(|id| s.notebook.page(id).is_none()) {
                 s.notebook.open = None; // deleted from another client
             }
+        }
+        if let Some(mut g) = snap.gardener {
+            if let Some(chats) = &s.notebook.preview_chats {
+                g.chats.clone_from(chats);
+            }
+            if let Some(changes) = &s.notebook.preview_changes {
+                g.changes.clone_from(changes);
+            }
+            s.notebook.gardener = g;
         }
         s.replies = snap.replies;
         s.search_snapshot_query = snap.search_query;
@@ -1484,7 +1498,7 @@ fn poll(s: &mut State, clock: f64, tx: &mut Tx) -> bool {
     }
 
     // Gentle breathing halo animation while any project has a live pulse.
-    if rune::tooling::headless_run().is_none() && s.has_active_pulse() && (s.open.is_some() || s.tab == Tab::Home) {
+    if rune::tooling::headless_run().is_none() && s.has_active_pulse() && (s.open.is_some() || s.tab == Tab::Home || s.tab == Tab::Feed) {
         if clock - s.last_pulse_tick >= 0.065 {
             s.last_pulse_tick = clock;
             changed = true;
@@ -1542,6 +1556,167 @@ fn main() {
             ("notebook-page", |s| {
                 s.tab = Tab::Notebook;
                 s.notebook.auto_open_first = true;
+            }),
+            ("notebook-gardener", |s| {
+                s.tab = Tab::Notebook;
+                s.notebook.shelf = notebook::Shelf::Gardener;
+            }),
+            ("notebook-gardener-session", |s| {
+                s.tab = Tab::Notebook;
+                s.notebook.shelf = notebook::Shelf::Gardener;
+                gardener::replay(&mut s.notebook.chat, feeder_core::gardener::Backend::ClaudeCode, feeder_core::gardener::demo_events());
+            }),
+            ("notebook-gardener-working", |s| {
+                s.tab = Tab::Notebook;
+                s.notebook.shelf = notebook::Shelf::Gardener;
+                // The demo session cut off mid-search, so the live spinner shows.
+                let mut events = feeder_core::gardener::demo_events();
+                events.truncate(11);
+                events.push(feeder_core::gardener::Event::ToolStarted(feeder_core::gardener::ToolCall {
+                    id: "t5".into(),
+                    name: "search_notebook".into(),
+                    input: Default::default(),
+                }));
+                gardener::replay(&mut s.notebook.chat, feeder_core::gardener::Backend::ClaudeCode, events);
+            }),
+            ("notebook-curator-history", |s| {
+                use feeder_core::gardener::{ChatSummary, Scope, SessionMode};
+                s.tab = Tab::Notebook;
+                s.notebook.shelf = notebook::Shelf::Gardener;
+                s.notebook.preview_chats = Some(vec![
+                    ChatSummary {
+                        run_id: 2,
+                        started_at: s.now - 40 * 60_000,
+                        mode: SessionMode::Ask,
+                        scope: Scope::Notebook,
+                        title: "How do we ship the Mac app?".into(),
+                        edits: 0,
+                        truncated: false,
+                    },
+                    ChatSummary {
+                        run_id: 1,
+                        started_at: s.now - 26 * 3_600_000,
+                        mode: SessionMode::Review,
+                        scope: Scope::Notebook,
+                        title: "Review Open Flags".into(),
+                        edits: 2,
+                        truncated: false,
+                    },
+                ]);
+            }),
+            ("notebook-curator-revision", |s| {
+                use feeder_core::gardener::{Event, ToolCall};
+                s.tab = Tab::Notebook;
+                s.notebook.shelf = notebook::Shelf::Gardener;
+                // A Review chat that revised page #1, for the inline diff. Needs a demo FEEDER_HOME
+                // where Curator revised that page.
+                let events = vec![
+                    Event::Started,
+                    Event::Text("Flag 2 says the busy timeout and writer rule are missing, so I'm adding them to the SQLite page.".into()),
+                    Event::ToolStarted(ToolCall {
+                        id: "w".into(),
+                        name: "write_page".into(),
+                        input: r#"{"id":1,"title":"SQLite returns SQLITE_BUSY under parallel writes"}"#.parse().unwrap_or_default(),
+                    }),
+                    Event::ToolFinished { id: "w".into(), output: "Revised page #1".into(), failed: false },
+                    Event::Text("Updated the SQLite page with the timeout value and the one-writer rule from flag 2.".into()),
+                    Event::TurnFinished,
+                ];
+                s.notebook.preview_changes = Some(vec![feeder_core::Change {
+                    id: 1,
+                    page_id: 1,
+                    page_title: "SQLite returns SQLITE_BUSY under parallel writes".into(),
+                    action: feeder_core::ChangeAction::Revised,
+                    agent: feeder_core::GARDENER.into(),
+                    reason: Some("Flag 2: timeout value and writer rule missing".into()),
+                    before: Some(feeder_core::PageSnapshot {
+                        kind: "pitfall".into(),
+                        topic: "rust".into(),
+                        title: "SQLite returns SQLITE_BUSY under parallel writes".into(),
+                        tags: vec!["rust".into(), "sqlite".into()],
+                        body: "## What happened\n\nTwo worker threads writing the same database failed with 'database is locked' under load.\n\n## Why\n\nEach connection opened in the default rollback journal mode, which locks the whole file for every write.\n\n## Takeaway\n\nOpen every connection in WAL mode and set a busy timeout before the first write.".into(),
+                    }),
+                    created_at: s.now,
+                    reverted_at: None,
+                    undoes: None,
+                    source_updates: vec![],
+                    gardener_run_id: None,
+                    source_flags: vec![2],
+                }]);
+                gardener::replay(&mut s.notebook.chat, feeder_core::gardener::Backend::ClaudeCode, events);
+            }),
+            ("notebook-curator-diagram", |s| {
+                use feeder_core::gardener::Event;
+                s.tab = Tab::Notebook;
+                s.notebook.shelf = notebook::Shelf::Gardener;
+                let answer = "Releases go through one script:\n\n```mermaid\nflowchart LR\n  A[Bump version] --> B[Write release notes]\n  B --> C[scripts/changelog.sh]\n  C --> D[scripts/release.sh]\n  D --> E[Sign + notarize]\n  E --> F[Publish appcast]\n```\n\nThe signing key for the appcast isn't in the Notebook yet.";
+                let events = vec![Event::Started, Event::Text(answer.into()), Event::TurnFinished];
+                gardener::replay(&mut s.notebook.chat, feeder_core::gardener::Backend::ClaudeCode, events);
+                s.notebook.chat.items.insert(0, gardener::Item::You("How do we ship the Mac app?".into()));
+            }),
+            ("notebook-curator-streaming", |s| {
+                use feeder_core::gardener::Event;
+                s.tab = Tab::Notebook;
+                s.notebook.shelf = notebook::Shelf::Gardener;
+                // Cut mid-sentence with an unclosed emphasis and link, as a stream arrives.
+                let partial = "Open every connection in **WAL mode** and set a busy timeout. See [SQLite returns SQLITE_BUSY](feeder://noteb";
+                let events = vec![Event::Started, Event::Text(partial.into())];
+                gardener::replay(&mut s.notebook.chat, feeder_core::gardener::Backend::ClaudeCode, events);
+                s.notebook.chat.items.insert(0, gardener::Item::You("Why do our parallel writes fail?".into()));
+            }),
+            ("notebook-curator-saved", |s| {
+                s.tab = Tab::Notebook;
+                s.notebook.shelf = notebook::Shelf::Gardener;
+                let mut events = feeder_core::gardener::demo_events();
+                events.retain(|e| !matches!(e, feeder_core::gardener::Event::Ended));
+                {
+                    use feeder_core::gardener::{ChatSummary, Scope, SessionMode};
+                    s.notebook.preview_chats = Some(vec![
+                        ChatSummary {
+                            run_id: 2,
+                            started_at: s.now - 40 * 60_000,
+                            mode: SessionMode::Ask,
+                            scope: Scope::Notebook,
+                            title: "How do we ship the Mac app?".into(),
+                            edits: 0,
+                            truncated: false,
+                        },
+                        ChatSummary {
+                            run_id: 1,
+                            started_at: s.now - 26 * 3_600_000,
+                            mode: SessionMode::Review,
+                            scope: Scope::Notebook,
+                            title: "What changed in the release notes?".into(),
+                            edits: 1,
+                            truncated: false,
+                        },
+                        ChatSummary {
+                            run_id: 3,
+                            started_at: s.now - 4 * 86_400_000,
+                            mode: SessionMode::Ask,
+                            scope: Scope::Notebook,
+                            title: "Why does SQLite return BUSY under load?".into(),
+                            edits: 0,
+                            truncated: false,
+                        },
+                    ]);
+                }
+                gardener::preview_saved(
+                    &mut s.notebook.chat,
+                    feeder_core::gardener::Backend::ClaudeCode,
+                    1,
+                    "What changed in the release notes?",
+                    events,
+                );
+            }),
+            ("notebook-no-match", |s| {
+                s.tab = Tab::Notebook;
+                s.notebook.query = TextEdit::new("appcast signing key");
+            }),
+            ("notebook-page-linked", |s| {
+                // Demo note #1, which another demo note links to, for Linked from.
+                s.tab = Tab::Notebook;
+                s.notebook.open = Some(1);
             }),
             ("notebook-new", |s| {
                 s.tab = Tab::Notebook;

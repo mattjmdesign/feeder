@@ -36,6 +36,7 @@ pnpm --dir site dev
 | Path | What it is |
 | --- | --- |
 | `crates/feeder-core` | The store (SQLite), the Notebook and agent setup (`setup` edits each tool's MCP config) |
+| `crates/feeder-core/src/gardener` | The Notebook gardener: runs the person's own `claude` or `codex` as a live session wired only to `feeder mcp --gardener` |
 | `crates/feeder-cli` | The `feeder` command and the MCP server (`feeder mcp`) |
 | `crates/feeder-app` | The window, in [Rune](https://github.com/anomalyco/rune). `updater.m` wraps Sparkle, `notify.m` posts notifications |
 | `crates/feeder-app/src/style.rs` | Colours, type roles and corner radii. Use these; don't write sizes or weights inline |

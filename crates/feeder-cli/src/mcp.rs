@@ -17,6 +17,7 @@ use serde_json::{Value, json};
 
 use crate::{project_json, todo_json, update_json};
 
+mod gardener;
 mod notebook;
 
 const PROTOCOL_VERSIONS: [&str; 4] = ["2025-11-25", "2025-06-18", "2025-03-26", "2024-11-05"];
@@ -24,11 +25,21 @@ const MAX_INLINE_SCREENSHOTS: usize = 6;
 const MAX_INLINE_SCREENSHOT_BYTES: u64 = 5 * 1024 * 1024;
 const MAX_RPC_LINE_BYTES: usize = 16 * 1024 * 1024;
 
+/// Who the server is for.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Role {
+    /// A coding agent: every feed, to-do and notebook tool.
+    Agent,
+    /// The Notebook gardener: only its own guarded tools.
+    Gardener(i64),
+}
+
 struct Server {
     client: Option<String>,
     cwd: PathBuf,
     store_dir: Option<PathBuf>,
     store: RefCell<Option<Store>>,
+    role: Role,
 }
 
 struct ToolOutput {
@@ -48,8 +59,9 @@ impl ToolOutput {
     }
 }
 
-pub fn serve() -> Result<(), String> {
+pub fn serve(role: Role) -> Result<(), String> {
     let mut server = Server::new(None, std::env::current_dir().map_err(|e| e.to_string())?, None);
+    server.role = role;
     let stdin = std::io::stdin();
     let mut reader = stdin.lock();
     let mut stdout = std::io::stdout().lock();
@@ -109,7 +121,7 @@ fn read_line_capped<R: BufRead>(reader: &mut R, out: &mut Vec<u8>, max_bytes: us
 
 impl Server {
     fn new(client: Option<String>, cwd: PathBuf, store_dir: Option<PathBuf>) -> Self {
-        Self { client, cwd, store_dir, store: RefCell::new(None) }
+        Self { client, cwd, store_dir, store: RefCell::new(None), role: Role::Agent }
     }
 
     fn open_store(&self) -> Result<Ref<'_, Store>, String> {
@@ -139,12 +151,17 @@ impl Server {
         let params = msg.get("params").cloned().unwrap_or(json!({}));
         let id = id?; // notifications (initialized, cancelled) need no answer
         let result = match method {
-            "initialize" => Ok(self.initialize(&params)),
+            "initialize" => self.initialize(&params).map_err(|e| (-32603, e)),
             "ping" => Ok(json!({})),
-            "tools/list" => Ok(json!({ "tools": all_tools() })),
+            "tools/list" => match self.role {
+                Role::Agent => Ok(json!({ "tools": all_tools() })),
+                Role::Gardener(run) => {
+                    self.curator_mode(run).map(|mode| json!({ "tools": gardener::tools(mode) })).map_err(|e| (-32603, e))
+                }
+            },
             "tools/call" => Ok(self.call(&params)),
-            "resources/list" => self.resources_list().map_err(|e| (-32603, e)),
-            "resources/templates/list" => Ok(json!({
+            "resources/list" if self.role == Role::Agent => self.resources_list().map_err(|e| (-32603, e)),
+            "resources/templates/list" if self.role == Role::Agent => Ok(json!({
                 "resourceTemplates": [{
                     "uriTemplate": "feeder://project/{slug}/feed",
                     "name": "Project feed",
@@ -157,17 +174,17 @@ impl Server {
                     "mimeType": "text/markdown"
                 }]
             })),
-            "resources/read" => self.resources_read(&params),
-            "prompts/list" => Ok(json!({ "prompts": [{
+            "resources/read" if self.role == Role::Agent => self.resources_read(&params),
+            "prompts/list" if self.role == Role::Agent => Ok(json!({ "prompts": [{
                 "name": "update",
                 "title": "Post a Feeder update",
                 "description": "Write this project's update the Feeder way and post it."
             }, {
                 "name": "lesson",
-                "title": "Save a lesson to the notebook",
-                "description": "Turn what was learned this session into a notebook page, if anything is worth keeping."
+                "title": "Flag a lesson for Curator",
+                "description": "Flag missing or incorrect Notebook knowledge uncovered in this session."
             }] })),
-            "prompts/get" => match params.get("name").and_then(Value::as_str) {
+            "prompts/get" if self.role == Role::Agent => match params.get("name").and_then(Value::as_str) {
                 Some("update") => Ok(json!({
                     "description": "Write this project's update the Feeder way and post it.",
                     "messages": [{ "role": "user", "content": { "type": "text", "text": format!(
@@ -175,9 +192,9 @@ impl Server {
                     ) } }]
                 })),
                 Some("lesson") => Ok(json!({
-                    "description": "Turn what was learned this session into a notebook page, if anything is worth keeping.",
+                    "description": "Flag missing or incorrect Notebook knowledge uncovered in this session.",
                     "messages": [{ "role": "user", "content": { "type": "text", "text": format!(
-                        "{NOTEBOOK_GUIDE}\n\nLook back over this session. If it produced a lesson that clears the bar above (a non-obvious fix, a dead end, a reusable pattern or a settled decision), search the notebook for it first, then write a new page or revise the existing one. If nothing clears the bar, say so and write nothing."
+                        "{NOTEBOOK_GUIDE}\n\nLook back over this session for a reusable lesson. Search the Notebook first. If you find a gap or a correction, call flag_knowledge with the verified fix in suggestion when available. If the Notebook already covers it accurately, skip the flag."
                     ) } }]
                 })),
                 _ => Err((-32602, "unknown prompt".to_string())),
@@ -190,22 +207,40 @@ impl Server {
         })
     }
 
-    fn initialize(&mut self, params: &Value) -> Value {
+    fn initialize(&mut self, params: &Value) -> Result<Value, String> {
         self.client = params.pointer("/clientInfo/name").and_then(Value::as_str).map(str::to_string);
         let asked = params.get("protocolVersion").and_then(Value::as_str).unwrap_or(PROTOCOL_VERSIONS[1]);
         let version = if PROTOCOL_VERSIONS.contains(&asked) { asked } else { PROTOCOL_VERSIONS[1] };
-        json!({
+        let (capabilities, instructions) = match self.role {
+            Role::Agent => (
+                json!({ "tools": {}, "prompts": {}, "resources": {} }),
+                format!(
+                    "Feeder is the user's local project update centre. Post an update with post_update when you finish a meaningful piece of work or when asked, and call get_feed before picking a project back up. Search the shared Notebook before non-trivial debugging. Flag gaps and suggest fixes with flag_knowledge. Curator maintains the shared notes.\n\n{GUIDE}\n\n{NOTEBOOK_GUIDE}"
+                ),
+            ),
+            Role::Gardener(run) => (json!({ "tools": {} }), self.curator_mode(run)?.instructions().to_string()),
+        };
+        Ok(json!({
             "protocolVersion": version,
-            "capabilities": { "tools": {}, "prompts": {}, "resources": {} },
+            "capabilities": capabilities,
             "serverInfo": { "name": "feeder", "version": env!("CARGO_PKG_VERSION") },
-            "instructions": format!("Feeder is the user's local project update centre (this server runs on their Mac; nothing leaves it). Post an update with post_update when you finish a meaningful piece of work or when asked, and call get_feed before picking a project back up. It also keeps a shared notebook of lessons across all projects: search it (search_notebook) before non-trivial debugging, and write a page (write_page) when you learn something that would save time in another project.\n\n{GUIDE}\n\n{NOTEBOOK_GUIDE}")
-        })
+            "instructions": instructions
+        }))
     }
 
     fn call(&self, params: &Value) -> Value {
         let name = params.get("name").and_then(Value::as_str).unwrap_or("");
         let args = params.get("arguments").cloned().unwrap_or(json!({}));
-        let outcome = match name {
+        let outcome = match (self.role, name) {
+            (Role::Gardener(run), name) => self.gardener_call(run, name, &args),
+            (Role::Agent, name) => self.agent_call(name, &args),
+        };
+        tool_result(outcome)
+    }
+
+    fn agent_call(&self, name: &str, args: &Value) -> Result<ToolOutput, String> {
+        let args = args.clone();
+        match name {
             "post_update" => self.post_update(&args),
             "edit_update" => self.edit_update(&args),
             "delete_update" => self.delete_update(&args),
@@ -225,7 +260,12 @@ impl Server {
             "delete_todo" => self.delete_todo(&args),
             other if notebook::TOOLS.contains(&other) => self.notebook_call(other, &args),
             _ => Err(format!("unknown tool: {name}")),
-        };
+        }
+    }
+}
+
+fn tool_result(outcome: Result<ToolOutput, String>) -> Value {
+    {
         match outcome {
             Ok(out) => {
                 let mut content = vec![json!({ "type": "text", "text": out.text })];
@@ -237,7 +277,9 @@ impl Server {
             Err(message) => json!({ "content": [{ "type": "text", "text": message }], "isError": true }),
         }
     }
+}
 
+impl Server {
     fn resources_list(&self) -> Result<Value, String> {
         let store = self.open_store()?;
         let projects = store.projects().map_err(|e| e.to_string())?;
@@ -437,13 +479,15 @@ impl Server {
         let limit = args.get("limit").and_then(Value::as_u64).unwrap_or(5).clamp(1, 50) as usize;
         let include_shots = args.get("include_screenshots").and_then(Value::as_bool).unwrap_or(false);
         let mark_read = args.get("mark_replies_read").and_then(Value::as_bool).unwrap_or(false);
+        let task = str_arg(args, "task");
         let store = self.open_store()?;
         let Some(project) = self.project(&store, args, false)? else {
             let name = detect_project(&self.base(args)).name;
-            return Ok(ToolOutput::text(
-                format!("{name} has no updates yet."),
-                json!({ "project": null, "todos": [], "updates": [], "unread_replies": [] }),
-            ));
+            let mut data = json!({ "project": null, "todos": [], "updates": [], "unread_replies": [] });
+            if task.is_some() {
+                data["related_notes"] = json!([]);
+            }
+            return Ok(ToolOutput::text(format!("{name} has no updates yet."), data));
         };
         let feed = store.feed(project.id, limit, None).map_err(|e| e.to_string())?;
         let ids: Vec<i64> = feed.iter().map(|u| u.id).collect();
@@ -470,6 +514,21 @@ impl Server {
         }
         if let Some(brief) = &project.brief {
             text.push_str(&format!("\n\nPinned brief:\n{brief}"));
+        }
+        let mut related_notes = Vec::new();
+        if let Some(task) = task.filter(|task| task.trim().chars().take(160).any(char::is_alphanumeric)) {
+            let query: String = task.trim().chars().take(160).collect();
+            let notes = store.search_project_notes(project.id, &query, &PageFilter::default(), 3).map_err(|e| e.to_string())?;
+            if !notes.is_empty() {
+                text.push_str("\n\nNotebook notes for this task (open with read_page):");
+            }
+            for page in notes {
+                let url = format!("feeder://notebook/{}", page.id);
+                let scope = if page.project_id.is_some() { "project" } else { "shared" };
+                let excerpt = page.excerpt(160);
+                text.push_str(&format!("\n- #{} {} ({scope}) — {excerpt}", page.id, page.title));
+                related_notes.push(json!({ "id": page.id, "title": page.title, "excerpt": excerpt, "url": url, "scope": scope }));
+            }
         }
         if !todos.is_empty() {
             let open_count = todos.iter().filter(|t| !t.done).count();
@@ -499,17 +558,17 @@ impl Server {
             .collect();
         let todos_json: Vec<_> = todos.iter().map(todo_json).collect();
         let unread_json: Vec<_> = unread.iter().map(reply_json).collect();
-        Ok(ToolOutput {
-            text,
-            data: json!({
-                "project": project_json(&project),
-                "needs_you": needs_you,
-                "todos": todos_json,
-                "updates": updates,
-                "unread_replies": unread_json,
-            }),
-            images,
-        })
+        let mut data = json!({
+            "project": project_json(&project),
+            "needs_you": needs_you,
+            "todos": todos_json,
+            "updates": updates,
+            "unread_replies": unread_json,
+        });
+        if task.is_some() {
+            data["related_notes"] = json!(related_notes);
+        }
+        Ok(ToolOutput { text, data, images })
     }
 
     fn get_recent_activity(&self, args: &Value) -> Result<ToolOutput, String> {
@@ -1022,12 +1081,13 @@ fn tools() -> Value {
         {
             "name": "get_feed",
             "title": "Read a project's feed",
-            "description": "Read the latest updates, pinned brief, optional to-dos, open attention status, and any unread human replies in this project's Feeder feed, newest first.",
+            "description": "Read this project's latest updates, pinned brief, to-dos and human replies. When starting a task, supply task keywords to also get a short list of relevant Notebook notes.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
                     "project": project,
                     "project_path": project_path,
+                    "task": { "type": "string", "maxLength": 160, "description": "Optional search keywords for the task, such as 'appcast signing'. Returns up to three current notes from this project or the shared Notebook." },
                     "limit": { "type": "integer", "minimum": 1, "maximum": 50, "description": "How many updates (default 5)." },
                     "include_screenshots": { "type": "boolean", "description": format!("When true, include up to {MAX_INLINE_SCREENSHOTS} attached screenshots as base64 image blocks.") },
                     "mark_replies_read": { "type": "boolean", "description": "When true, mark returned unread human replies for this project as read." }
@@ -1587,27 +1647,19 @@ mod tests {
             .unwrap();
         assert_eq!(feed_after.pointer("/result/structuredContent/needs_you"), Some(&json!(false)));
 
-        let wrote = server
-            .handle(&json!({
-                "jsonrpc": "2.0",
-                "id": 5,
-                "method": "tools/call",
-                "params": {
-                    "name": "write_page",
-                    "arguments": {
-                        "kind": "fix",
-                        "topic": "data",
-                        "title": "SQLite WAL checkpoints need busy timeout",
-                        "tags": ["sqlite", "locks"],
-                        "what_happened": "Concurrent reads threw SQLITE_BUSY under write bursts.",
-                        "why": "Default busy_timeout was zero on the reader connection.",
-                        "do_this": "Set PRAGMA busy_timeout = 3000 on every connection."
-                    }
-                }
-            }))
-            .unwrap();
-        assert_eq!(wrote.pointer("/result/isError"), Some(&json!(false)));
-        let pid = wrote.pointer("/result/structuredContent/id").and_then(Value::as_i64).unwrap();
+        let pid = Store::open(&store_dir)
+            .unwrap()
+            .create_page(
+                feeder_core::PageDraft::new(
+                    "SQLite WAL checkpoints need busy timeout",
+                    "Set PRAGMA busy_timeout = 3000 on every connection.",
+                ),
+                feeder_core::HUMAN_AUTHOR,
+                None,
+                feeder_core::OnSimilar::Refuse,
+            )
+            .unwrap()
+            .id;
 
         let index = server
             .handle(&json!({
@@ -1680,23 +1732,18 @@ mod tests {
         let content = feed.pointer("/result/content").and_then(Value::as_array).unwrap();
         assert_eq!(content.len(), 3); // 1 text + 2 inline images
 
-        let wrote = server
-            .handle(&json!({
-                "jsonrpc": "2.0",
-                "id": 3,
-                "method": "tools/call",
-                "params": {
-                    "name": "write_page",
-                    "arguments": {
-                        "topic": "Rust",
-                        "title": "SQLite multi-image cascade rules",
-                        "body": "## Pattern\n\nAlways copy files before opening the transaction.\n\n- [ ] Verify rollback cleanup"
-                    }
-                }
-            }))
-            .unwrap();
-        assert_eq!(wrote.pointer("/result/isError"), Some(&json!(false)));
-        let pid = wrote.pointer("/result/structuredContent/id").and_then(Value::as_i64).unwrap();
+        let draft = feeder_core::PageDraft {
+            topic: Some("Rust".into()),
+            ..feeder_core::PageDraft::new(
+                "SQLite multi-image cascade rules",
+                "## Pattern\n\nAlways copy files before opening the transaction.\n\n- [ ] Verify rollback cleanup",
+            )
+        };
+        let pid = Store::open(&store_dir)
+            .unwrap()
+            .create_page(draft, feeder_core::HUMAN_AUTHOR, None, feeder_core::OnSimilar::Refuse)
+            .unwrap()
+            .id;
 
         let page = server
             .handle(&json!({
@@ -1711,6 +1758,401 @@ mod tests {
             page.pointer("/result/structuredContent/body").and_then(Value::as_str).is_some_and(|b| b.contains("Verify rollback cleanup"))
         );
 
+        let _ = std::fs::remove_dir_all(store_dir);
+        let _ = std::fs::remove_dir_all(work_dir);
+    }
+
+    #[test]
+    fn a_feed_handoff_suggests_only_current_project_and_shared_notes() {
+        use feeder_core::{HUMAN_AUTHOR, OnSimilar, PageDraft, Standing};
+
+        let dir = temp_dir("task-notes");
+        let store = Store::open(&dir).unwrap();
+        let alpha = store.project_named("Alpha", None).unwrap();
+        let beta = store.project_named("Beta", None).unwrap();
+        let page = |title, project_id| {
+            store.create_page(PageDraft::new(title, "Use the signing checklist."), HUMAN_AUTHOR, project_id, OnSimilar::Allow).unwrap()
+        };
+        let local = page("Signing Alpha", Some(alpha.id));
+        let shared = page("Signing checklist", None);
+        page("Signing Beta", Some(beta.id));
+        let archived = page("Signing old builds", Some(alpha.id));
+        store.set_page_standing(archived.id, Standing::Archived).unwrap();
+        let server = Server::new(None, dir.clone(), Some(dir.clone()));
+        let handoff = |project, task| server.call(&json!({ "name": "get_feed", "arguments": { "project": project, "task": task } }));
+        let result = handoff("Alpha", Some("signing"));
+        let notes = result.pointer("/structuredContent/related_notes").unwrap().as_array().unwrap();
+        assert_eq!(notes.len(), 2);
+        for expected in [local.id, shared.id] {
+            assert!(notes.iter().any(|note| note["url"] == format!("feeder://notebook/{expected}")));
+        }
+        assert!(!result.to_string().contains("Signing Beta"));
+        assert!(!result.to_string().contains("Signing old builds"));
+        for query in ["--", "no match"] {
+            assert_eq!(handoff("Alpha", Some(query)).pointer("/structuredContent/related_notes"), Some(&json!([])));
+        }
+        assert!(store.flags(None, 10).unwrap().is_empty(), "suggestions don't file flags");
+        assert!(handoff("Alpha", None).pointer("/structuredContent/related_notes").is_none());
+        assert_eq!(handoff("Unknown", Some("signing")).pointer("/structuredContent/related_notes"), Some(&json!([])));
+        drop(server);
+        drop(store);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn everyday_agents_can_read_and_flag_but_cannot_edit_notebook_pages() {
+        use feeder_core::{HUMAN_AUTHOR, OnSimilar, PageDraft, Standing};
+
+        let store_dir = temp_dir("store-agent-notebook");
+        let store = Store::open(&store_dir).unwrap();
+        let page = store
+            .create_page(PageDraft::new("Release checklist", "Run the release checks."), HUMAN_AUTHOR, None, OnSimilar::Refuse)
+            .unwrap();
+        let mut server = Server::new(Some("Codex".into()), store_dir.clone(), Some(store_dir.clone()));
+        let listed = server.handle(&json!({ "id": 1, "method": "tools/list" })).unwrap();
+        let project_tools = tools();
+        let project_tools = project_tools.as_array().unwrap();
+        let names: Vec<_> = listed["result"]["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|tool| !project_tools.contains(tool))
+            .filter_map(|tool| tool["name"].as_str())
+            .collect();
+        let call = |name, arguments| server.call(&json!({ "name": name, "arguments": arguments }));
+
+        let read = call("read_page", json!({ "id": page.id }));
+        let helped = call("mark_page_helped", json!({ "id": page.id }));
+        let write = call("write_page", json!({ "id": page.id, "title": page.title, "body": "Overwrite this note." }));
+        let archive = call("archive_page", json!({ "id": page.id }));
+        let current = store.page(page.id).unwrap().unwrap();
+        drop(server);
+        drop(store);
+        std::fs::remove_dir_all(store_dir).unwrap();
+
+        assert_eq!(names, ["search_notebook", "read_page", "mark_page_helped", "flag_knowledge"]);
+        assert_eq!(read.pointer("/structuredContent/body"), Some(&json!(page.body)));
+        assert_eq!(helped["isError"], false);
+        assert_eq!(current.helped, page.helped + 1);
+        assert_eq!(write["isError"], true);
+        assert_eq!(archive["isError"], true);
+        assert_eq!(current.standing, Standing::Current);
+        assert_eq!(current.body, page.body);
+        assert_eq!(current.revision, page.revision);
+    }
+
+    #[test]
+    fn empty_searches_and_flag_knowledge_file_flags_for_the_gardener() {
+        let store_dir = temp_dir("store-flags");
+        let work_dir = temp_dir("work-flags");
+        let mut server = Server::new(Some("codex".into()), work_dir.clone(), Some(store_dir.clone()));
+        let call = |server: &mut Server, id: i64, name: &str, arguments: Value| {
+            server
+                .handle(&json!({ "jsonrpc": "2.0", "id": id, "method": "tools/call", "params": { "name": name, "arguments": arguments } }))
+                .unwrap()
+        };
+
+        for id in 1..=2 {
+            let miss = call(&mut server, id, "search_notebook", json!({ "query": "notarize the dmg" }));
+            let text = miss.pointer("/result/content/0/text").and_then(Value::as_str).unwrap();
+            assert!(text.contains("flag_knowledge"), "the empty result asks for a flag: {text}");
+        }
+        let flagged = call(
+            &mut server,
+            3,
+            "flag_knowledge",
+            json!({ "kind": "wrong", "note": "The release page says release.sh is in the root", "suggestion": "It moved to scripts/" }),
+        );
+        assert_eq!(flagged.pointer("/result/structuredContent/kind"), Some(&json!("wrong")));
+        let no_suggestion = call(&mut server, 4, "flag_knowledge", json!({ "note": "No instructions for rotating the appcast key" }));
+        assert_eq!(no_suggestion.pointer("/result/isError"), Some(&json!(false)));
+
+        let store = Store::open(&store_dir).unwrap();
+        let open = store.flags(Some(feeder_core::FlagStatus::Open), 10).unwrap();
+        assert_eq!(open.len(), 3, "two explicit flags and one from the repeated empty search");
+        assert!(open.iter().any(|f| f.note.contains("notarize the dmg") && f.kind == feeder_core::FlagKind::Missing));
+        assert!(open.iter().any(|f| f.suggestion.as_deref() == Some("It moved to scripts/")));
+
+        let refused = call(&mut server, 5, "flag_knowledge", json!({ "note": "no" }));
+        assert_eq!(refused.pointer("/result/isError"), Some(&json!(true)));
+
+        let _ = std::fs::remove_dir_all(store_dir);
+        let _ = std::fs::remove_dir_all(work_dir);
+    }
+
+    #[test]
+    fn the_gardener_role_offers_only_guarded_tools_and_caps_its_edits() {
+        let store_dir = temp_dir("store-gardener");
+        let work_dir = temp_dir("work-gardener");
+        let mut server = Server::new(Some("claude-code".into()), work_dir.clone(), Some(store_dir.clone()));
+        let run = Store::open(&store_dir).unwrap().start_gardener_run(feeder_core::gardener::Backend::ClaudeCode).unwrap();
+        server.role = Role::Gardener(run);
+        let call = |server: &mut Server, id: i64, name: &str, arguments: Value| {
+            server
+                .handle(&json!({ "jsonrpc": "2.0", "id": id, "method": "tools/call", "params": { "name": name, "arguments": arguments } }))
+                .unwrap()
+        };
+
+        let listed = server.handle(&json!({ "jsonrpc": "2.0", "id": 1, "method": "tools/list" })).unwrap();
+        let names: Vec<&str> =
+            listed.pointer("/result/tools").and_then(Value::as_array).unwrap().iter().filter_map(|t| t["name"].as_str()).collect();
+        assert_eq!(names, gardener::tool_names(feeder_core::gardener::SessionMode::Review), "only the gardener's tools");
+        let post = call(&mut server, 2, "post_update", json!({ "project": "Alpha", "summary": "Done: x" }));
+        assert_eq!(post.pointer("/result/isError"), Some(&json!(true)), "feed tools are out of reach");
+
+        let flag = {
+            let store = Store::open(&store_dir).unwrap();
+            let new = feeder_core::NewFlag {
+                kind: feeder_core::FlagKind::Missing,
+                page_id: None,
+                project_id: None,
+                note: "Nothing on release checks".into(),
+                suggestion: Some("Run scripts/changelog.sh --check".into()),
+            };
+            store.flag_knowledge(new, "Codex").unwrap().id
+        };
+        let unsourced = call(
+            &mut server,
+            3,
+            "write_page",
+            json!({ "title": "Release checks", "body": "Run the changelog check.", "reason": "Useful" }),
+        );
+        assert_eq!(unsourced.pointer("/result/isError"), Some(&json!(true)));
+        let sourced = call(
+            &mut server,
+            4,
+            "write_page",
+            json!({ "title": "Release checks", "body": "Run `scripts/changelog.sh --check`.", "reason": "Flag asked for it", "flags": [flag] }),
+        );
+        assert_eq!(sourced.pointer("/result/isError"), Some(&json!(false)), "{sourced}");
+        assert_eq!(sourced.pointer("/result/structuredContent/page/agent"), Some(&json!("Gardener")));
+
+        // The refused edit didn't use up the cap: four more fit, the fifth after that doesn't.
+        let store = Store::open(&store_dir).unwrap();
+        let titles = ["Signing builds", "Rotating logs", "Caching fonts", "Pinning toolchains"];
+        for (n, title) in (10_i64..).zip(titles) {
+            let f = store
+                .flag_knowledge(
+                    feeder_core::NewFlag {
+                        kind: feeder_core::FlagKind::Missing,
+                        page_id: None,
+                        project_id: None,
+                        note: format!("Gap about {title}"),
+                        suggestion: None,
+                    },
+                    "Codex",
+                )
+                .unwrap()
+                .id;
+            let ok =
+                call(&mut server, n, "write_page", json!({ "title": title, "body": "Do the step.", "reason": "Flagged", "flags": [f] }));
+            assert_eq!(ok.pointer("/result/isError"), Some(&json!(false)), "{ok}");
+        }
+        let f = store
+            .flag_knowledge(
+                feeder_core::NewFlag {
+                    kind: feeder_core::FlagKind::Missing,
+                    page_id: None,
+                    project_id: None,
+                    note: "One more gap".into(),
+                    suggestion: None,
+                },
+                "Codex",
+            )
+            .unwrap()
+            .id;
+        let over =
+            call(&mut server, 20, "write_page", json!({ "title": "One more page", "body": "Body.", "reason": "Flagged", "flags": [f] }));
+        assert_eq!(over.pointer("/result/isError"), Some(&json!(true)), "the sixth change is refused");
+
+        let missing = call(&mut server, 21, "search_notebook", json!({ "query": "zzz nothing" }));
+        assert_eq!(missing.pointer("/result/isError"), Some(&json!(false)));
+        assert_eq!(
+            store.flags(Some(feeder_core::FlagStatus::Open), 50).unwrap().len(),
+            1,
+            "the gardener's empty searches don't file flags"
+        );
+
+        let _ = std::fs::remove_dir_all(store_dir);
+        let _ = std::fs::remove_dir_all(work_dir);
+    }
+
+    #[test]
+    fn asking_curator_only_reads_notebook_pages_in_scope() {
+        use feeder_core::gardener::{Backend, Scope, SessionMode};
+
+        let store_dir = temp_dir("store-curator-ask");
+        let work_dir = temp_dir("work-curator-ask");
+        let store = Store::open(&store_dir).expect("open scratch store");
+        let alpha = store.project_named("Alpha", None).expect("add Alpha");
+        let beta = store.project_named("Beta", None).expect("add Beta");
+        let write = |project: &Project| {
+            store
+                .create_page(
+                    feeder_core::PageDraft::new(format!("{} deployment", project.name), "Use the deployment checklist."),
+                    feeder_core::HUMAN_AUTHOR,
+                    Some(project.id),
+                    feeder_core::OnSimilar::Refuse,
+                )
+                .expect("write a scratch page")
+                .id
+        };
+        let own_id = write(&alpha);
+        let other_id = write(&beta);
+        let shared_id = store
+            .create_page(
+                feeder_core::PageDraft::new("Shared deployment preferences", "Prefer a short manual smoke test."),
+                feeder_core::HUMAN_AUTHOR,
+                None,
+                feeder_core::OnSimilar::Allow,
+            )
+            .unwrap()
+            .id;
+        let run = store.start_curator_run(Backend::Codex, Scope::Project(alpha.id), SessionMode::Ask).expect("start an Ask session");
+        let mut server = Server::new(None, work_dir.clone(), Some(store_dir.clone()));
+        server.role = Role::Gardener(run);
+        let request = |server: &mut Server, method: &str, params: Value| {
+            server.handle(&json!({ "jsonrpc": "2.0", "id": 1, "method": method, "params": params })).expect("receive a reply")
+        };
+        let listed = request(&mut server, "tools/list", json!({}));
+        let names: Vec<&str> =
+            listed.pointer("/result/tools").and_then(Value::as_array).unwrap().iter().filter_map(|tool| tool["name"].as_str()).collect();
+        assert_eq!(names, ["search_notebook", "read_page"]);
+        let call = |name: &str, arguments: Value| server.call(&json!({ "name": name, "arguments": arguments }));
+        for query in ["deployment", ""] {
+            let result = call("search_notebook", json!({ "query": query }));
+            let pages = result.pointer("/structuredContent/pages").unwrap().as_array().unwrap();
+            assert_eq!(pages.len(), 2);
+            assert!(pages.iter().any(|page| page["id"] == own_id));
+            assert!(pages.iter().any(|page| page["id"] == shared_id));
+        }
+        assert_eq!(call("read_page", json!({ "id": own_id }))["isError"], false);
+        assert_eq!(call("read_page", json!({ "id": shared_id }))["isError"], false);
+        assert_eq!(call("read_page", json!({ "id": other_id }))["isError"], true);
+        for tool in ["read_traces", "list_flags", "write_page", "archive_page", "dismiss_flag"] {
+            let result = call(tool, json!({ "id": own_id }));
+            assert_eq!(result["isError"], true, "{tool} was not refused");
+            assert!(result.to_string().contains("tool unavailable in this Curator session"), "{result}");
+        }
+        let resource = request(&mut server, "resources/read", json!({ "uri": format!("feeder://notebook/{other_id}") }));
+        assert_eq!(resource.pointer("/error/code"), Some(&json!(-32601)));
+        assert_eq!(store.gardener_run(run).expect("read run").expect("run exists").edits, 0);
+
+        let _ = std::fs::remove_dir_all(store_dir);
+        let _ = std::fs::remove_dir_all(work_dir);
+    }
+
+    #[test]
+    fn a_project_gardener_turns_a_thread_correction_into_a_revertible_note() {
+        use feeder_core::gardener::{Backend, Scope};
+
+        let store_dir = temp_dir("store-thread");
+        let work_dir = temp_dir("work-thread");
+        let store = Store::open(&store_dir).expect("open a scratch store");
+        let alpha = store.project_named("Alpha", None).expect("add Alpha");
+        let beta = store.project_named("Beta", None).expect("add Beta");
+        let post = |project: &Project, body: &str| {
+            store
+                .post(project.id, NewUpdate { agent: "Codex".into(), body: body.into(), ..NewUpdate::default() })
+                .expect("post a scratch update")
+        };
+        let update = post(&alpha, "Done: Added an appcast check.");
+        let unrelated = post(&beta, "Done: Drafted a database guide.");
+        let correction = "Run the appcast check after generating the feed.";
+        store.add_reply(update.id, "You", true, correction).expect("correct the agent");
+        let flag = store.flag_update_for_notebook(update.id, "You").expect("flag the thread");
+        assert_eq!(flag.id, store.flag_update_for_notebook(update.id, "You").expect("flag again").id);
+        let other_flag = store.flag_update_for_notebook(unrelated.id, "You").expect("flag a different project");
+
+        let run = store.start_scoped_gardener_run(Backend::Codex, Scope::Project(alpha.id)).expect("start scoped session");
+        let mut gardener = Server::new(None, work_dir.clone(), Some(store_dir.clone()));
+        gardener.role = Role::Gardener(run);
+        let call = |server: &Server, name: &str, arguments: Value| server.call(&json!({ "name": name, "arguments": arguments }));
+
+        let flags = call(&gardener, "list_flags", json!({}));
+        assert_eq!(flags.pointer("/structuredContent/flags/0/source_update_id"), Some(&json!(update.id)));
+        assert!(flags.pointer("/structuredContent/flags/1").is_none());
+        let traces = call(&gardener, "read_traces", json!({}));
+        assert_eq!(traces.pointer("/structuredContent/traces/0/replies/0/body"), Some(&json!(correction)));
+        assert!(traces.pointer("/structuredContent/traces/1").is_none());
+        let other_trace = call(&gardener, "read_traces", json!({ "update_id": unrelated.id }));
+        assert_eq!(other_trace["isError"], true);
+        let refused = call(&gardener, "dismiss_flag", json!({ "id": other_flag.id, "reason": "Wrong scope" }));
+        assert_eq!(refused["isError"], true);
+
+        let title = "When to run the appcast check";
+        let write = |flags: Vec<i64>, updates: Vec<i64>| {
+            call(
+                &gardener,
+                "write_page",
+                json!({
+                    "title": title,
+                    "body": correction,
+                    "reason": "The person corrected the order in the Feed thread.",
+                    "flags": flags,
+                    "updates": updates,
+                }),
+            )
+        };
+        assert_eq!(write(vec![other_flag.id], vec![update.id])["isError"], true);
+        assert_eq!(write(vec![flag.id], vec![unrelated.id])["isError"], true);
+        let saved = write(vec![flag.id], vec![]);
+        assert_eq!(saved["isError"], false, "{saved}");
+        assert_eq!(saved.pointer("/structuredContent/source_updates/0"), Some(&json!(update.id)));
+        let change_id = saved.pointer("/structuredContent/change_id").and_then(Value::as_i64).expect("change is returned");
+        let page_id = saved.pointer("/structuredContent/page/id").and_then(Value::as_i64).expect("page is returned");
+        assert_eq!(store.page(page_id).expect("load the page").expect("the page exists").project_id, Some(alpha.id));
+
+        let worker = Server::new(Some("claude-code".into()), work_dir.clone(), Some(store_dir.clone()));
+        let lookup = call(&worker, "search_notebook", json!({ "query": "appcast check" }));
+        assert_eq!(lookup.pointer("/structuredContent/pages/0/title"), Some(&json!(title)));
+        assert_eq!(store.changes_from_update(update.id).expect("read linked changes")[0].id, change_id);
+        assert_eq!(store.gardener_run_changes(run).expect("read session changes")[0].id, change_id);
+        store.finish_gardener_run(run, None, None).expect("finish the session");
+        assert_eq!(store.gardener_run(run).expect("read the run").expect("run exists").edits, 1);
+        assert_eq!(write(vec![flag.id], vec![])["isError"], true, "an ended session cannot keep writing");
+
+        assert!(store.revert_change(change_id, "You").expect("revert from session history").page.is_archived());
+        assert_eq!(store.flag(flag.id).expect("read the flag").expect("flag still exists").status, feeder_core::FlagStatus::Open);
+        let change = &store.changes_from_update(update.id).expect("retain attribution after Revert")[0];
+        assert!(change.is_reverted());
+        assert_eq!(change.source_flags, vec![flag.id]);
+        let lookup = call(&worker, "search_notebook", json!({ "query": "appcast check" }));
+        assert!(lookup.pointer("/structuredContent/pages/0").is_none());
+
+        let _ = std::fs::remove_dir_all(store_dir);
+        let _ = std::fs::remove_dir_all(work_dir);
+    }
+
+    #[test]
+    fn the_edit_cap_spans_every_server_in_one_session() {
+        let store_dir = temp_dir("store-cap");
+        let work_dir = temp_dir("work-cap");
+        let store = Store::open(&store_dir).unwrap();
+        let run = store.start_gardener_run(feeder_core::gardener::Backend::Codex).unwrap();
+        let titles = ["Signing builds", "Rotating logs", "Caching fonts", "Pinning toolchains", "Tagging releases", "Pruning branches"];
+        let mut refused = 0;
+        // Codex starts a fresh server for each turn: three turns, two edits each.
+        for (turn, pair) in titles.chunks(2).enumerate() {
+            let mut server = Server::new(Some("codex".into()), work_dir.clone(), Some(store_dir.clone()));
+            server.role = Role::Gardener(run);
+            for (n, title) in pair.iter().enumerate() {
+                let new = feeder_core::NewFlag {
+                    kind: feeder_core::FlagKind::Missing,
+                    page_id: None,
+                    project_id: None,
+                    note: format!("Gap about {title}"),
+                    suggestion: None,
+                };
+                let flag = store.flag_knowledge(new, "Codex").unwrap().id;
+                let id = i64::try_from(turn * 2 + n).unwrap();
+                let out = server.handle(&json!({ "jsonrpc": "2.0", "id": id, "method": "tools/call", "params": { "name": "write_page", "arguments": { "title": title, "body": "Do it.", "reason": "Flagged", "flags": [flag] } } })).unwrap();
+                if out.pointer("/result/isError") == Some(&json!(true)) {
+                    refused += 1;
+                }
+            }
+        }
+        assert_eq!(refused, 1, "five changes per session, however many servers it starts");
         let _ = std::fs::remove_dir_all(store_dir);
         let _ = std::fs::remove_dir_all(work_dir);
     }

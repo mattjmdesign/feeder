@@ -57,6 +57,13 @@ pub fn bar_chrome(s: &State, id: i64, p: &Palette) -> (El, Option<El>) {
     // Show in Finder and Pin are on the project's orb menu on Home, so the header doesn't repeat
     // them; Copy Context covers what the old resume prompt did.
     let mut actions = row().gap(4.0).center_y();
+    if !archived {
+        actions = actions.child(
+            chrome::bar_button("project-curator-btn", "Update Notes", p)
+                .label("Run Curator for this project")
+                .on_press(move |s: &mut State| s.start_project_curator(id)),
+        );
+    }
     actions = actions.child(
         chrome::bar_button("project-todo-btn", &todo_label, p)
             .label("Open project to-do list")
@@ -828,10 +835,37 @@ pub fn card_actions(s: &State, p: &Palette, u: &FeedUpdate) -> El {
         .on_press_tx(move |s: &mut State, tx: &mut Tx| s.start_edit_update(uid, tx));
     let reply_btn = small_btn(format!("reply-u-{uid}"), "Reply", "Reply to update")
         .on_press_tx(move |s: &mut State, tx: &mut Tx| s.start_reply(uid, tx));
+    let flag_btn =
+        small_btn(format!("flag-u-{uid}"), "Flag", "Flag for Notebook").on_press(move |s: &mut State| s.flag_update_for_notebook(uid));
     let delete_btn =
         small_btn(format!("del-u-{uid}"), "Delete", "Delete update").on_press(move |s: &mut State| s.delete_confirm = Some(uid));
 
-    row().gap(2.0).center_y().child(copy_btn).child(edit_btn).child(reply_btn).child(delete_btn)
+    row().gap(2.0).center_y().child(copy_btn).child(edit_btn).child(reply_btn).child(flag_btn).child(delete_btn)
+}
+
+/// A quiet link to the Notebook page written from this Feed update, when one exists.
+pub fn notebook_link(s: &State, p: &Palette, update_id: i64) -> Option<El> {
+    let change = s.notebook.gardener.changes.iter().find(|c| !c.is_reverted() && c.source_updates.contains(&update_id))?;
+    let page_id = change.page_id;
+    let title = change.page_title.clone();
+    Some(
+        row()
+            .key(format!("nb-link-{update_id}-{page_id}"))
+            .role("button")
+            .label(format!("Open Notebook note {title}"))
+            .help(format!("Open \"{title}\""))
+            .focusable(true)
+            .px(7.0)
+            .py(1.5)
+            .radius(5.0)
+            .gap(5.0)
+            .center_y()
+            .border(1.0, p.hairline)
+            .hover(p.hover)
+            .cursor(Cursor::Pointer)
+            .on_press(move |s: &mut State| s.open_notebook_page_from_anywhere(page_id))
+            .child(text("In Notebook · Open").font(style::META).color(p.text_2)),
+    )
 }
 
 fn entry(s: &State, (p, k, md): (&Palette, &Kit, &MarkdownStyle), u: &FeedUpdate, orb: &Orb, latest: bool, last: bool) -> El {
@@ -893,6 +927,9 @@ fn entry(s: &State, (p, k, md): (&Palette, &Kit, &MarkdownStyle), u: &FeedUpdate
     card = card.child(rune::rule(1.0, p.hairline)).child(edit_or_body(s, p, k, md, u, latest));
     if let Some(media) = media_view(s, p, u, COLUMN - 24.0 - 12.0 - 40.0) {
         card = card.child(media);
+    }
+    if let Some(link) = notebook_link(s, p, u.id) {
+        card = card.child(row().w_full().child(link));
     }
     if let Some(replies) = replies_section(s, p, k, u) {
         card = card.child(replies);

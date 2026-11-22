@@ -1,0 +1,371 @@
+//! Notebook flags, Curator sessions, and local Curator chat history.
+
+use std::io::{BufRead, IsTerminal, Write};
+use std::sync::mpsc;
+
+use clap::Subcommand;
+use feeder_core::gardener::{
+    Backend, ChatOpening, ChatSummary, Event, OPENING, Run, RunStatus, Scope, Session, SessionEnv, SessionMode, StoredEvent,
+};
+use feeder_core::{Change, Flag, FlagOutcome, FlagStatus, HUMAN_AUTHOR, NewFlag, Store, ago, now_ms};
+use serde_json::{Value, json};
+
+#[derive(Subcommand)]
+pub enum GardenerCmd {
+    /// Start Curator with an installed agent.
+    /// It streams what the agent does; type follow-ups after each answer, or press Enter to end.
+    Run {
+        /// `claude`, `codex`, `opencode`, or `antigravity`. Defaults to the first one installed.
+        #[arg(long = "with")]
+        backend: Option<String>,
+        /// Limit reads and edits to this project (name or ID).
+        #[arg(long)]
+        project: Option<String>,
+        /// Answer a question from the Notebook without making any changes.
+        #[arg(long, requires = "message")]
+        ask: bool,
+        /// Your first message. Defaults to reviewing open flags and recent updates.
+        message: Vec<String>,
+    },
+    /// Sign in through the provider's own CLI.
+    Connect {
+        #[arg(long = "with")]
+        backend: String,
+    },
+    /// Recent runs and which CLIs can run Curator.
+    Status {
+        #[arg(long)]
+        json: bool,
+    },
+    /// List saved Curator chats, newest first.
+    Chats {
+        #[arg(short = 'n', long, default_value_t = 20)]
+        limit: usize,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Read a saved Curator chat by its run ID.
+    Chat {
+        id: i64,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Delete a saved chat while keeping its Notebook edits.
+    DeleteChat { id: i64 },
+    /// Recent Notebook changes, with their reasons, newest first.
+    Changes {
+        #[arg(short = 'n', long, default_value_t = 20)]
+        limit: usize,
+        /// Only the gardener's changes.
+        #[arg(long)]
+        mine: bool,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Undo one change (see `feeder curator changes`).
+    Revert { id: i64 },
+}
+
+/// `feeder flag`: file a flag.
+pub fn flag(store: &Store, flag: NewFlag, author: &str, json: bool) -> Result<(), String> {
+    let flag = store.flag_knowledge(flag, author).map_err(|e| e.to_string())?;
+    print_flag(&flag, json);
+    Ok(())
+}
+
+pub(crate) fn print_flag(flag: &Flag, json: bool) {
+    if json {
+        println!("{}", flag_json(flag));
+    } else {
+        println!("Flagged #{} ({}) for Curator to review.", flag.id, flag.kind);
+    }
+}
+
+/// `feeder flags`: list flags, or dismiss one.
+pub fn flags(store: &Store, all: bool, dismiss: Option<i64>, reason: Option<String>, json: bool) -> Result<(), String> {
+    if let Some(id) = dismiss {
+        let note = reason.unwrap_or_default();
+        let flag = store.close_flag(id, FlagOutcome::Dismissed { note }, HUMAN_AUTHOR).map_err(|e| e.to_string())?;
+        println!("Dismissed flag #{}.", flag.id);
+        return Ok(());
+    }
+    let status = if all { None } else { Some(FlagStatus::Open) };
+    let list = store.flags(status, 200).map_err(|e| e.to_string())?;
+    if json {
+        println!("{}", Value::Array(list.iter().map(flag_json).collect()));
+    } else if list.is_empty() {
+        println!("{}", if all { "No flags yet." } else { "No open flags." });
+    } else {
+        let now = now_ms();
+        for f in &list {
+            let page = f.page_id.map(|id| format!(" page #{id}")).unwrap_or_default();
+            let state = if f.status == FlagStatus::Open { String::new() } else { format!(" ({})", f.status.as_str()) };
+            println!("#{:<4} {:<8} {}{page} · {} · {}{state}", f.id, f.kind.as_str(), f.note, f.agent, ago(f.created_at, now));
+        }
+    }
+    Ok(())
+}
+
+pub fn run(store: &Store, cmd: GardenerCmd) -> Result<(), String> {
+    match cmd {
+        GardenerCmd::Run { backend, project, ask, message } => {
+            let backend = match backend {
+                Some(name) => name.parse::<Backend>().map_err(|e| e.to_string())?,
+                None => *Backend::installed().first().ok_or("Install Claude Code, Codex, OpenCode, or Antigravity to use Curator.")?,
+            };
+            let text = message.join(" ");
+            let opening = if message.is_empty() {
+                ChatOpening::Job { title: "Review Open Flags", prompt: OPENING }
+            } else {
+                ChatOpening::Message(&text)
+            };
+            let scope = match project {
+                Some(name) => Scope::Project(crate::find(store, &name)?.id),
+                None => Scope::Notebook,
+            };
+            let mode = if ask { SessionMode::Ask } else { SessionMode::Review };
+            chat(backend, scope, mode, opening)?;
+        }
+        GardenerCmd::Connect { backend } => {
+            backend.parse::<Backend>().and_then(|backend| backend.connect(store.dir())).map_err(|e| e.to_string())?;
+        }
+        GardenerCmd::Status { json } => {
+            let installed = Backend::installed();
+            let runs = store.gardener_runs(5).map_err(|e| e.to_string())?;
+            let open = store.open_flag_count().map_err(|e| e.to_string())?;
+            if json {
+                println!(
+                    "{}",
+                    json!({
+                        "backends": installed.iter().map(|b| b.as_str()).collect::<Vec<_>>(),
+                        "open_flags": open,
+                        "runs": runs.iter().map(run_json).collect::<Vec<_>>(),
+                    })
+                );
+            } else {
+                let names: Vec<&str> = installed.iter().map(|b| b.label()).collect();
+                println!("Runs with: {}", if names.is_empty() { "no supported agents installed".into() } else { names.join(", ") });
+                println!("Open flags: {open}");
+                match runs.first() {
+                    Some(r) => print_run(r),
+                    None => println!("No runs yet. Start one with `feeder curator run`."),
+                }
+            }
+        }
+        GardenerCmd::Chats { limit, json } => {
+            let chats = store.curator_chats(limit).map_err(|e| e.to_string())?;
+            if json {
+                println!("{}", Value::Array(chats.iter().map(chat_json).collect()));
+            } else if chats.is_empty() {
+                println!("No saved Curator chats.");
+            } else {
+                for chat in chats {
+                    println!("#{} {} · {}", chat.run_id, terminal_text(&chat.title), ago(chat.started_at, now_ms()));
+                }
+            }
+        }
+        GardenerCmd::Chat { id, json } => {
+            let events = store.curator_chat_events(id).map_err(|e| e.to_string())?;
+            if json {
+                let data = serde_json::to_string(&events).map_err(|e| e.to_string())?;
+                println!("{data}");
+            } else {
+                print_saved_chat(events);
+            }
+        }
+        GardenerCmd::DeleteChat { id } => {
+            store.delete_curator_chat(id).map_err(|e| e.to_string())?;
+            println!("Deleted Curator chat #{id}.");
+        }
+        GardenerCmd::Changes { limit, mine, json } => {
+            let agent = mine.then_some(feeder_core::GARDENER);
+            let changes = store.changes(agent, None, limit).map_err(|e| e.to_string())?;
+            if json {
+                println!("{}", Value::Array(changes.iter().map(change_json).collect()));
+            } else if changes.is_empty() {
+                println!("No Notebook changes logged yet.");
+            } else {
+                let now = now_ms();
+                for c in &changes {
+                    let reverted = if c.is_reverted() { "  (reverted)" } else { "" };
+                    let reason = c.reason.as_deref().map(|r| format!(" — {r}")).unwrap_or_default();
+                    println!(
+                        "#{:<4} {} #{} \"{}\" · {} · {}{reason}{reverted}",
+                        c.id,
+                        c.action.label(),
+                        c.page_id,
+                        c.page_title,
+                        c.agent,
+                        ago(c.created_at, now)
+                    );
+                }
+            }
+        }
+        GardenerCmd::Revert { id } => {
+            let done = store.revert_change(id, HUMAN_AUTHOR).map_err(|e| e.to_string())?;
+            let state = match done.change.action {
+                feeder_core::ChangeAction::Archived => "archived",
+                feeder_core::ChangeAction::Restored => "back in the notebook",
+                feeder_core::ChangeAction::Created | feeder_core::ChangeAction::Revised => "back to its earlier text",
+            };
+            println!("Reverted change #{id}: page #{} \"{}\" is {state}.", done.page.id, done.page.title);
+        }
+    }
+    Ok(())
+}
+
+fn chat_json(chat: &ChatSummary) -> Value {
+    let mode = match chat.mode {
+        SessionMode::Ask => "ask",
+        SessionMode::Review => "review",
+    };
+    json!({
+        "run_id": chat.run_id,
+        "started_at": chat.started_at,
+        "mode": mode,
+        "project_id": chat.scope.project_id(),
+        "title": chat.title,
+        "edits": chat.edits,
+        "truncated": chat.truncated,
+    })
+}
+
+fn print_saved_chat(events: Vec<StoredEvent>) {
+    for event in events {
+        match event {
+            StoredEvent::You(text) => println!("You: {}", terminal_text(&text)),
+            StoredEvent::Event(Event::Text(text)) => println!("{}", terminal_text(&text)),
+            StoredEvent::Event(Event::ToolStarted(call)) => println!("  → {}", terminal_text(&call.name)),
+            StoredEvent::Event(Event::ToolFinished { output, failed, .. }) => {
+                let first = output.lines().next().unwrap_or("");
+                println!("  {} {}", if failed { "✗" } else { "✓" }, terminal_text(first));
+            }
+            StoredEvent::Event(Event::NeedsSignIn) => println!("Sign-in required."),
+            StoredEvent::Event(Event::Failed(text)) => println!("Curator: {}", terminal_text(&text)),
+            StoredEvent::Event(Event::Started | Event::Thinking(_) | Event::TurnFinished | Event::Ended) => {}
+        }
+    }
+}
+
+fn terminal_text(text: &str) -> String {
+    text.chars().filter(|ch| !ch.is_control() || *ch == '\n' || *ch == '\t').collect()
+}
+
+fn print_run(r: &Run) {
+    let when = ago(r.started_at, now_ms());
+    match (r.status, &r.error) {
+        (RunStatus::Failed, Some(e)) => println!("Session #{} with {} failed ({when}): {e}", r.id, r.backend),
+        (RunStatus::Running, _) => println!("Session #{} with {} is running (started {when}).", r.id, r.backend),
+        _ => {
+            println!("Session #{} with {} ({when}): {} change(s).", r.id, r.backend, r.edits);
+            if let Some(s) = &r.summary {
+                println!("{s}");
+            }
+        }
+    }
+}
+
+/// Runs a session in the terminal: streams events, then reads follow-ups until an empty line.
+fn chat(backend: Backend, scope: Scope, mode: SessionMode, opening: ChatOpening<'_>) -> Result<(), String> {
+    let (tx, rx) = mpsc::channel();
+    let session = Session::start_curator_chat(backend, SessionEnv::detect(), scope, mode, opening, move |e| {
+        let _ = tx.send(e);
+    })
+    .map_err(|e| e.to_string())?;
+    let task = match mode {
+        SessionMode::Ask => "Ask the Notebook",
+        SessionMode::Review => "Review and update notes",
+    };
+    eprintln!("{task} · {}", backend.label());
+    let interactive = std::io::stdin().is_terminal();
+    let mut out = std::io::stdout().lock();
+    for event in rx {
+        match event {
+            Event::Started => {}
+            Event::Thinking(t) => write!(out, "\x1b[2m{t}\x1b[0m").map_err(|e| e.to_string())?,
+            Event::Text(t) => write!(out, "{t}").map_err(|e| e.to_string())?,
+            Event::ToolStarted(call) => writeln!(out, "\n  → {} {}", call.name, call.input).map_err(|e| e.to_string())?,
+            Event::ToolFinished { output, failed, .. } => {
+                let first = output.lines().next().unwrap_or("");
+                writeln!(out, "  {} {first}", if failed { "✗" } else { "✓" }).map_err(|e| e.to_string())?;
+            }
+            Event::TurnFinished => {
+                writeln!(out).map_err(|e| e.to_string())?;
+                out.flush().map_err(|e| e.to_string())?;
+                let next = if interactive { prompt()? } else { String::new() };
+                if next.trim().is_empty() {
+                    session.stop();
+                } else {
+                    session.send(next.trim()).map_err(|e| e.to_string())?;
+                }
+            }
+            Event::NeedsSignIn => {
+                return Err(format!(
+                    "{} isn't signed in. Run `{}` in Terminal to sign in, then try again.",
+                    backend.label(),
+                    backend.sign_in_command()
+                ));
+            }
+            Event::Failed(why) => return Err(why),
+            Event::Ended => break,
+        }
+        out.flush().map_err(|e| e.to_string())?;
+    }
+    Ok(())
+}
+
+fn prompt() -> Result<String, String> {
+    eprint!("\nyou (Enter to finish) › ");
+    let mut line = String::new();
+    std::io::stdin().lock().read_line(&mut line).map_err(|e| e.to_string())?;
+    Ok(line)
+}
+
+fn flag_json(f: &Flag) -> Value {
+    json!({
+        "id": f.id,
+        "kind": f.kind.as_str(),
+        "page_id": f.page_id,
+        "project_id": f.project_id,
+        "agent": f.agent,
+        "note": f.note,
+        "suggestion": f.suggestion,
+        "status": f.status.as_str(),
+        "resolution": f.resolution,
+        "change_id": f.change_id,
+        "source_update_id": f.source_update_id,
+        "created_at": f.created_at,
+        "resolved_at": f.resolved_at,
+    })
+}
+
+fn change_json(c: &Change) -> Value {
+    json!({
+        "id": c.id,
+        "page_id": c.page_id,
+        "page_title": c.page_title,
+        "action": c.action.as_str(),
+        "agent": c.agent,
+        "reason": c.reason,
+        "source_updates": c.source_updates,
+        "source_flags": c.source_flags,
+        "gardener_run_id": c.gardener_run_id,
+        "revertible": c.is_revertible(),
+        "created_at": c.created_at,
+        "reverted_at": c.reverted_at,
+    })
+}
+
+fn run_json(r: &Run) -> Value {
+    json!({
+        "id": r.id,
+        "backend": r.backend,
+        "project_id": r.scope.project_id(),
+        "status": format!("{:?}", r.status).to_lowercase(),
+        "started_at": r.started_at,
+        "finished_at": r.finished_at,
+        "summary": r.summary,
+        "edits": r.edits,
+        "error": r.error,
+    })
+}

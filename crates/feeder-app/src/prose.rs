@@ -1,8 +1,6 @@
-//! Shapes an update for reading. Each paragraph may open with a short label ("Next:",
-//! "**Where it stands:**"), which becomes a small heading over it. Then, outside the code and bold
-//! the agent wrote itself: ticket ids, commit hashes, branches, paths and file names read as code;
-//! results ("44/44", "85%", "14 ms") and inline cues ("Next:") are bold; and a short opening
-//! sentence leads in bold when more follows. What's left is Markdown, rendered by rune-kit.
+//! Shapes an update for reading. A short label such as "Next:" becomes a section heading.
+//! Plain lines get automatic emphasis for metrics and code styling for paths and ticket IDs.
+//! Authored Markdown goes directly to Rune's renderer.
 
 #[derive(Debug, PartialEq, Eq)]
 pub struct Section {
@@ -11,14 +9,19 @@ pub struct Section {
 }
 
 pub fn sections(body: &str) -> Vec<Section> {
-    body.split("\n\n")
+    feeder_core::update_blocks(body)
         .map(str::trim)
-        .filter(|p| !p.is_empty())
         .map(|p| {
             let (label, rest) = split_label(p);
             // Under a heading the sentence starts afresh: "Where it stands: the branch…" → "The branch…".
             let rest = if label.is_some() { capitalize(rest) } else { rest.to_string() };
-            Section { label, markdown: enrich(&code_tickets(&rest)) }
+            // Leave authored Markdown and multiline structure to the renderer.
+            let markdown = if rest.contains(['\n', '`', '[', '*', '_', '<', '>', '~', '\\', '|']) || rest.starts_with('#') {
+                rest
+            } else {
+                enrich(&code_tickets(&rest))
+            };
+            Section { label, markdown }
         })
         .collect()
 }
@@ -276,6 +279,15 @@ mod tests {
         let plain = sections("Shipped the onboarding flow and fixed the bug in billing: it rounded down.");
         assert_eq!(plain[0].label, None);
         assert_eq!(sections("Meeting at 12:30 today.")[0].label, None);
+    }
+
+    #[test]
+    fn authored_links_and_fenced_code_reach_the_renderer_intact() {
+        let s =
+            sections("Done: Read the [release notes](https://example.test/TAL-42).\n\n```text\nfirst line\n\nNext: example output\n```");
+        assert_eq!(s.len(), 2);
+        assert_eq!(s[0].markdown, "Read the [release notes](https://example.test/TAL-42).");
+        assert_eq!(s[1].markdown, "```text\nfirst line\n\nNext: example output\n```");
     }
 
     #[test]

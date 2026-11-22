@@ -1,23 +1,21 @@
-//! The notebook's MCP tools: search before digging, read a page, write or revise one, and say
-//! when one helped.
+//! The everyday agent's Notebook tools: search, read, record what helped, and flag gaps for Curator.
 
-use feeder_core::{Kind, OnSimilar, PageDraft, PageFilter, Standing, now_ms};
+use feeder_core::{FlagKind, FlagStatus, Kind, NewFlag, PageFilter, now_ms};
 use serde_json::{Value, json};
 
 use super::{Server, ToolOutput, str_arg};
 use crate::notebook::{page_json, project_name};
 
 /// The tools this module answers, by name.
-pub(super) const TOOLS: [&str; 5] = ["search_notebook", "read_page", "write_page", "mark_page_helped", "archive_page"];
+pub(super) const TOOLS: [&str; 4] = ["search_notebook", "read_page", "mark_page_helped", "flag_knowledge"];
 
 impl Server {
     pub(super) fn notebook_call(&self, name: &str, args: &Value) -> Result<ToolOutput, String> {
         match name {
             "search_notebook" => self.search_notebook(args),
             "read_page" => self.read_page(args),
-            "write_page" => self.write_page(args),
             "mark_page_helped" => self.mark_page_helped(args),
-            "archive_page" => self.archive_page(args),
+            "flag_knowledge" => self.flag_knowledge(args),
             _ => Err(format!("unknown tool: {name}")),
         }
     }
@@ -36,7 +34,20 @@ impl Server {
         let store = self.open_store()?;
         let hits = store.search_pages(query, &filter, limit).map_err(|e| e.to_string())?;
         let text = if hits.is_empty() {
-            format!("Nothing in the notebook matches “{query}”. If you solve this and the cause wasn't obvious, consider writing a page.")
+            // An empty search is the clearest sign of a gap, so it files itself for the gardener.
+            if !query.trim().is_empty() {
+                let note = format!("Notebook search found nothing for “{}”", query.trim());
+                let open = store.flags(Some(FlagStatus::Open), 200).map_err(|e| e.to_string())?;
+                if !open.iter().any(|f| f.note == note) {
+                    let project_id = self.project(&store, args, false).ok().flatten().map(|p| p.id);
+                    let flag = NewFlag { kind: FlagKind::Missing, page_id: None, project_id, note, suggestion: None };
+                    // Best effort: a refused flag (a secret in the query, say) mustn't fail the search.
+                    let _ = store.flag_knowledge(flag, &self.resolve_agent(args));
+                }
+            }
+            format!(
+                "Nothing in the notebook matches “{query}”. If you work it out, use flag_knowledge to leave the verified answer for Curator."
+            )
         } else {
             let mut out = format!("{} page(s), best match first. Open one with read_page:", hits.len());
             for p in &hits {
@@ -56,49 +67,6 @@ impl Server {
         Ok(ToolOutput::text(text, page_json(&store, &page)))
     }
 
-    fn write_page(&self, args: &Value) -> Result<ToolOutput, String> {
-        let kind: Kind = match str_arg(args, "kind") {
-            Some(raw) => raw.parse().map_err(|e: feeder_core::Error| e.to_string())?,
-            None => Kind::Note,
-        };
-        let tags: Vec<String> = match args.get("tags") {
-            Some(Value::Array(a)) => a.iter().filter_map(Value::as_str).map(str::to_string).collect(),
-            Some(Value::String(s)) => vec![s.clone()],
-            _ => vec![],
-        };
-        let title = str_arg(args, "title").ok_or("`title` is required")?.to_string();
-        let topic = str_arg(args, "topic").map(str::to_string);
-        let draft = if let Some(body) = str_arg(args, "body") {
-            PageDraft { kind, topic, title, tags, body: body.to_string() }
-        } else if args.get("what_happened").is_some() || args.get("do_this").is_some() {
-            PageDraft::from_legacy(
-                kind,
-                topic,
-                title,
-                tags,
-                str_arg(args, "what_happened").unwrap_or_default().to_string(),
-                str_arg(args, "why").map(str::to_string),
-                str_arg(args, "do_this").unwrap_or_default().to_string(),
-            )
-        } else {
-            return Err("`body` (Markdown) is required".into());
-        };
-        let author = self.resolve_agent(args);
-        let store = self.open_store()?;
-        let page = match args.get("id").and_then(Value::as_i64) {
-            Some(id) => store.revise_page(id, draft, &author),
-            None => {
-                let project_id = self.project(&store, args, false)?.map(|p| p.id);
-                let on_similar =
-                    if args.get("allow_similar").and_then(Value::as_bool).unwrap_or(false) { OnSimilar::Allow } else { OnSimilar::Refuse };
-                store.create_page(draft, &author, project_id, on_similar)
-            }
-        }
-        .map_err(|e| e.to_string())?;
-        let verb = if page.revision > 1 { "Revised" } else { "Wrote" };
-        Ok(ToolOutput::text(format!("{verb} notebook page #{}: {}", page.id, page.title), page_json(&store, &page)))
-    }
-
     fn mark_page_helped(&self, args: &Value) -> Result<ToolOutput, String> {
         let id = args.get("id").and_then(Value::as_i64).ok_or("`id` is required")?;
         let store = self.open_store()?;
@@ -106,14 +74,23 @@ impl Server {
         Ok(ToolOutput::text(format!("Noted: page #{} has helped {}×.", page.id, page.helped), page_json(&store, &page)))
     }
 
-    fn archive_page(&self, args: &Value) -> Result<ToolOutput, String> {
-        let id = args.get("id").and_then(Value::as_i64).ok_or("`id` is required")?;
-        let restore = args.get("restore").and_then(Value::as_bool).unwrap_or(false);
-        let standing = if restore { Standing::Current } else { Standing::Archived };
+    fn flag_knowledge(&self, args: &Value) -> Result<ToolOutput, String> {
+        let kind: FlagKind = str_arg(args, "kind").unwrap_or("missing").parse().map_err(|e: feeder_core::Error| e.to_string())?;
+        let note = str_arg(args, "note").ok_or("`note` is required: say what's missing or wrong")?.to_string();
         let store = self.open_store()?;
-        store.set_page_standing(id, standing).map_err(|e| e.to_string())?;
-        let verb = if restore { "Restored" } else { "Archived" };
-        Ok(ToolOutput::text(format!("{verb} notebook page #{id}."), json!({ "id": id, "archived": !restore })))
+        let project_id = self.project(&store, args, false)?.map(|p| p.id);
+        let flag = NewFlag {
+            kind,
+            page_id: args.get("page_id").and_then(Value::as_i64),
+            project_id,
+            note,
+            suggestion: str_arg(args, "suggestion").map(str::to_string),
+        };
+        let flag = store.flag_knowledge(flag, &self.resolve_agent(args)).map_err(|e| e.to_string())?;
+        Ok(ToolOutput::text(
+            format!("Flagged #{} ({}) for the next Curator review.", flag.id, flag.kind),
+            json!({ "id": flag.id, "kind": flag.kind.as_str(), "page_id": flag.page_id, "status": "open" }),
+        ))
     }
 }
 
@@ -147,38 +124,25 @@ pub(super) fn tools() -> Vec<Value> {
             "annotations": { "readOnlyHint": true }
         }),
         json!({
-            "name": "write_page",
-            "title": "Write or revise a notebook page",
-            "description": "Save a freeform Markdown article to Feeder's cross-project knowledge library (a non-obvious fix, pitfall, reusable pattern, architecture decision, or technical guide). Search first; to update an existing article, pass its `id`. Near-duplicates are refused. Never include secrets.",
-            "inputSchema": {
-                "type": "object",
-                "properties": {
-                    "id": { "type": "integer", "description": "Revise this page instead of adding a new one." },
-                    "title": { "type": "string", "description": "Clear, searchable title (2–120 chars)." },
-                    "body": { "type": "string", "description": "Freeform Markdown content (headings, fenced code blocks, lists, `- [ ]` checklists, tables, `> [!note]` callouts, links)." },
-                    "topic": { "type": "string", "description": "Optional category (`rust`, `react`, `nextjs`, `react-native`, `swift`, `typescript`, `agents`, `data`, `design`, `tooling`, `general`, or a custom slug). Inferred automatically when omitted." },
-                    "tags": { "type": "array", "items": { "type": "string" }, "description": "Optional lowercase tags (0–10)." },
-                    "kind": kind,
-                    "project": { "type": "string", "description": "The project it came from. Defaults to the one the server runs in." },
-                    "allow_similar": { "type": "boolean", "description": "File it even though a similar page exists; only for a genuinely different note." }
-                },
-                "required": ["title", "body"]
-            }
-        }),
-        json!({
             "name": "mark_page_helped",
             "title": "Mark a notebook page as helpful",
             "description": "Record that a notebook page helped with the current task, so pages that keep paying off rise in search.",
             "inputSchema": { "type": "object", "properties": { "id": id }, "required": ["id"] }
         }),
         json!({
-            "name": "archive_page",
-            "title": "Archive or restore a notebook page",
-            "description": "Archive a page that's outdated or wrong (it stays on record but leaves search), or restore one.",
+            "name": "flag_knowledge",
+            "title": "Flag missing or wrong notebook knowledge",
+            "description": "Search the Notebook first. Flag missing, incorrect, or outdated knowledge instead of writing or archiving shared notes. Add the matching `page_id` when there is one and put the verified fix in `suggestion` if you know it. Curator reviews the flag. Never include secrets.",
             "inputSchema": {
                 "type": "object",
-                "properties": { "id": id, "restore": { "type": "boolean", "description": "Bring an archived page back." } },
-                "required": ["id"]
+                "properties": {
+                    "kind": { "type": "string", "enum": ["missing", "wrong", "outdated"], "description": "What you found (default `missing`)." },
+                    "note": { "type": "string", "description": "What's missing or wrong, in a sentence or two (4–2000 chars)." },
+                    "page_id": { "type": "integer", "description": "The page that's wrong or outdated, if any." },
+                    "suggestion": { "type": "string", "description": "Optional verified correction or reusable lesson for Curator to review." },
+                    "project": { "type": "string", "description": "The project you were working in. Defaults to the one the server runs in." }
+                },
+                "required": ["note"]
             }
         }),
     ]

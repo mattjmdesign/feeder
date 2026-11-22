@@ -3,7 +3,9 @@
 
 mod agent;
 mod detect;
+pub mod gardener;
 mod guide;
+mod knowledge;
 mod notebook;
 mod orb;
 mod settings;
@@ -18,10 +20,14 @@ pub use detect::{
     latest_commit_summary, remove_post_commit_hook, slugify,
 };
 pub use guide::{GUIDE, NOTEBOOK_GUIDE, notebook_skill_markdown, skill_markdown};
+pub use knowledge::{
+    Change, ChangeAction, Curated, Curation, FLAG_NOTE_CHARS, FLAG_SUGGESTION_MAX_CHARS, Flag, FlagKind, FlagOutcome, FlagStatus, GARDENER,
+    NewFlag, PageSnapshot, Provenance, REASON_MAX_CHARS,
+};
 pub use notebook::{
-    BODY_CHARS, CANONICAL_TOPICS, Kind, OnSimilar, Page, PageDraft, PageFilter, Standing, TAG_COUNT, TITLE_CHARS, TOPIC_MAX_CHARS,
-    TagCount, TopicSpec, TopicSummary, compose_legacy_body, infer_topic, markdown_excerpt, normalize_tags, normalize_topic, secret_in,
-    tag_counts, toggle_markdown_task, topic_counts, topic_label,
+    BODY_CHARS, CANONICAL_TOPICS, HUMAN_AUTHOR, Kind, OnSimilar, Page, PageDraft, PageFilter, Standing, TAG_COUNT, TITLE_CHARS,
+    TOPIC_MAX_CHARS, TagCount, TopicSpec, TopicSummary, compose_legacy_body, infer_topic, markdown_excerpt, normalize_tags,
+    normalize_topic, secret_in, tag_counts, toggle_markdown_task, topic_counts, topic_label,
 };
 pub use orb::{Orb, Pattern};
 pub use settings::{OrbSize, Order, Settings, Theme};
@@ -31,7 +37,8 @@ pub use store::{
 };
 pub use time::{ago, day_key, day_label, now_ms, relative_time};
 pub use update::{
-    AttentionKind, MAX_CHARS, MAX_PARAGRAPHS, UpdateError, build_resume_prompt, extract_block, parse_attention, validate_body,
+    AttentionKind, MAX_CHARS, MAX_PARAGRAPHS, UpdateError, build_resume_prompt, extract_block, parse_attention, update_blocks,
+    validate_body,
 };
 
 pub type Result<T> = std::result::Result<T, Error>;

@@ -10,7 +10,7 @@
 
 Each project gets an orb on the Home screen and its own feed of updates. Agents post through a
 local MCP server or the `feeder` command. It's built in Rust on [Rune](https://github.com/anomalyco/rune),
-so it opens instantly and stays small. Everything stays on your Mac.
+so it opens instantly and stays small. Your Feed and Notebook are stored on your Mac.
 
 ## Install
 
@@ -45,6 +45,42 @@ In the app:
   callouts, code blocks, tables, and interactive checklists. Agents search it before they start debugging.
 - **⌘K** jumps to any project, update or notebook page.
 
+### Curator
+
+The **Feed** records what happened. The **Notebook** keeps what you'll want to know next time.
+If an update or its replies explain a reusable fix or decision, choose **Flag for Notebook**.
+Working agents can search and read the Notebook (`search_notebook`, `read_page`), record when a
+page helped (`mark_page_helped`), and report gaps (`flag_knowledge`). They can include a verified
+fix as a `suggestion` for Curator to review. You can edit notes directly in the Notebook.
+
+When an agent starts or resumes work, it can pass task keywords to `get_feed` to get up to three
+matching current notes alongside the project's updates. This includes notes from that project
+and the shared Notebook. Save personal design and writing preferences as **Taste** notes in the
+shared Notebook. Project notes keep their project scope regardless of category.
+
+Open **Notebook → Curator** to ask a question from saved notes or review those flags:
+
+- **Ask** searches the Notebook and links to the pages it used. It can't edit notes or read Feed threads.
+- **Review Open Flags** reads flags and relevant Feed replies. It uses that evidence to add or update notes.
+  Curator looks for a reusable lesson or a pointer to a source that stays current. It checks for an
+  existing note first and leaves gaps open when the evidence is unclear. Each page edit has a source
+  and can be reverted.
+- **Find Duplicate Notes** links to overlapping pages so you can decide what to keep.
+
+Open Curator from a project's **Update Notes** button to limit the session to that project.
+You can ask follow-up questions in the same session or press **Stop** to end it.
+
+Curator can use an installed [Claude Code](https://claude.com/claude-code),
+[Codex](https://developers.openai.com/codex), [OpenCode](https://opencode.ai/) or
+[Antigravity CLI](https://antigravity.google/docs/cli/acp/). Claude Code and Codex reuse their
+normal CLI sign-in. OpenCode and Antigravity use separate Curator profiles. Sign in to them
+with `feeder curator connect --with opencode` or `feeder curator connect --with antigravity`.
+The CLI manages its own credentials and the account or model configured there determines usage.
+
+From Terminal, use `feeder curator run --ask "How do we sign releases?"` for a read-only
+answer or `feeder curator run --project "My Project" --with codex` to review a project.
+Use `feeder flag --update 42` to flag a Feed thread and its replies for review.
+
 You can also post from Terminal:
 
 ```sh
@@ -62,8 +98,9 @@ feeder dismiss         # clear an open Needs you flag on this project
 ## Privacy
 
 Your projects, updates and screenshots are saved in `~/Library/Application Support/feeder` on your
-Mac. Feeder has no account and collects no data. The only thing it sends over the internet is an
-hourly check for a new version.
+Mac. Feeder has no account and collects no telemetry. It checks for new versions about once an
+hour. When you start Curator, the messages you send and the sources it reads go to the model
+provider used by the selected CLI, under that account's terms.
 
 ## Uninstall
 

@@ -1,9 +1,53 @@
 //! What an update may be: 1–3 short blocks, capped so updates stay scannable.
 
-/// Blocks (paragraphs or short lists) are separated by a blank line.
+/// Blocks are separated by a blank line outside fenced Markdown code.
 pub const MAX_PARAGRAPHS: usize = 3;
 /// A ceiling on the whole note, so updates stay a glance rather than an essay.
 pub const MAX_CHARS: usize = 900;
+
+#[derive(Clone, Copy)]
+struct Fence {
+    marker: char,
+    width: usize,
+}
+
+impl Fence {
+    /// Tracks Markdown fences and tells the caller whether this line belongs to one.
+    fn advance(active: &mut Option<Self>, line: &str) -> bool {
+        let trimmed = line.trim_start_matches(' ');
+        let marker = trimmed.chars().next();
+        let candidate = marker.filter(|c| matches!(c, '`' | '~')).filter(|_| line.len() - trimmed.len() <= 3);
+        let was_active = active.is_some();
+        if let Some(marker) = candidate {
+            let width = trimmed.chars().take_while(|&c| c == marker).count();
+            let rest = &trimmed[width..];
+            match *active {
+                Some(open) if marker == open.marker && width >= open.width && rest.trim().is_empty() => *active = None,
+                None if width >= 3 && (marker == '~' || !rest.contains('`')) => *active = Some(Self { marker, width }),
+                _ => {}
+            }
+        }
+        was_active || active.is_some()
+    }
+}
+
+/// Splits an update at blank lines outside fenced Markdown code blocks.
+pub fn update_blocks(mut rest: &str) -> impl Iterator<Item = &str> {
+    std::iter::from_fn(move || {
+        while let Some(line) = rest.split_inclusive('\n').next().filter(|line| line.trim().is_empty()) {
+            rest = &rest[line.len()..];
+        }
+        if rest.is_empty() {
+            return None;
+        }
+        let mut fence = None;
+        let end =
+            rest.split_inclusive('\n').take_while(|line| Fence::advance(&mut fence, line) || !line.trim().is_empty()).map(str::len).sum();
+        let (block, tail) = rest.split_at(end);
+        rest = tail;
+        Some(block.trim_end_matches(['\n', '\r']))
+    })
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum UpdateError {
@@ -24,15 +68,11 @@ impl std::fmt::Display for UpdateError {
     }
 }
 
-/// Trims the note, collapses runs of blank lines into one paragraph break and checks the limits.
+/// Trims the note, collapses runs of blank lines between blocks and checks the limits.
 /// Returns the note as it will be stored.
 pub fn validate_body(raw: &str) -> Result<String, UpdateError> {
-    let paragraphs: Vec<String> = raw
-        .replace("\r\n", "\n")
-        .split("\n\n")
-        .map(|p| p.lines().map(str::trim_end).collect::<Vec<_>>().join("\n").trim().to_string())
-        .filter(|p| !p.is_empty())
-        .collect();
+    let normalized = raw.replace("\r\n", "\n");
+    let paragraphs: Vec<&str> = update_blocks(&normalized).map(str::trim).collect();
     if paragraphs.is_empty() {
         return Err(UpdateError::Empty);
     }
@@ -55,17 +95,16 @@ pub enum AttentionKind {
 
 /// Detects whether an update explicitly flags a blocker or a decision needed from the human.
 pub fn parse_attention(body: &str) -> Option<AttentionKind> {
-    for block in body.split("\n\n") {
-        for line in block.lines() {
-            let trimmed = line.trim().trim_start_matches(['-', '*', ' ']);
-            let clean = trimmed.trim_start_matches("**");
-            let lower = clean.to_ascii_lowercase();
-            if lower.starts_with("decision needed:") || lower.starts_with("decision needed**") {
-                return Some(AttentionKind::DecisionNeeded);
-            }
-            if lower.starts_with("blocked:") || lower.starts_with("blocked**") {
-                return Some(AttentionKind::Blocked);
-            }
+    let mut fence = None;
+    for line in body.lines().filter(|line| !Fence::advance(&mut fence, line)) {
+        let trimmed = line.trim().trim_start_matches(['-', '*', ' ']);
+        let clean = trimmed.trim_start_matches("**");
+        let lower = clean.to_ascii_lowercase();
+        if lower.starts_with("decision needed:") || lower.starts_with("decision needed**") {
+            return Some(AttentionKind::DecisionNeeded);
+        }
+        if lower.starts_with("blocked:") || lower.starts_with("blocked**") {
+            return Some(AttentionKind::Blocked);
         }
     }
     None
@@ -73,7 +112,7 @@ pub fn parse_attention(body: &str) -> Option<AttentionKind> {
 
 /// Extracts the text of the first paragraph matching one of `prefixes` (e.g. `"done"`, `"next"`).
 pub fn extract_block(body: &str, prefixes: &[&str]) -> Option<String> {
-    for block in body.split("\n\n") {
+    for block in update_blocks(body) {
         let t = block.trim();
         let no_bold = t.strip_prefix("**").unwrap_or(t);
         let Some(colon) = no_bold.find(':') else { continue };
@@ -141,6 +180,14 @@ mod tests {
     #[test]
     fn a_fourth_block_is_refused() {
         assert_eq!(validate_body("a\n\nb\n\nc\n\nd"), Err(UpdateError::TooManyParagraphs(4)));
+    }
+
+    #[test]
+    fn fenced_code_keeps_blank_lines_and_does_not_raise_attention() {
+        let body = "Done: verified the command.\n~~~text\necho first\n\nBlocked: example output\n~~~\n\nWhy: the sample needs both lines.\n\nNext: publish the docs.";
+        assert_eq!(validate_body(body).expect("three update blocks"), body);
+        assert_eq!(parse_attention(body), None);
+        assert_eq!(extract_block(body, &["next"]).as_deref(), Some("publish the docs."));
     }
 
     #[test]

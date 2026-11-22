@@ -1,5 +1,6 @@
 //! `feeder`: post and read project updates from a terminal, or serve them to agents over MCP.
 
+mod gardener;
 mod mcp;
 mod notebook;
 mod web;
@@ -120,6 +121,49 @@ enum Command {
     Notebook {
         #[command(subcommand)]
         action: Option<notebook::NotebookCmd>,
+    },
+    /// Flag Notebook knowledge that is missing, wrong or outdated for Curator to review.
+    Flag {
+        /// What's missing or wrong.
+        note: Vec<String>,
+        /// Flag a Feed thread and its replies for Curator to review.
+        #[arg(long, conflicts_with_all = ["note", "kind", "page", "suggest", "project"])]
+        update: Option<i64>,
+        /// `missing` (default), `wrong` or `outdated`.
+        #[arg(long)]
+        kind: Option<String>,
+        /// The page that's wrong or outdated.
+        #[arg(long)]
+        page: Option<i64>,
+        /// The correct information, if you know it.
+        #[arg(long)]
+        suggest: Option<String>,
+        /// The project you're working in. Defaults to the current folder's project.
+        #[arg(short, long)]
+        project: Option<String>,
+        #[arg(short, long)]
+        agent: Option<String>,
+        #[arg(long)]
+        json: bool,
+    },
+    /// List open flags (or all with --all), or dismiss one.
+    Flags {
+        #[arg(long)]
+        all: bool,
+        /// Dismiss this flag.
+        #[arg(long)]
+        dismiss: Option<i64>,
+        /// Why it's dismissed.
+        #[arg(long, requires = "dismiss")]
+        reason: Option<String>,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Ask a Notebook question or review flagged notes with Curator.
+    #[command(name = "curator", visible_alias = "gardener")]
+    Gardener {
+        #[command(subcommand)]
+        action: gardener::GardenerCmd,
     },
     /// Manage a project's optional to-do list.
     Todo {
@@ -249,7 +293,13 @@ enum Command {
         yes: bool,
     },
     /// Run the MCP server on stdio (agent tools start this themselves; it's local only).
-    Mcp,
+    Mcp {
+        /// Offer only the Notebook gardener's tools (Feeder starts this for a gardener session).
+        #[arg(long, hide = true, requires = "gardener_run")]
+        gardener: bool,
+        #[arg(long, hide = true, requires = "gardener")]
+        gardener_run: Option<i64>,
+    },
     /// Connect Feeder to your agent tools: the MCP server, plus the writing skill.
     ///
     /// With no tools named it lists them; `--all` connects every one found on this Mac.
@@ -336,7 +386,7 @@ enum TodoCmd {
 fn main() -> ExitCode {
     let cli = Cli::parse();
     let result = match cli.command {
-        Command::Mcp => mcp::serve(),
+        Command::Mcp { gardener_run, .. } => mcp::serve(gardener_run.map_or(mcp::Role::Agent, mcp::Role::Gardener)),
         Command::Serve { bind, token } => web::serve(&bind, token.as_deref()),
         Command::Guide => {
             print!("{GUIDE}");
@@ -576,6 +626,26 @@ fn run(command: Command) -> Result<(), String> {
         }
         Command::Todo { action, project, open, json } => run_todo(&store, action, project, open, json),
         Command::Notebook { action } => notebook::run(&store, action, &default_agent()),
+        Command::Flag { update: Some(id), agent, json, .. } => {
+            let author = agent.as_deref().map_or_else(|| feeder_core::HUMAN_AUTHOR.to_string(), agent_display_name);
+            let flag = store.flag_update_for_notebook(id, &author).map_err(|e| e.to_string())?;
+            gardener::print_flag(&flag, json);
+            Ok(())
+        }
+        Command::Flag { note, kind, page, suggest, project, agent, json, .. } => {
+            let kind = kind.as_deref().unwrap_or("missing").parse().map_err(|e: feeder_core::Error| e.to_string())?;
+            let project_id = match project {
+                Some(name) => Some(store.find_project(&name).map_err(|e| e.to_string())?.ok_or(format!("no project called {name}"))?.id),
+                None => {
+                    std::env::current_dir().ok().and_then(|here| store.find_detected(&detect_project(&here)).ok().flatten()).map(|p| p.id)
+                }
+            };
+            let author = agent_display_name(&agent.unwrap_or_else(default_agent));
+            let flag = feeder_core::NewFlag { kind, page_id: page, project_id, note: note.join(" "), suggestion: suggest };
+            gardener::flag(&store, flag, &author, json)
+        }
+        Command::Flags { all, dismiss, reason, json } => gardener::flags(&store, all, dismiss, reason, json),
+        Command::Gardener { action } => gardener::run(&store, action),
         Command::Pulse { status, project, agent, branch, ttl, clear, json } => {
             let dir = std::env::current_dir().map_err(|e| e.to_string())?;
             let project = match project {
@@ -855,7 +925,9 @@ fn run(command: Command) -> Result<(), String> {
             println!("Removed {}.", p.name);
             Ok(())
         }
-        Command::Mcp | Command::Serve { .. } | Command::Where | Command::Guide | Command::Setup { .. } => unreachable!("handled in main"),
+        Command::Mcp { .. } | Command::Serve { .. } | Command::Where | Command::Guide | Command::Setup { .. } => {
+            unreachable!("handled in main")
+        }
     }
 }
 

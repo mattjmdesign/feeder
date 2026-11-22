@@ -154,7 +154,7 @@ pub fn app_path(tool: Tool) -> Option<PathBuf> {
     tool.app_names().iter().flat_map(|name| [Path::new("/Applications").join(name), h.join("Applications").join(name)]).find(|p| p.exists())
 }
 
-fn which(cmd: &str) -> Option<PathBuf> {
+pub(crate) fn which(cmd: &str) -> Option<PathBuf> {
     let path = std::env::var_os("PATH")?;
     let mut dirs: Vec<PathBuf> = std::env::split_paths(&path).collect();
     // GUI apps and some shells don't put these on PATH.

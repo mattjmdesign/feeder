@@ -63,9 +63,8 @@ CLI (from the project folder):
 MCP: call `post_update` with `summary` (and `screenshots` or `screenshot_path` when visible).
 "#;
 
-/// How agents should use the notebook: look before digging, write clean Markdown articles worth
-/// keeping, and keep it tidy. Served by the MCP server, `feeder notebook guide` and the
-/// `feeder-notebook` skill.
+/// How agents should use the Notebook. Served by the MCP server, `feeder notebook guide`, and
+/// the `feeder-notebook` skill.
 pub const NOTEBOOK_GUIDE: &str = r###"# Feeder's notebook: a shared Markdown knowledge library across projects
 
 The notebook is one shared, searchable library of freeform Markdown articles across every project
@@ -74,6 +73,10 @@ decisions, and technical notes. Every project and every agent reads the same lib
 learn once pays off everywhere.
 
 ## Look before you dig
+When starting or resuming work, pass a few task keywords to `get_feed`, for example
+`{"project":"Orbit","task":"appcast signing"}`. It includes up to three relevant current
+notes from that project and the shared Notebook. Open the ones you need with `read_page`.
+
 Search the notebook before non-trivial debugging, before picking an approach for something tricky,
 and whenever an error message isn't immediately familiar:
 
@@ -83,42 +86,23 @@ Results show each article's title and excerpt. Open one in full with `feeder not
 (MCP: `read_page`). If an article helped, record it with `feeder notebook helped 12`
 (MCP: `mark_page_helped`) so the most useful notes rise in search.
 
-## Write a note only when it will save someone time later
-Good notes capture things worth carrying into the next project:
-- A non-obvious bug fix (symptom, exact error, root cause, fix)
-- A pitfall or dead end worth avoiding next time
-- A reusable pattern, recipe, or architecture decision with its reasoning
+## Flag gaps for Curator
+Use `flag_knowledge` when a reusable lesson is missing, wrong, or outdated. Include the affected
+`page_id` if a note exists. Put the verified fix in `suggestion` when you have one.
 
-Skip one-off typos, project-local trivia, or status updates (those belong in the feed). Most
-sessions write no note at all; that's expected.
+    feeder flag --kind outdated --page 12 --suggest 'Run scripts/release.sh' 'The release script moved out of the repository root.'
 
-## Shape of a note: clean, freeform Markdown
-Write natural, well-structured `.md` just like Obsidian or Notion—no rigid form fields required:
-- **Title**: plain, searchable phrasing (e.g. "SQLite reads stall while a long write holds the lock").
-- **Category (`topic`)**: optional high-level home (`rust`, `react`, `nextjs`, `react-native`, `swift`, `typescript`, `agents`, `data`, `design`, `tooling`, `general`, or a short custom slug). Inferred automatically when omitted.
-- **Body (`body`)**: freeform Markdown—use `##` headings, fenced code blocks with language tags, bullet lists, `- [ ]` checklists, tables, links, and `> [!note]` / `> [!tip]` / `> [!warning]` callouts.
-- **Tags & kind**: optional (`tags`, `kind`: `note`, `fix`, `pitfall`, `pattern`, `decision`).
+Flag non-obvious fixes, pitfalls, reusable procedures, and decisions that will help the next agent.
+Keep status updates in the Feed. Leave out secrets, tokens, keys, and customer data.
 
-Write so it helps in a different project: name the technology and exact error, not local scratch paths.
-Never include secrets, tokens, keys, or customer data; the notebook refuses them.
-
-## Keep it tidy
-- Search first. If an article already covers the topic, revise it (`write_page` with its `id`, or
-  `feeder notebook write --id 12 …`) instead of creating a duplicate. Feeder refuses near-duplicates.
-- If a note turns out wrong, update it. If it's outdated, archive it (`archive_page`).
-
-## Writing one
-
-    feeder notebook write --topic data --title "SQLite reads stall while a long write holds the lock" --body "## Symptom\n\nApp reads froze during media copy.\n\n## Rule\n\nCopy files to disk before opening a SQLite write transaction."
-
-MCP: `write_page` with `title`, `body` (Markdown), and optional `topic`, `tags`, `kind`.
+Curator reviews flags and maintains the shared notes. As a working agent, never create, edit,
+archive, or restore shared notes. Flag the change and keep working.
 "###;
 
-/// The skill that teaches agents to search the notebook before digging and to write the lessons
-/// worth keeping.
+/// The skill that teaches agents to search the Notebook and flag gaps for Curator.
 pub fn notebook_skill_markdown() -> String {
     format!(
-        "---\nname: feeder-notebook\ndescription: Search and grow Feeder's shared Markdown knowledge library (fixes, pitfalls, patterns, decisions, technical notes) across all of the user's projects. Use before non-trivial debugging, when an error message is unfamiliar, before choosing an approach for something tricky, and after solving a non-obvious bug, hitting a dead end or settling a design decision worth remembering.\n---\n\n{NOTEBOOK_GUIDE}"
+        "---\nname: feeder-notebook\ndescription: Search Feeder's shared Notebook before non-trivial debugging or choosing an unfamiliar approach. Flag missing, wrong, or outdated knowledge for Curator, with a verified suggestion when available.\n---\n\n{NOTEBOOK_GUIDE}"
     )
 }
 
@@ -142,10 +126,13 @@ mod tests {
     }
 
     #[test]
-    fn the_notebook_skill_teaches_search_first() {
+    fn the_notebook_skill_teaches_search_and_flagging() {
         let skill = super::notebook_skill_markdown();
         assert!(skill.starts_with("---\nname: feeder-notebook\n"));
         assert!(skill.contains("## Look before you dig"));
-        assert!(skill.contains("write_page"));
+        assert!(skill.contains("`flag_knowledge`"));
+        assert!(skill.contains("`suggestion`"));
+        assert!(!skill.contains("write_page"));
+        assert!(!skill.contains("feeder notebook write"));
     }
 }

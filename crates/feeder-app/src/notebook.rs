@@ -31,7 +31,7 @@ const ROW_BLEED: f32 = 10.0;
 const INDEX_MAX_W: f32 = 760.0;
 const DOC_MAX_W: f32 = 720.0;
 
-static PLUS_ICON: Icon = Icon {
+pub(crate) static PLUS_ICON: Icon = Icon {
     name: "nb-plus",
     view: 16.0,
     body: r#"<path d="M8 3.25V12.75M3.25 8H12.75" stroke="currentColor" stroke-width="1.35" stroke-linecap="round"/>"#,
@@ -50,6 +50,8 @@ pub enum Shelf {
     All,
     Topic(String),
     Archived,
+    /// The gardener's changes and open flags.
+    Gardener,
 }
 
 /// Tree node stored inside `TreeModel<NavNode>` in the Obsidian-style sidebar.
@@ -83,6 +85,17 @@ pub struct Notebook {
     pub action_menu_open: bool,
     /// Opens the first current page once snapshots arrive (used by `--scene notebook-page`).
     pub auto_open_first: bool,
+    pub gardener: crate::watch::GardenerView,
+    /// Whether the Gardener page lists its open flags.
+    /// The Gardener page's live session.
+    pub chat: crate::gardener::Chat,
+    /// Saved chats a snapshot scene shows in place of the database's.
+    pub preview_chats: Option<Vec<feeder_core::gardener::ChatSummary>>,
+    /// Curator changes a snapshot scene shows in place of the database's.
+    pub preview_changes: Option<Vec<feeder_core::Change>>,
+    /// The provider picked for new Curator chats; `None` uses the first installed.
+    pub curator_backend: Option<feeder_core::gardener::Backend>,
+    pub provider_open: bool,
 }
 
 impl Default for Notebook {
@@ -99,6 +112,12 @@ impl Default for Notebook {
             delete_confirm: None,
             action_menu_open: false,
             auto_open_first: false,
+            gardener: crate::watch::GardenerView::default(),
+            chat: crate::gardener::Chat::default(),
+            preview_chats: None,
+            preview_changes: None,
+            curator_backend: None,
+            provider_open: false,
         }
     }
 }
@@ -275,6 +294,7 @@ impl Notebook {
                 Shelf::All => !p.is_archived(),
                 Shelf::Topic(t) => !p.is_archived() && p.topic == *t,
                 Shelf::Archived => p.is_archived(),
+                Shelf::Gardener => false,
             };
             if !shelf_ok {
                 return false;
@@ -392,6 +412,23 @@ impl State {
         self.notebook.sync_tree_selection();
     }
 
+    /// Jumps from another tab (such as Feed) straight to a Notebook page.
+    pub fn open_notebook_page_from_anywhere(&mut self, id: i64) {
+        self.open = None;
+        self.tab = crate::Tab::Notebook;
+        self.notebook_open_page(id);
+    }
+
+    /// Flags a Feed update for Curator review (idempotent on the store side).
+    pub fn flag_update_for_notebook(&mut self, update_id: i64) {
+        self.notebook_send(NotebookOp::FlagUpdate(update_id));
+        self.push_toast(
+            "flagged-for-notebook",
+            ToastItem { title: "Flagged for Notebook".into(), description: None, kind: ToastKind::Info },
+            Some(2.5),
+        );
+    }
+
     pub fn notebook_toggle_task(&mut self, page_id: i64, task_index: usize, checked: bool) {
         if let Some(page) = self.notebook.pages.iter_mut().find(|p| p.id == page_id)
             && let Some(updated) = toggle_markdown_task(&page.body, task_index, checked)
@@ -467,7 +504,7 @@ impl State {
         false
     }
 
-    fn notebook_shelf(&mut self, shelf: Shelf) {
+    pub(crate) fn notebook_shelf(&mut self, shelf: Shelf) {
         self.notebook.shelf = shelf;
         self.notebook.open = None;
         self.notebook.editor = None;
@@ -497,17 +534,26 @@ pub fn view(s: &State, p: &Palette, k: &Kit, inset: f32, reduced_motion: bool, l
     } else if let Some(page) = nb.open.and_then(|id| nb.page(id)) {
         page_view(s, page, p, k, layer)
     } else {
-        index_view(s, p, k)
+        index_view(s, p, k, reduced_motion)
     };
 
+    // The Gardener page reads as a conversation: it follows new output and keeps its composer
+    // pinned under the scroll area.
+    let gardener = nb.editor.is_none() && nb.open.is_none() && nb.shelf == Shelf::Gardener;
+    let following = gardener && !nb.chat.items.is_empty();
     let viewport = col()
         .w_full()
         .grow(1.0)
         .min_h(0.0)
-        .child(col().w_full().items_center().px(40.0).pt(24.0).pb(80.0).child(body))
-        .scroll(ScrollSpec { stick_bottom: false })
+        .child(col().w_full().items_center().px(40.0).pt(24.0).pb(if gardener { 24.0 } else { 80.0 }).child(body))
+        .scroll(ScrollSpec { stick_bottom: following })
         .scroll_edge_fade(16.0);
-    let main_area = scroll_bar(k, "notebook-scroll-area", "notebook-scroll", viewport).w_full().grow(1.0).min_h(0.0);
+    let scroll_area = scroll_bar(k, "notebook-scroll-area", "notebook-scroll", viewport).w_full().grow(1.0).min_h(0.0);
+    let main_area = if gardener {
+        col().w_full().grow(1.0).min_h(0.0).child(scroll_area).child(crate::gardener::composer(s, p, k, INDEX_MAX_W, layer))
+    } else {
+        scroll_area
+    };
 
     let toolbar = Toolbar::new().leading(toolbar_breadcrumb(nb, p, k)).trailing(chrome::tabs(s, k)).trailing(chrome::menu(s, p, k, layer));
 
@@ -574,6 +620,10 @@ fn toolbar_breadcrumb(nb: &Notebook, p: &Palette, k: &Kit) -> El {
             .child(crumb_btn("nb-bc-all", "Notebook", false).on_press(|s: &mut State| s.notebook_shelf(Shelf::All)))
             .child(sep())
             .child(text("Archived").font(k.ty.ui_medium).color(p.text).pl(CRUMB_PAD)),
+        Shelf::Gardener => row_el
+            .child(crumb_btn("nb-bc-all", "Notebook", false).on_press(|s: &mut State| s.notebook_shelf(Shelf::All)))
+            .child(sep())
+            .child(text("Curator").font(k.ty.ui_medium).color(p.text).pl(CRUMB_PAD)),
     }
 }
 
@@ -601,14 +651,19 @@ fn sidebar_view(s: &State, p: &Palette, k: &Kit) -> El {
     }
     let search = search_input.build(k).key("nb-search");
 
-    let new_page = Button::new("New Note")
-        .icon(&PLUS_ICON)
-        .variant(ButtonVariant::Outline)
-        .control_size(ControlSize::Regular)
-        .on_press(|s: &mut State| s.notebook_new_page())
-        .build(k)
-        .w_full()
-        .key("nb-new");
+    let gardener_selected = nb.editor.is_none() && nb.open.is_none() && nb.shelf == Shelf::Gardener;
+    let new_page = if gardener_selected {
+        crate::gardener::new_chat_button(s, k)
+    } else {
+        Button::new("New Note")
+            .icon(&PLUS_ICON)
+            .variant(ButtonVariant::Outline)
+            .control_size(ControlSize::Regular)
+            .on_press(|s: &mut State| s.notebook_new_page())
+            .build(k)
+            .w_full()
+            .key("nb-new")
+    };
 
     let all_selected = nb.editor.is_none() && nb.open.is_none() && nb.shelf == Shelf::All;
     let all_row = SidebarRow::new("All notes")
@@ -618,7 +673,42 @@ fn sidebar_view(s: &State, p: &Palette, k: &Kit) -> El {
         .build(k)
         .key("nb-shelf-all");
 
-    let header = col().key("nb-sidebar-header").w_full().px(10.0).pt(4.0).pb(8.0).gap(8.0).child(search).child(new_page).child(all_row);
+    let open_flags = nb.gardener.open_flags.len();
+    let mut gardener_row = SidebarRow::new("Curator").selected(gardener_selected);
+    if nb.chat.phase == crate::gardener::Phase::Working || nb.gardener.running.is_some() {
+        gardener_row = gardener_row.status(rune_kit::shell::RowStatus::Busy);
+    }
+    if open_flags > 0 {
+        gardener_row = gardener_row.badge(open_flags.to_string());
+    }
+    let gardener_row = gardener_row.on_select(|s: &mut State, _| s.notebook_shelf(Shelf::Gardener)).build(k).key("nb-shelf-gardener");
+
+    let header = col()
+        .key("nb-sidebar-header")
+        .w_full()
+        .px(10.0)
+        .pt(4.0)
+        .pb(8.0)
+        .gap(8.0)
+        .child(search)
+        .child(new_page)
+        .child(col().w_full().gap(2.0).child(all_row).child(gardener_row));
+
+    // In Curator the sidebar lists its chats, the way AI apps keep threads beside the conversation.
+    if gardener_selected {
+        return col()
+            .key("nb-sidebar")
+            .w_full()
+            .h_full()
+            .min_h(0.0)
+            .child(header)
+            .child(if nb.gardener.chats.is_empty() {
+                el()
+            } else {
+                el().w_full().px(8.0).child(SidebarHeader::new("Chats").count(nb.gardener.chats.len()).build(k))
+            })
+            .child(col().w_full().grow(1.0).min_h(0.0).child(crate::gardener::thread_list(s, k)));
+    }
 
     let mut topics_head = SidebarHeader::new("Categories");
     if !topics.is_empty() {
@@ -688,8 +778,11 @@ fn sidebar_view(s: &State, p: &Palette, k: &Kit) -> El {
     sb
 }
 
-fn index_view(s: &State, p: &Palette, k: &Kit) -> El {
+fn index_view(s: &State, p: &Palette, k: &Kit, reduced_motion: bool) -> El {
     let nb = &s.notebook;
+    if nb.shelf == Shelf::Gardener {
+        return crate::gardener::view(s, p, k, INDEX_MAX_W, reduced_motion);
+    }
     if nb.pages.is_empty() && s.loaded {
         return col().w_full().max_w(INDEX_MAX_W).child(empty_notebook(p, k));
     }
@@ -698,6 +791,7 @@ fn index_view(s: &State, p: &Palette, k: &Kit) -> El {
         Shelf::All => "Notebook".to_string(),
         Shelf::Topic(slug) => topic_label(slug).to_string(),
         Shelf::Archived => "Archived".to_string(),
+        Shelf::Gardener => "Curator".to_string(),
     };
 
     let pages = nb.visible();
@@ -729,14 +823,21 @@ fn index_view(s: &State, p: &Palette, k: &Kit) -> El {
 
     let mut list = col().key("nb-index").w_full();
     if pages.is_empty() {
-        list = list.child(
-            col()
-                .w_full()
-                .py(36.0)
-                .gap(8.0)
-                .child(text("No matching notes").font(style::NAME).color(p.text))
-                .child(text("Clear a filter or search for fewer words.").font(style::META).color(p.text_3)),
-        );
+        let mut empty = col().w_full().py(36.0).gap(8.0).child(text("No matching notes").font(style::NAME).color(p.text));
+        let question = nb.query.text.trim().to_string();
+        if !question.is_empty() && !nb.gardener.backends.is_empty() {
+            empty = empty.child(
+                row().pt(4.0).child(
+                    Button::new("Ask Curator")
+                        .variant(ButtonVariant::Outline)
+                        .control_size(ControlSize::Small)
+                        .on_press(move |s: &mut State| s.ask_curator(question.clone()))
+                        .build(k)
+                        .key("nb-ask-curator"),
+                ),
+            );
+        }
+        list = list.child(empty);
     } else {
         for (i, page) in pages.into_iter().enumerate() {
             if i > 0 {
@@ -789,8 +890,9 @@ fn index_row(s: &State, page: &Page, p: &Palette, k: &Kit) -> El {
 
 /// "Claude Code · Feeder · helped 3×": author, source project, and usefulness count.
 fn byline(s: &State, page: &Page, p: &Palette, mark: f32) -> El {
-    let mut r = row().gap(6.0).center_y().child(agents::mark(&page.agent, p, mark, s.agent_icon(&page.agent)));
-    r = r.child(text(page.agent.clone()).font(style::META).color(p.text_2));
+    let author = if page.agent == feeder_core::GARDENER { "Curator" } else { page.agent.as_str() };
+    let mut r = row().gap(6.0).center_y().child(agents::mark(author, p, mark, s.agent_icon(author)));
+    r = r.child(text(author.to_string()).font(style::META).color(p.text_2));
     if let Some(project) = page.project_id.and_then(|pid| s.summary(pid)) {
         r = r
             .child(text("·").font(style::META).color(p.text_3))
@@ -1009,47 +1111,74 @@ fn page_view(s: &State, page: &Page, p: &Palette, k: &Kit, layer: &mut Vec<El>) 
     // Freeform Markdown article body with callouts, tables, syntax highlighting, and interactive tasks.
     doc = doc.child(render_article_markdown(&page.body, Some(id), p, k).mt(24.0));
 
-    let related = related_pages(&s.notebook, page);
+    // The Notebook as a graph: notes that point here, then notes nearby by link, tag or category.
+    let backlinks = linked_from(&s.notebook, id);
+    if !backlinks.is_empty() {
+        doc = doc.child(Divider::horizontal().build(k).mt(36.0)).child(page_list("Linked from", "nb-backlink", &backlinks, p, k));
+    }
+    let related: Vec<&Page> = related_pages(&s.notebook, page).into_iter().filter(|r| !backlinks.iter().any(|b| b.id == r.id)).collect();
     if !related.is_empty() {
-        let mut rel = col().w_full().mt(36.0).gap(4.0).child(text("Related").font(style::HEADING).color(p.text_2).mb(6.0));
-        for r in related {
-            let rid = r.id;
-            let mut row_item = row()
-                .key(format!("nb-related-{rid}"))
-                .role("button")
-                .label(r.title.clone())
-                .w_full()
-                .px(8.0)
-                .py(8.0)
-                .gap(10.0)
-                .center_y()
-                .radius(6.0)
-                .hover(p.hover)
-                .cursor(Cursor::Pointer)
-                .on_press(move |s: &mut State| s.notebook_open_page(rid));
-            if r.kind != Kind::Note {
-                row_item = row_item.child(el().size(6.0, 6.0).radius(3.0).fill(kind_color(r.kind, p)));
-            }
-            row_item = row_item
-                .child(text(r.title.clone()).font(style::NAME).color(p.text).truncate().grow(1.0).min_w(0.0))
-                .child(Badge::new(topic_label(&r.topic)).variant(BadgeVariant::Subtle).build(k));
-            rel = rel.child(row_item);
+        if backlinks.is_empty() {
+            doc = doc.child(Divider::horizontal().build(k).mt(36.0));
         }
-        doc = doc.child(Divider::horizontal().build(k).mt(36.0)).child(rel);
+        doc = doc.child(page_list("Related", "nb-related", &related, p, k));
     }
 
     doc
 }
 
-/// Up to three current pages related by shared tags or matching category.
+/// A titled list of note rows, used for Linked from and Related.
+fn page_list(title: &str, key: &str, pages: &[&Page], p: &Palette, k: &Kit) -> El {
+    let mut list = col().w_full().mt(36.0).gap(4.0).child(text(title.to_string()).font(style::HEADING).color(p.text_2).mb(6.0));
+    for r in pages {
+        let rid = r.id;
+        let mut row_item = row()
+            .key(format!("{key}-{rid}"))
+            .role("button")
+            .label(r.title.clone())
+            .w_full()
+            .px(8.0)
+            .py(8.0)
+            .gap(10.0)
+            .center_y()
+            .radius(6.0)
+            .hover(p.hover)
+            .cursor(Cursor::Pointer)
+            .on_press(move |s: &mut State| s.notebook_open_page(rid));
+        if r.kind != Kind::Note {
+            row_item = row_item.child(el().size(6.0, 6.0).radius(3.0).fill(kind_color(r.kind, p)));
+        }
+        row_item = row_item
+            .child(text(r.title.clone()).font(style::NAME).color(p.text).truncate().grow(1.0).min_w(0.0))
+            .child(Badge::new(topic_label(&r.topic)).variant(BadgeVariant::Subtle).build(k));
+        list = list.child(row_item);
+    }
+    list
+}
+
+/// Whether `body` links to note `id` with a `feeder://notebook/ID` link.
+fn links_to(body: &str, id: i64) -> bool {
+    let target = format!("feeder://notebook/{id}");
+    body.match_indices(&target).any(|(at, _)| !body[at + target.len()..].starts_with(|c: char| c.is_ascii_digit()))
+}
+
+/// Current notes whose text links to note `id`, most recently updated first.
+fn linked_from(nb: &Notebook, id: i64) -> Vec<&Page> {
+    let mut pages: Vec<&Page> = nb.current().filter(|p| p.id != id && links_to(&p.body, id)).collect();
+    pages.sort_by_key(|p| std::cmp::Reverse(p.updated_at));
+    pages
+}
+
+/// Up to three current pages related by a direct link, shared tags or matching category.
 fn related_pages<'a>(nb: &'a Notebook, page: &Page) -> Vec<&'a Page> {
     let mut scored: Vec<(usize, &Page)> = nb
         .current()
         .filter(|p| p.id != page.id)
         .map(|p| {
+            let linked = usize::from(links_to(&page.body, p.id) || links_to(&p.body, page.id));
             let shared_tags = p.tags.iter().filter(|t| page.tags.contains(t)).count();
             let same_topic = usize::from(p.topic == page.topic);
-            (shared_tags * 3 + same_topic, p)
+            (linked * 10 + shared_tags * 3 + same_topic, p)
         })
         .filter(|(sc, _)| *sc > 0)
         .collect();
@@ -1264,8 +1393,36 @@ fn split_article_chunks(src: &str) -> Vec<ArticleChunk> {
     chunks
 }
 
-fn render_article_markdown(src: &str, page_id: Option<i64>, p: &Palette, k: &Kit) -> El {
+/// How long each newly streamed word takes to fade in, in seconds.
+const LIVE_WORD_FADE: f32 = 0.22;
+
+/// A reply still arriving from Curator: Rune's streaming Markdown, so unfinished emphasis, links
+/// and tables draw as what they're becoming instead of flashing raw markers, with each new word
+/// fading in (shown at once under Reduce Motion).
+pub(crate) fn render_live_markdown(src: &str, reduced_motion: bool, p: &Palette, k: &Kit) -> El {
     let md_style = feed::markdown_style(p, k).body_font(style::PROSE);
+    Markdown::new(src.to_string())
+        .selectable(true)
+        .streaming(true)
+        .reveal(if reduced_motion { 0.0 } else { LIVE_WORD_FADE })
+        .tasks_read_only()
+        .on_link(|s: &mut State, url: &str| {
+            if let Some(id) = url.strip_prefix("feeder://notebook/").and_then(|id| id.parse::<i64>().ok()) {
+                s.notebook_open_page(id);
+            }
+        })
+        .render(&md_style)
+}
+
+pub(crate) fn render_article_markdown(src: &str, page_id: Option<i64>, p: &Palette, k: &Kit) -> El {
+    let md_style = feed::markdown_style(p, k).body_font(style::PROSE);
+    let article_markdown = |text: String| {
+        Markdown::new(text).selectable(true).on_link(|s: &mut State, url: &str| {
+            if let Some(id) = url.strip_prefix("feeder://notebook/").and_then(|id| id.parse::<i64>().ok()) {
+                s.notebook_open_page(id);
+            }
+        })
+    };
     let chunks = split_article_chunks(src);
     if chunks.is_empty() {
         return el().w_full();
@@ -1274,7 +1431,7 @@ fn render_article_markdown(src: &str, page_id: Option<i64>, p: &Palette, k: &Kit
     for (idx, chunk) in chunks.into_iter().enumerate() {
         match chunk {
             ArticleChunk::Markdown { text, task_offset } => {
-                let mut md = Markdown::new(text).selectable(true);
+                let mut md = article_markdown(text);
                 if let Some(pid) = page_id {
                     md = md.on_task(move |s: &mut State, _key, local_idx, checked| {
                         s.notebook_toggle_task(pid, task_offset + local_idx, checked);
@@ -1288,7 +1445,7 @@ fn render_article_markdown(src: &str, page_id: Option<i64>, p: &Palette, k: &Kit
                 let glyph = el().pt(2.0).child(icon(kind.icon(), 15.0).color(kind.icon_color(p)));
                 let mut inner = col().grow(1.0).min_w(0.0).gap(4.0).child(text(title).font(style::NAME).color(p.text));
                 if !body.is_empty() {
-                    let mut md = Markdown::new(body).selectable(true);
+                    let mut md = article_markdown(body);
                     if let Some(pid) = page_id {
                         md = md.on_task(move |s: &mut State, _key, local_idx, checked| {
                             s.notebook_toggle_task(pid, task_offset + local_idx, checked);
@@ -2079,6 +2236,7 @@ mod tests {
             revision: 1,
             standing,
             helped: 0,
+            human_edited: false,
         }
     }
 
@@ -2091,6 +2249,15 @@ mod tests {
             page(1, Kind::Pattern, "rust", "Old layout trick", &["layout"], Standing::Archived),
         ]);
         nb
+    }
+
+    #[test]
+    fn note_links_match_whole_ids_only() {
+        let body = "See [busy](feeder://notebook/12) and feeder://notebook/3.";
+        assert!(links_to(body, 12));
+        assert!(links_to(body, 3));
+        assert!(!links_to(body, 1), "12 doesn't count as a link to 1");
+        assert!(!links_to("no links here", 12));
     }
 
     #[test]

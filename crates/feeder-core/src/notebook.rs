@@ -25,6 +25,9 @@ pub const TAG_CHARS: std::ops::RangeInclusive<usize> = 2..=24;
 /// Title-word overlap (Jaccard) at which two pages count as the same note.
 const SIMILAR_TITLE: f32 = 0.6;
 
+/// The author name the app writes under when the person edits the Notebook by hand.
+pub const HUMAN_AUTHOR: &str = "You";
+
 /// Optional kind label for a notebook article. Freeform notes default to [`Kind::Note`].
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub enum Kind {
@@ -177,6 +180,7 @@ pub const CANONICAL_TOPICS: &[TopicSpec] = &[
         label: "Tooling & Git",
         aliases: &["tooling", "tools", "git", "ci", "cli", "build", "testing", "test", "devops", "docker", "nix"],
     },
+    TopicSpec { slug: "taste", label: "Taste", aliases: &[] },
 ];
 
 /// Normalizes a typed or stored category/topic into a canonical slug (or custom slug).
@@ -299,6 +303,8 @@ pub struct Page {
     pub standing: Standing,
     /// How many times an agent or the user marked the page as having helped.
     pub helped: i64,
+    /// The person wrote or edited this page by hand at some point, so curators only add to it.
+    pub human_edited: bool,
 }
 
 impl Page {
@@ -428,6 +434,8 @@ impl PageDraft {
 pub enum OnSimilar {
     /// Refuse, naming the existing page, so the writer revises it instead (agents).
     Refuse,
+    /// Refuse duplicates in the same project or shared Notebook scope.
+    RefuseInScope,
     /// File it anyway (the user curating by hand, or an agent that checked and disagrees).
     Allow,
 }
@@ -458,8 +466,7 @@ pub struct TopicSummary {
     pub tags: Vec<TagCount>,
 }
 
-const PAGE_COLS: &str =
-    "id, kind, topic, title, tags, body, context, cause, rule, project_id, agent, created_at, updated_at, revision, standing, helped";
+const PAGE_COLS: &str = "id, kind, topic, title, tags, body, context, cause, rule, project_id, agent, created_at, updated_at, revision, standing, helped, human_edited";
 
 impl Store {
     /// Every page that passes `filter`, the most recently revised first.
@@ -477,11 +484,18 @@ impl Store {
     /// Pages matching `query`, best first: title and tags count most, then category, then body.
     /// An empty query lists the filter's pages.
     pub fn search_pages(&self, query: &str, filter: &PageFilter, limit: usize) -> Result<Vec<Page>> {
+        self.search_notebook(query, filter, limit, |_| true)
+    }
+
+    /// Searches the given project and the shared Notebook, without returning other projects' notes.
+    pub fn search_project_notes(&self, project_id: i64, query: &str, filter: &PageFilter, limit: usize) -> Result<Vec<Page>> {
+        self.search_notebook(query, filter, limit, |page| page.project_id.is_none_or(|id| id == project_id))
+    }
+
+    fn search_notebook(&self, query: &str, filter: &PageFilter, limit: usize, in_scope: impl Fn(&Page) -> bool) -> Result<Vec<Page>> {
         let limit = limit.max(1);
         let Some(fts) = fts_terms(query) else {
-            let mut all = self.pages(filter)?;
-            all.truncate(limit);
-            return Ok(all);
+            return Ok(self.pages(filter)?.into_iter().filter(in_scope).take(limit).collect());
         };
         let mut stmt = self.conn.prepare(&format!(
             "SELECT {} FROM notebook_pages p
@@ -491,13 +505,15 @@ impl Store {
             PAGE_COLS.split(", ").map(|c| format!("p.{c}")).collect::<Vec<_>>().join(", ")
         ))?;
         let rows = stmt.query_map(params![fts], page_row)?;
-        let mut hits: Vec<Page> = rows.collect::<rusqlite::Result<Vec<_>>>()?.into_iter().filter(|p| passes(p, filter)).collect();
+        let mut hits: Vec<Page> =
+            rows.collect::<rusqlite::Result<Vec<_>>>()?.into_iter().filter(|p| passes(p, filter) && in_scope(p)).collect();
         if hits.is_empty() {
             // FTS needs whole-token prefixes; fall back to substrings so "busy_time" still finds pages.
             let needle = query.trim().to_lowercase();
             hits = self
                 .pages(filter)?
                 .into_iter()
+                .filter(in_scope)
                 .filter(|p| {
                     [&p.topic, &p.title, &p.body].iter().any(|t| t.to_lowercase().contains(&needle))
                         || p.topic_label().to_lowercase().contains(&needle)
@@ -530,8 +546,9 @@ impl Store {
     pub fn create_page(&self, draft: PageDraft, author: &str, project_id: Option<i64>, on_similar: OnSimilar) -> Result<Page> {
         let draft = draft.checked()?;
         let topic = draft.resolved_topic();
-        if on_similar == OnSimilar::Refuse
-            && let Some(existing) = self.similar_pages(&draft)?.into_iter().next()
+        if on_similar != OnSimilar::Allow
+            && let Some(existing) =
+                self.similar_pages(&draft)?.into_iter().find(|p| on_similar == OnSimilar::Refuse || p.project_id == project_id)
         {
             return Err(Error::Invalid(format!(
                 "the notebook already has a page on this: #{} \"{}\". Revise it (pass id {}) rather than adding another, or file this as new only if it's a genuinely different note",
@@ -540,9 +557,19 @@ impl Store {
         }
         let now = now_ms();
         self.conn.execute(
-            "INSERT INTO notebook_pages (kind, topic, title, tags, body, context, cause, rule, project_id, agent, created_at, updated_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, '', NULL, '', ?6, ?7, ?8, ?8)",
-            params![draft.kind.as_str(), topic, draft.title, draft.tags.join(" "), draft.body, project_id, author_name(author), now],
+            "INSERT INTO notebook_pages (kind, topic, title, tags, body, context, cause, rule, project_id, agent, created_at, updated_at, human_edited)
+             VALUES (?1, ?2, ?3, ?4, ?5, '', NULL, '', ?6, ?7, ?8, ?8, ?9)",
+            params![
+                draft.kind.as_str(),
+                topic,
+                draft.title,
+                draft.tags.join(" "),
+                draft.body,
+                project_id,
+                author_name(author),
+                now,
+                author_name(author) == HUMAN_AUTHOR
+            ],
         )?;
         let id = self.conn.last_insert_rowid();
         self.page(id)?.ok_or_else(|| Error::NotFound(format!("page {id} vanished")))
@@ -555,9 +582,19 @@ impl Store {
         let changed = self.conn.execute(
             "UPDATE notebook_pages
              SET kind = ?1, topic = ?2, title = ?3, tags = ?4, body = ?5, context = '', cause = NULL, rule = '',
-                 agent = ?6, updated_at = ?7, revision = revision + 1
+                 agent = ?6, updated_at = ?7, revision = revision + 1, human_edited = human_edited OR ?9
              WHERE id = ?8",
-            params![draft.kind.as_str(), topic, draft.title, draft.tags.join(" "), draft.body, author_name(author), now_ms(), id],
+            params![
+                draft.kind.as_str(),
+                topic,
+                draft.title,
+                draft.tags.join(" "),
+                draft.body,
+                author_name(author),
+                now_ms(),
+                id,
+                author_name(author) == HUMAN_AUTHOR
+            ],
         )?;
         if changed == 0 {
             return Err(Error::NotFound(format!("no notebook page {id}")));
@@ -952,6 +989,7 @@ fn page_row(r: &Row<'_>) -> rusqlite::Result<Page> {
         revision: r.get(13)?,
         standing: if standing == "archived" { Standing::Archived } else { Standing::Current },
         helped: r.get(15)?,
+        human_edited: r.get(16)?,
     })
 }
 
@@ -974,7 +1012,8 @@ pub(crate) fn migrate(conn: &Connection) -> Result<()> {
             updated_at INTEGER NOT NULL,
             revision INTEGER NOT NULL DEFAULT 1,
             standing TEXT NOT NULL DEFAULT 'current',
-            helped INTEGER NOT NULL DEFAULT 0
+            helped INTEGER NOT NULL DEFAULT 0,
+            human_edited INTEGER NOT NULL DEFAULT 0
         );
         CREATE INDEX IF NOT EXISTS notebook_by_updated ON notebook_pages(updated_at DESC, id DESC);",
     )?;
@@ -989,6 +1028,11 @@ pub(crate) fn migrate(conn: &Connection) -> Result<()> {
     }
     if !cols.iter().any(|c| c == "body") {
         conn.execute("ALTER TABLE notebook_pages ADD COLUMN body TEXT NOT NULL DEFAULT ''", [])?;
+    }
+    if !cols.iter().any(|c| c == "human_edited") {
+        conn.execute("ALTER TABLE notebook_pages ADD COLUMN human_edited INTEGER NOT NULL DEFAULT 0", [])?;
+        // Before this column, the latest author is all there is to go on.
+        conn.execute("UPDATE notebook_pages SET human_edited = 1 WHERE agent = ?1", params![HUMAN_AUTHOR])?;
     }
 
     // Backfill Markdown `body` for legacy structured rows whose `body` is still empty.
@@ -1264,6 +1308,7 @@ mod tests {
             revision: 1,
             standing: Standing::Current,
             helped: 2,
+            human_edited: false,
         };
         let md = page.to_markdown(Some("Feeder"), 0);
         assert!(md.starts_with("# Keep the MCP server stdio-only\n"));

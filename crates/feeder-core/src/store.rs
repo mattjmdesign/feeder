@@ -394,6 +394,8 @@ impl Store {
         migrate_projects(&conn)?;
         migrate_updates(&conn, dir)?;
         crate::notebook::migrate(&conn)?;
+        crate::knowledge::migrate(&conn)?;
+        crate::gardener::migrate(&conn)?;
         Ok(Store { conn, dir: dir.to_path_buf() })
     }
 
@@ -407,10 +409,12 @@ impl Store {
     }
 
     /// Cheap fingerprint of notebook state so watchers can skip reloading pages on feed-only changes.
-    pub fn notebook_stamp(&self) -> Result<(i64, i64, i64)> {
-        Ok(self.conn.query_row("SELECT COUNT(*), COALESCE(MAX(updated_at), 0), COALESCE(SUM(helped), 0) FROM notebook_pages", [], |r| {
-            Ok((r.get(0)?, r.get(1)?, r.get(2)?))
-        })?)
+    pub fn notebook_stamp(&self) -> Result<(i64, i64, i64, i64)> {
+        Ok(self.conn.query_row(
+            "SELECT COUNT(*), COALESCE(MAX(updated_at), 0), COALESCE(SUM(helped), 0), COALESCE(SUM(standing = 'archived'), 0) FROM notebook_pages",
+            [],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+        )?)
     }
 
     /// Every project, pinned first, then most recently active.
