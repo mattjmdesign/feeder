@@ -1664,6 +1664,13 @@ fn main() {
                 gardener::replay(&mut s.notebook.chat, feeder_core::gardener::Backend::ClaudeCode, events);
                 s.notebook.chat.items.insert(0, gardener::Item::You("Why do our parallel writes fail?".into()));
             }),
+            ("notebook-curator-signin", |s| {
+                use feeder_core::gardener::{Backend, Event};
+                s.tab = Tab::Notebook;
+                s.notebook.shelf = notebook::Shelf::Gardener;
+                gardener::replay(&mut s.notebook.chat, Backend::Codex, vec![Event::Started, Event::NeedsSignIn, Event::Ended]);
+                s.notebook.chat.items.insert(0, gardener::Item::You("How do we sign releases?".into()));
+            }),
             ("notebook-curator-saved", |s| {
                 s.tab = Tab::Notebook;
                 s.notebook.shelf = notebook::Shelf::Gardener;

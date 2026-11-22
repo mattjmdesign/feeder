@@ -205,7 +205,10 @@ pub fn apply(items: &mut Vec<Item>, phase: &mut Phase, backend: Option<Backend>,
         Event::Failed(why) => items.push(Item::Failed(why)),
         Event::Ended => {
             *phase = Phase::Ended;
-            items.push(Item::Ended);
+            // A sign-in or failure card already says why the run stopped.
+            if !matches!(items.last(), Some(Item::SignIn(_) | Item::Failed(_))) {
+                items.push(Item::Ended);
+            }
         }
     }
 }
@@ -231,6 +234,21 @@ impl State {
                 chat.session_send(typed);
             }
             Phase::Idle | Phase::Ended => self.gardener_start(self.notebook.chat.scope, mode, typed, None),
+        }
+    }
+
+    /// Re-sends the last question after the person signs in.
+    fn gardener_retry(&mut self) {
+        let last = self.notebook.chat.items.iter().rev().find_map(|item| match item {
+            Item::You(text) => Some(text.clone()),
+            _ => None,
+        });
+        let scope = self.notebook.chat.scope;
+        self.gardener_close();
+        self.notebook.chat.scope = scope;
+        if let Some(question) = last {
+            self.notebook.chat.input = TextEdit::new(question);
+            self.gardener_submit();
         }
     }
 
@@ -576,6 +594,71 @@ pub(crate) static SEND_ICON: Icon = Icon {
 static STOP_ICON: Icon =
     Icon { name: "curator-stop", view: 16.0, body: r#"<rect x="4.5" y="4.5" width="7" height="7" rx="1.5" fill="currentColor"/>"# };
 
+/// The provider asked for sign-in: one press runs its own login in Terminal (which opens the
+/// browser for the person's subscription account), then Try Again re-sends the question.
+fn sign_in_card(i: usize, backend: Backend, p: &Palette, k: &Kit) -> El {
+    let actions = row()
+        .gap(6.0)
+        .pt(2.0)
+        .child(
+            Button::new("Sign In")
+                .variant(ButtonVariant::Submit)
+                .control_size(ControlSize::Small)
+                .on_press(move |_: &mut State| open_sign_in(backend))
+                .build(k)
+                .key(format!("gardener-signin-open-{i}")),
+        )
+        .child(
+            Button::new("Try Again")
+                .variant(ButtonVariant::Outline)
+                .control_size(ControlSize::Small)
+                .on_press(|s: &mut State| s.gardener_retry())
+                .build(k)
+                .key(format!("gardener-signin-retry-{i}")),
+        );
+    col()
+        .key(format!("gardener-signin-{i}"))
+        .role("group")
+        .label(format!("Sign in to {}", backend.label()))
+        .w_full()
+        .gap(6.0)
+        .px(14.0)
+        .py(12.0)
+        .radius(10.0)
+        .border(1.0, p.hairline)
+        .child(
+            row()
+                .gap(8.0)
+                .center_y()
+                .child(crate::agents::mark(backend.label(), p, 16.0, None))
+                .child(text(format!("Sign in to {}", backend.label())).font(style::NAME).color(p.text)),
+        )
+        .child(
+            text(format!("Uses your {} account. Feeder never sees your password.", backend.label()))
+                .font(style::META)
+                .color(p.text_2)
+                .wrap(),
+        )
+        .child(actions)
+}
+
+/// Opens Terminal running the provider's own sign-in through Feeder's isolated Curator profile.
+fn open_sign_in(backend: Backend) {
+    let bin = feeder_core::setup::feeder_binary();
+    let shell = format!("'{}' curator connect --with {}", bin.display().to_string().replace('\'', "'\\''"), backend.as_str());
+    let script = shell.replace('\\', "\\\\").replace('"', "\\\"");
+    std::thread::spawn(move || {
+        let _ = std::process::Command::new("/usr/bin/osascript")
+            .args([
+                "-e",
+                "tell application \"Terminal\" to activate",
+                "-e",
+                &format!("tell application \"Terminal\" to do script \"{script}\""),
+            ])
+            .status();
+    });
+}
+
 /// Whether an item is a finished read/search step that folds into a collapsible group.
 fn quiet_step(item: &Item) -> bool {
     matches!(item, Item::Tool { call, result: Some(r), .. } if !r.failed && !is_edit(&call.name))
@@ -633,12 +716,7 @@ fn item_view(s: &State, i: usize, p: &Palette, k: &Kit) -> El {
         Item::Reply(reply) => crate::notebook::render_article_markdown(reply, None, p, k).key(format!("gardener-reply-{i}")),
         Item::Tool { call, result: Some(r), .. } if is_edit(&call.name) && !r.failed => edit_card(s, i, call, r, p, k),
         Item::Tool { call, result, open } => tool_step(s, i, call, result.as_ref(), *open, p, k),
-        Item::SignIn(backend) => Card::new()
-            .accent(p.amber)
-            .title(format!("{} isn't signed in", backend.label()), None)
-            .description(format!("Run `{}` in Terminal, sign in, then press Start again.", backend.sign_in_command()))
-            .build(k)
-            .key(format!("gardener-signin-{i}")),
+        Item::SignIn(backend) => sign_in_card(i, *backend, p, k),
         Item::Failed(why) => {
             Card::new().accent(p.amber).title("Run stopped", None).description(why.clone()).build(k).key(format!("gardener-failed-{i}"))
         }
@@ -1153,7 +1231,7 @@ mod tests {
         let (mut items, mut phase) = (vec![], Phase::Working);
         apply(&mut items, &mut phase, Some(Backend::ClaudeCode), Event::NeedsSignIn);
         apply(&mut items, &mut phase, Some(Backend::ClaudeCode), Event::Ended);
-        assert_eq!(items, [Item::SignIn(Backend::ClaudeCode), Item::Ended]);
+        assert_eq!(items, [Item::SignIn(Backend::ClaudeCode)], "the sign-in card already explains the stop");
         assert_eq!(phase, Phase::Ended);
     }
 
