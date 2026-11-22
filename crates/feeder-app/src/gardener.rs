@@ -6,9 +6,9 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 use feeder_core::gardener::{
-    Backend, ChatOpening, ChatSummary, Event, OPENING, RunStatus, Scope, Session, SessionEnv, SessionMode, StoredEvent, ToolCall,
+    Backend, ChatOpening, ChatSummary, Event, RunStatus, Scope, Session, SessionEnv, SessionMode, StoredEvent, ToolCall,
 };
-use feeder_core::{Change, Flag, ago};
+use feeder_core::{Change, ago};
 use rune::{Cursor, El, Icon, Key, KeyEvent, TextEdit, Tx, col, el, icon, row, text};
 use rune_kit::diff::{FileDiff, LineKind};
 use rune_kit::shell::{Sidebar, SidebarRow, SidebarSection};
@@ -34,33 +34,6 @@ const FOLD_AFTER: usize = 2;
 const CHAT_MAX_W: f32 = 640.0;
 /// The person's bubble stops at three quarters of the reading width.
 const USER_BUBBLE_MAX_W: f32 = 480.0;
-
-/// Curator's jobs that don't need typing. Asking a question is the composer itself.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Job {
-    /// Turn open flags and Feed replies into Notebook edits.
-    ReviewFlags,
-    /// Find overlapping notes so the person can decide what to keep.
-    FindDuplicates,
-}
-
-impl Job {
-    fn label(self) -> &'static str {
-        match self {
-            Job::ReviewFlags => "Review Open Flags",
-            Job::FindDuplicates => "Find Duplicate Notes",
-        }
-    }
-
-    fn message(self) -> &'static str {
-        match self {
-            Job::ReviewFlags => OPENING,
-            Job::FindDuplicates => {
-                "Look for overlapping Notebook pages. Link the pages and suggest what to keep or combine. Say which notes you checked."
-            }
-        }
-    }
-}
 
 /// A saved chat's run id and transcript.
 type SavedChat = (i64, Vec<StoredEvent>);
@@ -258,18 +231,6 @@ impl State {
                 chat.session_send(typed);
             }
             Phase::Idle | Phase::Ended => self.gardener_start(self.notebook.chat.scope, mode, typed, None),
-        }
-    }
-
-    /// Starts a run for one of Curator's preset jobs.
-    fn gardener_job(&mut self, job: Job) {
-        if matches!(self.notebook.chat.phase, Phase::Idle | Phase::Ended) {
-            let scope = self.notebook.chat.scope;
-            let mode = match job {
-                Job::ReviewFlags => SessionMode::Review,
-                Job::FindDuplicates => SessionMode::Ask,
-            };
-            self.gardener_start(scope, mode, job.message().to_string(), Some(job.label()));
         }
     }
 
@@ -580,10 +541,9 @@ pub fn composer(s: &State, p: &Palette, k: &Kit, max_w: f32, layer: &mut Vec<El>
             .key("gardener-send")
     };
 
-    // The toolbar lives inside the box: jobs on the left before a chat starts, then the agent
-    // and send on the right.
+    // The toolbar lives inside the box: the agent and send on the right.
     let mut toolbar = row().w_full().gap(6.0).center_y();
-    toolbar = if is_fresh(s) { toolbar.child(jobs(s, k).grow(1.0).min_w(0.0)) } else { toolbar.child(rune::spacer()) };
+    toolbar = toolbar.child(rune::spacer());
     if let Some(picker) = provider_picker(s, p, k, layer) {
         toolbar = toolbar.child(picker);
     }
@@ -615,44 +575,6 @@ pub(crate) static SEND_ICON: Icon = Icon {
 
 static STOP_ICON: Icon =
     Icon { name: "curator-stop", view: 16.0, body: r#"<rect x="4.5" y="4.5" width="7" height="7" rx="1.5" fill="currentColor"/>"# };
-
-/// Curator's preset jobs, shown above the composer before a chat starts.
-fn jobs(s: &State, k: &Kit) -> El {
-    let g = &s.notebook.gardener;
-    let ready = !g.backends.is_empty() && g.running.is_none();
-    let has_flags = !scoped_flags(s).is_empty();
-    let mut jobs = row().gap(2.0).wrap();
-    for job in [Job::ReviewFlags, Job::FindDuplicates] {
-        if job == Job::ReviewFlags && !has_flags {
-            continue;
-        }
-        jobs = jobs.child(
-            Button::new(job.label())
-                .variant(ButtonVariant::GhostMuted)
-                .control_size(ControlSize::Small)
-                .disabled(!ready)
-                .on_press(move |s: &mut State| s.gardener_job(job))
-                .build(k)
-                .key(format!("gardener-job-{job:?}")),
-        );
-    }
-    jobs
-}
-
-/// Open flags inside the chat's scope.
-fn scoped_flags(s: &State) -> Vec<&Flag> {
-    let scope = s.notebook.chat.scope;
-    let page_project = |id| s.notebook.page(id).and_then(|page| page.project_id);
-    s.notebook
-        .gardener
-        .open_flags
-        .iter()
-        .filter(|flag| {
-            let page_project_id = flag.page_id.and_then(page_project);
-            scope.includes(flag.project_id.or(page_project_id)) && page_project_id.is_none_or(|id| scope.includes(Some(id)))
-        })
-        .collect()
-}
 
 /// Whether an item is a finished read/search step that folds into a collapsible group.
 fn quiet_step(item: &Item) -> bool {
