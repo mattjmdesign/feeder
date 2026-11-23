@@ -236,8 +236,7 @@ fn needs_you_now(s: &State, p: &Palette) -> Option<El> {
             actions = actions
                 .child(action(format!("needs-reply-{id}"), "Reply", format!("Reply to {name}")).on_press_tx(
                     move |s: &mut State, tx: &mut Tx| {
-                        s.open_project(id);
-                        s.pending_scroll = Some(format!("u-{uid}"));
+                        s.open_project_at(id, Some(uid));
                         s.start_reply(uid, tx);
                     },
                 ))

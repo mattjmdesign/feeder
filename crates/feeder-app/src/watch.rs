@@ -14,6 +14,7 @@ use feeder_core::{
 pub struct Want {
     pub project: Option<i64>,
     pub limit: usize,
+    pub through_update: Option<i64>,
     pub files: bool,
     pub visible: bool,
 }
@@ -336,9 +337,10 @@ impl Watcher {
                     let nb_stamp = s.notebook_stamp().ok();
                     let need_pages = nb_stamp.is_none() || nb_stamp != last_notebook_stamp;
                     let loaded = s.projects().and_then(|projects| {
-                        let feed = match want.project {
-                            Some(id) => s.feed(id, want.limit, None)?,
-                            None => vec![],
+                        let feed = match (want.project, want.through_update) {
+                            (Some(id), Some(target)) => s.feed_through_update(id, want.limit, target)?,
+                            (Some(id), None) => s.feed(id, want.limit, None)?,
+                            (None, _) => vec![],
                         };
                         let timeline = s.timeline(timeline_limit)?;
                         let search_hits =

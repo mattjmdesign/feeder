@@ -20,7 +20,7 @@ use crate::watch::NotebookOp;
 use crate::{CopyTarget, State, ToastItem, ToastKind, agents, chrome, feed};
 
 pub(crate) const INDEX_MAX_W: f32 = 720.0;
-const CARD_MIN_W: f32 = 340.0;
+const CARD_MIN_W: f32 = 408.0;
 const CARD_H: f32 = 112.0;
 const TILE: f32 = CARD_H - 2.0 * CARD_PAD;
 const CARD_PAD: f32 = 8.0;
@@ -793,14 +793,12 @@ fn card_grid(s: &State, pages: &[&Page], rank: usize, p: &Palette) -> El {
     let main_w = if s.notebook.main_w > 0.0 { s.notebook.main_w } else { (s.window_size[0] - 240.0).max(320.0) };
     let avail = (main_w - INDEX_PAD * 2.0).max(200.0);
     let cols = (((avail + CARD_GAP) / (CARD_MIN_W + CARD_GAP)).floor() as usize).max(1);
+    let card_w = ((avail - CARD_GAP * (cols - 1) as f32) / cols as f32).floor();
     let mut grid = col().w_full().gap(CARD_GAP);
     for chunk in pages.chunks(cols) {
         let mut line = row().w_full().gap(CARD_GAP);
         for page in chunk {
-            line = line.child(index_card(s, page, rank, p));
-        }
-        for _ in chunk.len()..cols {
-            line = line.child(el().grow(1.0).min_w(0.0));
+            line = line.child(index_card(s, page, rank, p).w(card_w));
         }
         grid = grid.child(line);
     }
@@ -809,23 +807,22 @@ fn card_grid(s: &State, pages: &[&Page], rank: usize, p: &Palette) -> El {
 
 fn index_card(s: &State, page: &Page, rank: usize, p: &Palette) -> El {
     let id = page.id;
-    let title = row()
-        .w_full()
-        .gap(10.0)
-        .items_start()
-        .child(text(page.title.clone()).font(style::NAME).color(p.text).max_lines(1).grow(1.0).min_w(0.0))
-        .child(text(ago(page.updated_at, s.now)).font(style::META).color(p.text_3).pt(1.0));
-    let mut info = col().grow(1.0).min_w(0.0).gap(6.0).pt(6.0).pr(8.0).child(title);
-    let excerpt = card_excerpt(&page.body);
-    if !excerpt.is_empty() {
-        info = info.child(text(excerpt).font(style::META).color(p.text_2).max_lines(3));
-    }
+    let info = col()
+        .grow(1.0)
+        .min_w(0.0)
+        .gap(4.0)
+        .pt(1.0)
+        .pr(8.0)
+        .child(
+            text(page.title.clone()).font(style::NAME).color(p.text).w_full().h(style::NAME.line_height * 2.0).wrap_anywhere().max_lines(2),
+        )
+        .child(text(card_excerpt(&page.body)).font(style::META).color(p.text_2).w_full().h(style::META.line_height * 2.0).max_lines(2))
+        .child(text(ago(page.updated_at, s.now)).font(style::META).color(p.text_3));
     row()
         .key(format!("nb-page-{id}"))
         .role("button")
         .label(page.title.clone())
         .focusable(true)
-        .grow(1.0)
         .min_w(0.0)
         .h(CARD_H)
         .padding(CARD_PAD)

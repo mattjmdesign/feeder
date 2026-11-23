@@ -740,6 +740,8 @@ main{max-width:740px;margin:0 auto;padding:16px;}
 .reply{font-size:13px;background:var(--hover);padding:7px 10px;border-radius:8px;}
 .reply-form{display:flex;gap:8px;margin-top:8px;}
 .reply-form input{flex:1;padding:6px 10px;border-radius:8px;border:1px solid var(--line);background:transparent;}
+.reply-error{margin:0;color:var(--warn);font-size:13px;}
+.reply-error:empty{position:absolute;}
 .brief{white-space:pre-wrap;font-size:13px;color:var(--muted);}
 .todo-head{display:flex;align-items:center;gap:8px;margin-bottom:8px;}
 .todo-head strong{margin-right:auto;font-size:13px;}
@@ -766,6 +768,7 @@ main{max-width:740px;margin:0 auto;padding:16px;}
 </main>
 <script>
 let state = null, selected = null, mode = 'feed', pendingRender = false, todoOpen = false, todoClearConfirm = false, slideIdx = {};
+const replyDrafts = new Map();
 if (new URLSearchParams(location.search).has('token')) {
   const clean = new URL(location.href);
   clean.searchParams.delete('token');
@@ -778,6 +781,7 @@ function isTyping(){
 async function load(background) {
   const q = selected ? '?project=' + encodeURIComponent(selected) : '';
   const r = await fetch('/api/state' + q, { credentials: 'same-origin' });
+  if(!r.ok) throw Error('Couldn’t refresh the feed.');
   state = await r.json();
   if(background && isTyping()){ pendingRender = true; return; }
   pendingRender = false;
@@ -797,10 +801,59 @@ function closeEmptyTodos(){ todoOpen = false; todoClearConfirm = false; render()
 function stepSlide(uid, delta, total){ slideIdx[uid] = (((slideIdx[uid] || 0) + delta) % total + total) % total; render(); }
 function setSlide(uid, idx){ slideIdx[uid] = idx; render(); }
 async function markAllRead(){ await fetch('/api/seen', {method:'POST',credentials:'same-origin',headers:{'Content-Type':'application/json'},body:JSON.stringify({all:true})}); load(false); }
-async function sendReply(uid, el){
-  const body = el.value.trim(); if(!body) return;
-  await fetch('/api/reply',{method:'POST',credentials:'same-origin',headers:{'Content-Type':'application/json'},body:JSON.stringify({update_id:uid,body})});
-  el.value=''; load(false);
+function replyDraft(uid){
+  if(!replyDrafts.has(uid)) replyDrafts.set(uid, {text:'', error:'', sending:false});
+  return replyDrafts.get(uid);
+}
+function syncReplyForm(uid, draft){
+  const form = document.getElementById('reply-form-' + uid);
+  if(!form) return;
+  const input = form.querySelector('input');
+  const button = form.querySelector('button');
+  if(input.value !== draft.text) input.value = draft.text;
+  input.readOnly = draft.sending;
+  button.disabled = draft.sending;
+  button.textContent = draft.sending ? 'Sending…' : 'Send';
+  document.getElementById('reply-error-' + uid).textContent = draft.error;
+}
+function editReply(uid, input){
+  const draft = replyDraft(uid);
+  draft.text = input.value;
+  if(draft.error){
+    draft.error = '';
+    syncReplyForm(uid, draft);
+  }
+}
+async function sendReply(uid, input){
+  const draft = replyDraft(uid);
+  const body = input.value.trim();
+  if(!body || draft.sending) return;
+  draft.text = input.value;
+  draft.error = '';
+  draft.sending = true;
+  syncReplyForm(uid, draft);
+  try {
+    const response = await fetch('/api/reply',{method:'POST',credentials:'same-origin',headers:{'Content-Type':'application/json'},body:JSON.stringify({update_id:uid,body})});
+    if(response.ok){
+      draft.text = '';
+    }else{
+      const detail = await response.json().catch(()=>null);
+      draft.error = typeof detail?.error === 'string' ? detail.error : 'Couldn’t send your reply. Try again.';
+    }
+  }catch{
+    draft.error = 'Couldn’t confirm your reply was sent. Refresh before trying again.';
+  }
+  draft.sending = false;
+  syncReplyForm(uid, draft);
+  if(!draft.error){
+    replyDrafts.delete(uid);
+    load(false).catch(()=>{
+      if(replyDrafts.has(uid)) return;
+      draft.error = 'Reply sent. Refresh to see it.';
+      replyDrafts.set(uid, draft);
+      syncReplyForm(uid, draft);
+    });
+  }
 }
 async function dismissAttention(uid){
   await fetch('/api/dismiss',{method:'POST',credentials:'same-origin',headers:{'Content-Type':'application/json'},body:JSON.stringify({update_id:uid})});
@@ -895,7 +948,11 @@ function render(){
     for(const r of u.replies){
       html += `<div class="reply"><strong>${esc(r.author)}</strong> <span class="meta" style="display:inline">${esc(r.ago)}</span>: ${esc(r.body)}</div>`;
     }
-    html += `<form class="reply-form" onsubmit="event.preventDefault();sendReply(${u.id},this.querySelector('input'))"><input placeholder="Reply or answer decision…"><button class="btn" type="submit">Send</button></form></div></div>`;
+    const draft = replyDrafts.get(u.id);
+    html += `<form class="reply-form" id="reply-form-${u.id}" onsubmit="event.preventDefault();sendReply(${u.id},this.querySelector('input'))">
+      <input placeholder="Reply or answer decision…" aria-describedby="reply-error-${u.id}" value="${esc(draft?.text)}" oninput="editReply(${u.id},this)" ${draft?.sending?'readonly':''}>
+      <button class="btn" type="submit" ${draft?.sending?'disabled':''}>${draft?.sending?'Sending…':'Send'}</button>
+      </form><p class="reply-error" id="reply-error-${u.id}" role="status">${esc(draft?.error)}</p></div></div>`;
   }
   cEl.innerHTML = html;
 }

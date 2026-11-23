@@ -853,6 +853,23 @@ impl Store {
         Ok(updates)
     }
 
+    pub fn feed_through_update(&self, project_id: i64, limit: usize, update_id: i64) -> Result<Vec<FeedUpdate>> {
+        let limit = i64::try_from(limit).unwrap_or(i64::MAX);
+        let mut stmt = self.conn.prepare(&format!(
+            "SELECT {UPDATE_COLS} FROM updates WHERE project_id = ?1
+             ORDER BY created_at DESC, id DESC
+             LIMIT MAX(?3, (
+                SELECT count(*) FROM updates AS newer JOIN updates AS target
+                    ON target.id = ?2 AND target.project_id = ?1
+                WHERE newer.project_id = ?1 AND (newer.created_at, newer.id) >= (target.created_at, target.id)
+             ))"
+        ))?;
+        let rows = stmt.query_map(params![project_id, update_id, limit], |r| self.update_row(r))?;
+        let mut updates: Vec<FeedUpdate> = rows.collect::<rusqlite::Result<_>>()?;
+        self.attach_media(&mut updates)?;
+        Ok(updates)
+    }
+
     pub fn timeline(&self, limit: usize) -> Result<Vec<FeedUpdate>> {
         let limit = i64::try_from(limit).unwrap_or(i64::MAX);
         let mut stmt = self.conn.prepare(&format!(
@@ -1469,6 +1486,26 @@ mod tests {
         assert_eq!(projects[0].updates, 2);
         assert_eq!(projects[0].last_agent.as_deref(), Some("Claude Code"));
         assert_ne!(projects[0].project.orb, projects[1].project.orb);
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn linked_update_expands_only_its_projects_feed() {
+        let (store, dir) = temp_store("linked-update");
+        let project = store.project_named("Alpha", None).unwrap();
+        let other = store.project_named("Beta", None).unwrap();
+        let earliest = store.post(project.id, note("earliest")).unwrap();
+        let linked = store.post(project.id, note("linked")).unwrap();
+        let other_update = store.post(other.id, note("other project")).unwrap();
+        let newest = store.post(project.id, note("newest")).unwrap();
+        store.conn.execute("UPDATE updates SET created_at = 0", []).unwrap();
+
+        let ids =
+            |target| store.feed_through_update(project.id, 1, target).unwrap().into_iter().map(|update| update.id).collect::<Vec<_>>();
+        assert_eq!(ids(linked.id), [newest.id, linked.id]);
+        assert_eq!(ids(other_update.id), [newest.id]);
+        store.delete_update(earliest.id).unwrap();
+        assert_eq!(ids(earliest.id), [newest.id]);
         std::fs::remove_dir_all(dir).ok();
     }
 

@@ -3,6 +3,13 @@
 What changed in each version of Feeder, newest first. Each section is copied from
 `release-notes/<version>.md` by `scripts/changelog.sh`; edit those files, not this one.
 
+## 0.5.10
+
+- Library cards are wider and give titles two lines. Cards stay the same size across categories.
+- Curator asks for a fresh proposal if the note changed before you approve it.
+- Links to older project updates scroll to the right post.
+- The web companion keeps your reply draft and shows an error if sending fails.
+
 ## 0.5.9
 
 - **OpenCode can use Feeder tools in Curator.** Review flagged lessons, read Feed updates, and propose Library notes from the installed Mac app.

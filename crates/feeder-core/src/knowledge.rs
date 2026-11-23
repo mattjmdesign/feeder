@@ -196,6 +196,11 @@ impl PageSnapshot {
     }
 }
 
+fn proposal_baseline(page: &Page) -> Result<String> {
+    serde_json::to_string(&(PageSnapshot::of(page), page.is_archived(), page.revision, page.project_id))
+        .map_err(|e| Error::Invalid(format!("can't record the proposal's original note: {e}")))
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Change {
     pub id: i64,
@@ -463,7 +468,7 @@ impl Store {
             return Err(Error::Invalid(format!("keep the reason under {REASON_MAX_CHARS} characters")));
         }
         self.check_gardener_edit(&curation, &evidence)?;
-        let (action, page_id, project_id, draft, before_body) = match curation {
+        let (action, page_id, project_id, draft, before) = match curation {
             Curation::Create { draft, project_id } => {
                 let draft = draft.checked()?;
                 if let Some(existing) = self.similar_pages(&draft)?.into_iter().find(|p| p.project_id == project_id) {
@@ -485,7 +490,7 @@ impl Store {
             Curation::Revise { page_id, draft } => {
                 let old = self.page(page_id)?.ok_or_else(|| Error::NotFound(format!("no notebook page {page_id}")))?;
                 let draft = draft.checked()?;
-                (ChangeAction::Revised, Some(page_id), old.project_id, draft, Some(old.body))
+                (ChangeAction::Revised, Some(page_id), old.project_id, draft, Some(old))
             }
             Curation::Archive { page_id } => {
                 let old = self.page(page_id)?.ok_or_else(|| Error::NotFound(format!("no notebook page {page_id}")))?;
@@ -496,15 +501,16 @@ impl Store {
                     tags: old.tags.clone(),
                     body: old.body.clone(),
                 };
-                (ChangeAction::Archived, Some(page_id), old.project_id, draft, Some(old.body))
+                (ChangeAction::Archived, Some(page_id), old.project_id, draft, Some(old))
             }
         };
+        let before_state = before.as_ref().map(proposal_baseline).transpose()?;
         let topic = draft.resolved_topic();
         tx.execute(
             "INSERT INTO curator_proposals (
                 run_id, action, page_id, project_id, kind, topic, title, tags, body, before_body,
-                reason, source_flags, source_updates, status, created_at
-             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, 'pending', ?14)",
+                reason, source_flags, source_updates, status, created_at, before_state
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, 'pending', ?14, ?15)",
             params![
                 run_id,
                 action.as_str(),
@@ -515,11 +521,12 @@ impl Store {
                 draft.title,
                 draft.tags.join(" "),
                 draft.body,
-                before_body,
+                before.map(|page| page.body),
                 reason,
                 encode_ids(&evidence.flags),
                 encode_ids(&evidence.updates),
                 now_ms(),
+                before_state,
             ],
         )?;
         let id = tx.last_insert_rowid();
@@ -546,6 +553,15 @@ impl Store {
         let proposal = self.curator_proposal(id)?.ok_or_else(|| Error::NotFound(format!("no proposal {id}")))?;
         if proposal.status != ProposalStatus::Pending {
             return Err(Error::Invalid(format!("proposal {id} was already {}", proposal.status.as_str())));
+        }
+        if matches!(proposal.action, ChangeAction::Revised | ChangeAction::Archived) {
+            let outdated = || Error::Invalid("This proposal is out of date. Ask Curator for a new proposal.".into());
+            let page_id = proposal.page_id.ok_or_else(outdated)?;
+            let baseline: Option<String> = tx.query_row("SELECT before_state FROM curator_proposals WHERE id = ?1", [id], |r| r.get(0))?;
+            let page = self.page(page_id)?.ok_or_else(outdated)?;
+            if baseline.as_deref() != Some(proposal_baseline(&page)?.as_str()) {
+                return Err(outdated());
+            }
         }
         let draft = PageDraft {
             kind: proposal.kind,
@@ -1052,10 +1068,23 @@ pub(crate) fn migrate(conn: &Connection) -> Result<()> {
             source_updates TEXT,
             status TEXT NOT NULL DEFAULT 'pending',
             change_id INTEGER REFERENCES notebook_changes(id) ON DELETE SET NULL,
-            created_at INTEGER NOT NULL
+            created_at INTEGER NOT NULL,
+            before_state TEXT
         );
         CREATE INDEX IF NOT EXISTS curator_proposals_by_run ON curator_proposals(run_id, id DESC);",
     )?;
+    let has_baseline = |conn: &Connection| {
+        conn.query_row("SELECT EXISTS(SELECT 1 FROM pragma_table_info('curator_proposals') WHERE name = 'before_state')", [], |r| {
+            r.get::<_, bool>(0)
+        })
+    };
+    if !has_baseline(conn)? {
+        let tx = Transaction::new_unchecked(conn, TransactionBehavior::Immediate)?;
+        if !has_baseline(&tx)? {
+            tx.execute("ALTER TABLE curator_proposals ADD COLUMN before_state TEXT", [])?;
+        }
+        tx.commit()?;
+    }
     Ok(())
 }
 
@@ -1388,6 +1417,59 @@ mod tests {
         }
         assert_eq!("Stale".parse::<FlagKind>().expect("synonym"), FlagKind::Outdated);
         assert!("bogus".parse::<FlagKind>().is_err());
+    }
+
+    #[test]
+    fn stale_proposals_preserve_the_note_and_leave_flags_open() {
+        use crate::gardener::Backend;
+
+        let t = temp_store("stale-proposals");
+        let s = &t.store;
+        let title = "Review the release checklist";
+        let original = "Original checklist for a small release.";
+        let page = s.create_page(draft(title, original), "Codex", None, crate::OnSimilar::Refuse).unwrap();
+        let flag = s.flag_knowledge(missing("Missing signing verification"), "Codex").unwrap();
+        let run = s.start_gardener_run(Backend::OpenCode).unwrap();
+        let provenance = cites("Flag names a missing check", &[flag.id]);
+        let proposal = s
+            .propose_gardener_run(
+                run,
+                Curation::Revise { page_id: page.id, draft: draft(title, "Original checklist. Verify signing before publishing.") },
+                &provenance,
+            )
+            .unwrap();
+        let intervening = s.revise_page(page.id, draft("Updated release checklist", original), "Claude Code").unwrap();
+        assert!(s.apply_curator_proposal(proposal.id).is_err());
+        assert_eq!(s.page(page.id).unwrap(), Some(intervening));
+        assert_eq!(s.curator_proposal(proposal.id).unwrap().unwrap().status, ProposalStatus::Pending);
+        assert_eq!(s.flag(flag.id).unwrap().unwrap().status, FlagStatus::Open);
+    }
+
+    #[test]
+    fn upgrading_keeps_existing_revision_proposals_readable_and_requires_a_fresh_proposal_to_apply() {
+        use crate::gardener::Backend;
+
+        let t = temp_store("legacy-proposals");
+        let s = &t.store;
+        let title = "Review the release checklist";
+        let original = "Original checklist for a small release.";
+        let page = s.create_page(draft(title, original), "Codex", None, crate::OnSimilar::Refuse).unwrap();
+        let flag = s.flag_knowledge(missing("Missing signing verification"), "Codex").unwrap();
+        let run = s.start_gardener_run(Backend::OpenCode).unwrap();
+        let provenance = cites("Flag names a missing check", &[flag.id]);
+        let revised = "Verify signing before publishing.";
+        let revision = || Curation::Revise { page_id: page.id, draft: draft(title, revised) };
+        let legacy = s.propose_gardener_run(run, revision(), &provenance).unwrap();
+        s.conn.execute("ALTER TABLE curator_proposals DROP COLUMN before_state", []).unwrap();
+
+        let upgraded = Store::open(&t.dir).unwrap();
+        assert_eq!(upgraded.curator_proposal(legacy.id).unwrap(), Some(legacy.clone()));
+        assert!(upgraded.apply_curator_proposal(legacy.id).is_err());
+        assert_eq!(upgraded.page(page.id).unwrap().unwrap().body, original);
+        assert_eq!(upgraded.dismiss_curator_proposal(legacy.id).unwrap().status, ProposalStatus::Dismissed);
+
+        let fresh = upgraded.propose_gardener_run(run, revision(), &provenance).unwrap();
+        assert_eq!(upgraded.apply_curator_proposal(fresh.id).unwrap().page.body, revised);
     }
 
     #[test]

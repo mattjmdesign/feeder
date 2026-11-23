@@ -171,7 +171,7 @@ pub struct State {
     pub copy_feedback: Option<(CopyTarget, i64)>,
     pub toasts: ToastStack<ToastItem>,
     pub pending_url: Option<String>,
-    pub pending_scroll: Option<String>,
+    pending_scroll: Option<i64>,
     last_badge: Option<usize>,
     watcher: Option<Watcher>,
     pub(crate) wake: Option<Waker>,
@@ -305,6 +305,10 @@ impl State {
     }
 
     pub fn open_project(&mut self, id: i64) {
+        self.open_project_at(id, None);
+    }
+
+    fn open_project_at(&mut self, id: i64, update_id: Option<i64>) {
         self.open = Some(id);
         self.hovered = None;
         self.dismiss_menus();
@@ -320,7 +324,10 @@ impl State {
         self.editing_update = None;
         self.replying_to = None;
         self.feed_selected = None;
-        self.pending_scroll = None;
+        self.pending_scroll = update_id;
+        if update_id.is_some() {
+            self.files.view = files::ProjectView::Updates;
+        }
         self.project_visible_rows = None;
         self.limit = PAGE;
         let seeded: Vec<FeedUpdate> = self.timeline.iter().filter(|u| u.project_id == id).cloned().collect();
@@ -879,11 +886,8 @@ impl State {
                 self.projects.iter().find(|p| p.project.slug.eq_ignore_ascii_case(slug) || p.project.name.eq_ignore_ascii_case(slug))
             {
                 let id = sum.project.id;
-                self.open_project(id);
-                if let Some(uid) = update_id {
-                    self.feed_selected = Some(uid);
-                    self.pending_scroll = Some(format!("u-{uid}"));
-                }
+                self.open_project_at(id, update_id);
+                self.feed_selected = update_id;
             } else {
                 self.push_toast(
                     "missing-project-url",
@@ -982,7 +986,13 @@ impl State {
     fn ask(&self) {
         if let Some(w) = &self.watcher {
             let files = self.window_visible && self.open.is_some() && self.files.view == files::ProjectView::Files;
-            w.want(Want { project: self.open, limit: self.limit, files, visible: self.window_visible });
+            w.want(Want {
+                project: self.open,
+                limit: self.limit,
+                through_update: self.pending_scroll,
+                files,
+                visible: self.window_visible,
+            });
         }
     }
 
@@ -1242,6 +1252,29 @@ fn poll(s: &mut State, clock: f64, tx: &mut Tx) -> bool {
         if snap.want.project == s.open && snap.want.project.is_some() {
             s.feed = snap.feed;
             s.feed_for = snap.want.project;
+            if s.error.is_none()
+                && let Some(target) = s.pending_scroll
+                && snap.want.through_update == Some(target)
+            {
+                s.pending_scroll = None;
+                if s.feed.iter().any(|update| update.id == target) {
+                    s.limit = s.limit.max(s.feed.len());
+                    tx.scroll_into_view(format!("u-{target}"));
+                } else {
+                    if s.feed_selected == Some(target) {
+                        s.feed_selected = None;
+                    }
+                    if s.replying_to == Some(target) {
+                        s.replying_to = None;
+                    }
+                    s.push_toast(
+                        "missing-update-url",
+                        ToastItem { title: "Update not found".into(), description: None, kind: ToastKind::Error },
+                        Some(4.0),
+                    );
+                }
+                s.ask();
+            }
         }
         if let Some(id) = s.open
             && s.loaded
@@ -1277,14 +1310,6 @@ fn poll(s: &mut State, clock: f64, tx: &mut Tx) -> bool {
     {
         s.files.apply(id, wt);
         changed = true;
-    }
-
-    if s.open.is_some()
-        && s.feed_for == s.open
-        && s.pending_scroll.as_deref().is_some_and(|target| s.feed.iter().any(|u| format!("u-{}", u.id) == target))
-        && let Some(target) = s.pending_scroll.take()
-    {
-        tx.scroll_into_view(target);
     }
 
     let unseen = s.unseen_count();
@@ -1697,10 +1722,12 @@ mod tests {
         assert_eq!(s.notebook.open, None);
         assert_eq!(s.notebook.shelf, notebook::Shelf::All);
 
+        s.files.view = files::ProjectView::Files;
         assert!(s.open_feeder_url("feeder://project/alpha/update/42"));
         assert_eq!(s.open, Some(7));
+        assert_eq!(s.files.view, files::ProjectView::Updates);
         assert_eq!(s.feed_selected, Some(42));
-        assert_eq!(s.pending_scroll.as_deref(), Some("u-42"));
+        assert_eq!(s.pending_scroll, Some(42));
 
         assert!(s.open_feeder_url("feeder://home"));
         assert_eq!(s.tab, Tab::Home);
