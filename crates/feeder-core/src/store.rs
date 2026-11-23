@@ -476,20 +476,25 @@ impl Store {
 
     /// Finds a project by slug, name (any case) or id.
     pub fn find_project(&self, query: &str) -> Result<Option<Project>> {
-        let slug = slugify(query);
+        let trimmed = query.trim();
+        if trimmed.is_empty() {
+            return Ok(None);
+        }
+        let slug = slugify(trimmed);
         let found = self.one(
             &format!(
                 "SELECT {PROJECT_COLS} FROM projects
                  WHERE slug = ?1 OR lower(name) = lower(?2)
-                    OR lower(path) = lower(?2) OR lower(path) LIKE '%/' || lower(?2)
+                    OR lower(path) = lower(?2)
+                    OR (length(?2) > 0 AND length(path) > length(?2) AND substr(lower(path), -length(?2) - 1) = '/' || lower(?2))
                  ORDER BY slug = ?1 DESC, lower(name) = lower(?2) DESC LIMIT 1"
             ),
-            params![slug, query.trim()],
+            params![slug, trimmed],
         )?;
         if found.is_some() {
             return Ok(found);
         }
-        match query.trim().parse::<i64>() {
+        match trimmed.parse::<i64>() {
             Ok(id) => self.project(id),
             Err(_) => Ok(None),
         }
@@ -1600,6 +1605,9 @@ mod tests {
         for q in ["Acme", "acme-site", "/w/acme-site"] {
             assert_eq!(s.find_project(q).unwrap().map(|p| p.id), Some(p.id), "{q}");
         }
+        assert_eq!(s.find_project("%").unwrap(), None);
+        assert_eq!(s.find_project("acme_s_te").unwrap(), None);
+        assert_eq!(s.find_project("   ").unwrap(), None);
         s.rename_project(p.id, "  ").unwrap();
         assert_eq!(s.project(p.id).unwrap().unwrap().name, "acme-site");
         std::fs::remove_dir_all(dir).ok();

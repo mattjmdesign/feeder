@@ -6,22 +6,24 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::mpsc::{self, RecvTimeoutError, Sender};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use feeder_core::gardener::{Backend, ChatSummary, Run, RunStatus};
 use feeder_core::{
     Change, FeedUpdate, Flag, FlagStatus, GARDENER, HUMAN_AUTHOR, OnSimilar, Page, PageDraft, PageFilter, ProjectSummary, Reply, Settings,
-    Standing, Store, TodoItem, now_ms,
+    Standing, Store, WorkingTree, now_ms, read_working_tree,
 };
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
 pub struct Want {
     pub project: Option<i64>,
     pub limit: usize,
+    pub files: bool,
+    pub visible: bool,
 }
 
 /// How many timeline posts to load at first, and how many more each time the end comes near.
-pub const TIMELINE_PAGE: usize = 80;
+pub const TIMELINE_PAGE: usize = 25;
 
 enum Msg {
     Want(Want),
@@ -36,12 +38,6 @@ enum Msg {
     EditUpdate(i64, String),
     DeleteUpdate(i64),
     AddReply(i64, String),
-    AddTodo(i64, String),
-    SetTodoDone(i64, bool),
-    RenameTodo(i64, String),
-    DeleteTodo(i64),
-    ClearCompletedTodos(i64),
-    ClearProjectTodos(i64),
     SaveSettings(Settings),
     Notebook(NotebookOp),
     /// Load the timeline's first `n` posts.
@@ -104,7 +100,6 @@ pub struct Snapshot {
     pub projects: Vec<ProjectSummary>,
     pub want: Want,
     pub feed: Vec<FeedUpdate>,
-    pub todos: Vec<TodoItem>,
     /// Every project's updates, newest first, `timeline_limit` at most.
     pub timeline: Vec<FeedUpdate>,
     pub timeline_limit: usize,
@@ -122,19 +117,48 @@ pub struct Snapshot {
     pub failed_writes: Vec<FailedWrite>,
 }
 
-enum TodoOp {
-    Add(i64, String),
-    SetDone(i64, bool),
-    Rename(i64, String),
-    Delete(i64),
-    ClearCompleted(i64),
-    ClearAll(i64),
+#[derive(Default)]
+struct FilesRefresh {
+    project: Option<i64>,
+    scanned_at: Option<Instant>,
+    published: Option<(Instant, WorkingTree)>,
+}
+
+impl FilesRefresh {
+    fn select(&mut self, want: Want) {
+        let project = want.project.filter(|_| want.files);
+        if self.project != project {
+            *self = Self { project, ..Self::default() };
+        }
+    }
+
+    fn poll(&mut self, now: Instant, read: impl FnOnce(i64) -> Option<WorkingTree>) -> Option<(i64, WorkingTree)> {
+        let id = self.project?;
+        if self.scanned_at.is_some_and(|last| now.duration_since(last) < Duration::from_secs(2)) {
+            return None;
+        }
+        self.scanned_at = Some(now);
+        let mut tree = read(id)?;
+        if let Some((last, previous)) = &self.published
+            && now.duration_since(*last) < Duration::from_secs(30)
+        {
+            let read_at = tree.read_at;
+            tree.read_at = previous.read_at;
+            if tree == *previous {
+                return None;
+            }
+            tree.read_at = read_at;
+        }
+        self.published = Some((now, tree.clone()));
+        Some((id, tree))
+    }
 }
 
 #[derive(Clone)]
 pub struct Watcher {
     tx: Sender<Msg>,
     latest: Arc<Mutex<Option<Snapshot>>>,
+    files: Arc<Mutex<Option<(i64, WorkingTree)>>>,
 }
 
 impl Watcher {
@@ -142,11 +166,14 @@ impl Watcher {
         let (tx, rx) = mpsc::channel::<Msg>();
         let latest = Arc::new(Mutex::new(None));
         let slot = latest.clone();
+        let files = Arc::new(Mutex::new(None));
+        let files_slot = files.clone();
         std::thread::Builder::new()
             .name("feeder-watch".into())
             .spawn(move || {
                 let mut store = None;
-                let mut want = Want { project: None, limit: 0 };
+                let mut want = Want::default();
+                let mut files_refresh = FilesRefresh::default();
                 let mut search_query = String::new();
                 let mut timeline_limit = TIMELINE_PAGE;
                 let mut apps: HashMap<String, Option<PathBuf>> = Default::default();
@@ -167,15 +194,20 @@ impl Watcher {
                     let mut edits = Vec::new();
                     let mut deletes = Vec::new();
                     let mut new_replies = Vec::new();
-                    let mut todo_ops = Vec::new();
                     let mut notebook_ops = Vec::new();
                     let mut mutation_error: Option<String> = None;
                     let mut failed_writes = Vec::new();
-                    match rx.recv_timeout(Duration::from_millis(400)) {
+                    // Poll frequently while visible; back off when minimized/hidden so background
+                    // wakeups stay quiet while still catching updates for notifications.
+                    let poll_interval = if want.visible { Duration::from_millis(400) } else { Duration::from_secs(2) };
+                    match rx.recv_timeout(poll_interval) {
                         Ok(first) => {
                             for msg in std::iter::once(first).chain(rx.try_iter()) {
                                 match msg {
-                                    Msg::Want(w) => want = w,
+                                    Msg::Want(w) => {
+                                        want = w;
+                                        files_refresh.select(w);
+                                    }
                                     Msg::Search(q) => search_query = q,
                                     Msg::Timeline(n) => timeline_limit = timeline_limit.max(n),
                                     Msg::Rename(id, name) => renames.push((id, name)),
@@ -188,12 +220,6 @@ impl Watcher {
                                     Msg::EditUpdate(id, body) => edits.push((id, body)),
                                     Msg::DeleteUpdate(id) => deletes.push(id),
                                     Msg::AddReply(update_id, body) => new_replies.push((update_id, body)),
-                                    Msg::AddTodo(pid, title) => todo_ops.push(TodoOp::Add(pid, title)),
-                                    Msg::SetTodoDone(id, done) => todo_ops.push(TodoOp::SetDone(id, done)),
-                                    Msg::RenameTodo(id, title) => todo_ops.push(TodoOp::Rename(id, title)),
-                                    Msg::DeleteTodo(id) => todo_ops.push(TodoOp::Delete(id)),
-                                    Msg::ClearCompletedTodos(pid) => todo_ops.push(TodoOp::ClearCompleted(pid)),
-                                    Msg::ClearProjectTodos(pid) => todo_ops.push(TodoOp::ClearAll(pid)),
                                     Msg::Notebook(op) => notebook_ops.push(op),
                                     Msg::SaveSettings(settings) => {
                                         if let Err(e) = settings.save(&feeder_core::data_dir()) {
@@ -227,7 +253,6 @@ impl Watcher {
                                         projects: vec![],
                                         want,
                                         feed: vec![],
-                                        todos: vec![],
                                         timeline: vec![],
                                         timeline_limit,
                                         replies: HashMap::new(),
@@ -302,19 +327,6 @@ impl Watcher {
                             failed_writes.push(FailedWrite::Reply { update_id, body });
                         }
                     }
-                    for op in todo_ops {
-                        let res = match op {
-                            TodoOp::Add(pid, title) => s.add_todo(pid, &title).map(|_| ()),
-                            TodoOp::SetDone(id, done) => s.set_todo_done(id, done).map(|_| ()),
-                            TodoOp::Rename(id, title) => s.rename_todo(id, &title).map(|_| ()),
-                            TodoOp::Delete(id) => s.delete_todo(id),
-                            TodoOp::ClearCompleted(pid) => s.clear_completed_todos(pid).map(|_| ()),
-                            TodoOp::ClearAll(pid) => s.clear_project_todos(pid).map(|_| ()),
-                        };
-                        if let Err(e) = res {
-                            mutation_error = Some(format!("To-do update failed: {e}"));
-                        }
-                    }
                     for op in notebook_ops {
                         let res = match op {
                             // The user curates by hand, so a page they file deliberately is kept even if it
@@ -336,7 +348,10 @@ impl Watcher {
 
                     let version = s.data_version().ok();
                     let pulse_expired = next_pulse_expiry.is_some_and(|exp| now_ms() >= exp);
+                    // A Git refresh does not invalidate SQLite-backed views. In particular,
+                    // don't reload Feed media and Curator history on a Files-only update.
                     if !dirty && !pulse_expired && mutation_error.is_none() && version == seen {
+                        publish_files(&files_slot, &wake, &mut files_refresh, s);
                         continue;
                     }
                     seen = version;
@@ -344,9 +359,9 @@ impl Watcher {
                     let nb_stamp = s.notebook_stamp().ok();
                     let need_pages = nb_stamp.is_none() || nb_stamp != last_notebook_stamp;
                     let loaded = s.projects().and_then(|projects| {
-                        let (feed, todos) = match want.project {
-                            Some(id) => (s.feed(id, want.limit, None)?, s.todos(id)?),
-                            None => (vec![], vec![]),
+                        let feed = match want.project {
+                            Some(id) => s.feed(id, want.limit, None)?,
+                            None => vec![],
                         };
                         let timeline = s.timeline(timeline_limit)?;
                         let search_hits =
@@ -362,10 +377,10 @@ impl Watcher {
                         let pages =
                             if need_pages { Some(s.pages(&PageFilter { include_archived: true, ..PageFilter::default() })?) } else { None };
                         let gardener = gardener_view(s, &backends)?;
-                        Ok((projects, feed, todos, timeline, replies, search_hits, pages, gardener))
+                        Ok((projects, feed, timeline, replies, search_hits, pages, gardener))
                     });
                     let snapshot = match loaded {
-                        Ok((projects, feed, todos, timeline, replies, search_hits, pages, gardener)) => {
+                        Ok((projects, feed, timeline, replies, search_hits, pages, gardener)) => {
                             if pages.is_some() {
                                 last_notebook_stamp = nb_stamp;
                             }
@@ -374,7 +389,8 @@ impl Watcher {
                                 .iter()
                                 .filter_map(|p| p.last_agent.clone())
                                 .chain(feed.iter().chain(&timeline).chain(&search_hits).map(|u| u.agent.clone()))
-                                .chain(pages.iter().flatten().map(|pg| pg.agent.clone()));
+                                .chain(pages.iter().flatten().map(|pg| pg.agent.clone()))
+                                .chain(backends.iter().map(|b| b.label().to_string()));
                             for agent in agents {
                                 apps.entry(agent.clone()).or_insert_with(|| {
                                     if crate::agents::has_logo(&agent) {
@@ -388,7 +404,6 @@ impl Watcher {
                                 projects,
                                 want,
                                 feed,
-                                todos,
                                 timeline,
                                 timeline_limit,
                                 replies,
@@ -408,7 +423,6 @@ impl Watcher {
                                 projects: vec![],
                                 want,
                                 feed: vec![],
-                                todos: vec![],
                                 timeline: vec![],
                                 timeline_limit,
                                 replies: HashMap::new(),
@@ -424,10 +438,11 @@ impl Watcher {
                         }
                     };
                     publish(&slot, &wake, snapshot);
+                    publish_files(&files_slot, &wake, &mut files_refresh, s);
                 }
             })
             .expect("spawn watcher");
-        Watcher { tx, latest }
+        Watcher { tx, latest, files }
     }
 
     pub fn want(&self, want: Want) {
@@ -483,30 +498,6 @@ impl Watcher {
         self.tx.send(Msg::AddReply(update_id, body)).ok();
     }
 
-    pub fn add_todo(&self, project_id: i64, title: String) {
-        self.tx.send(Msg::AddTodo(project_id, title)).ok();
-    }
-
-    pub fn set_todo_done(&self, id: i64, done: bool) {
-        self.tx.send(Msg::SetTodoDone(id, done)).ok();
-    }
-
-    pub fn rename_todo(&self, id: i64, title: String) {
-        self.tx.send(Msg::RenameTodo(id, title)).ok();
-    }
-
-    pub fn delete_todo(&self, id: i64) {
-        self.tx.send(Msg::DeleteTodo(id)).ok();
-    }
-
-    pub fn clear_completed_todos(&self, project_id: i64) {
-        self.tx.send(Msg::ClearCompletedTodos(project_id)).ok();
-    }
-
-    pub fn clear_project_todos(&self, project_id: i64) {
-        self.tx.send(Msg::ClearProjectTodos(project_id)).ok();
-    }
-
     /// Asks for the timeline's first `n` posts; callable from scroll handlers, which can't
     /// change state themselves.
     pub fn timeline(&self, n: usize) {
@@ -524,6 +515,10 @@ impl Watcher {
     pub fn take(&self) -> Option<Snapshot> {
         self.latest.lock().ok()?.take()
     }
+
+    pub fn take_files(&self) -> Option<(i64, WorkingTree)> {
+        self.files.lock().ok()?.take()
+    }
 }
 
 fn publish(slot: &Mutex<Option<Snapshot>>, wake: &rune::Waker, snapshot: Snapshot) {
@@ -531,4 +526,61 @@ fn publish(slot: &Mutex<Option<Snapshot>>, wake: &rune::Waker, snapshot: Snapsho
         *s = Some(snapshot);
     }
     wake();
+}
+
+fn publish_files(slot: &Mutex<Option<(i64, WorkingTree)>>, wake: &rune::Waker, refresh: &mut FilesRefresh, store: &Store) {
+    let tree = refresh.poll(Instant::now(), |id| {
+        let project = store.project(id).ok().flatten()?;
+        Some(read_working_tree(project.path.as_deref()))
+    });
+    if let Some(tree) = tree
+        && let Ok(mut pending) = slot.lock()
+    {
+        *pending = Some(tree);
+        drop(pending);
+        wake();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn files_refresh_is_scoped_throttled_and_suppresses_timestamp_only_changes() {
+        let mut files = FilesRefresh::default();
+        let start = Instant::now();
+        let sample = read_working_tree(None);
+        let at = |seconds| start + Duration::from_secs(seconds);
+        let read = |id| {
+            assert_eq!(id, 1);
+            Some(sample.clone())
+        };
+        files.select(Want { project: Some(1), ..Want::default() });
+        assert!(files.poll(start, |_| panic!("closed view read Git")).is_none());
+        files.select(Want { project: Some(1), files: true, ..Want::default() });
+        assert_eq!(files.poll(start, read), Some((1, sample.clone())));
+        assert!(files.poll(at(1), |_| panic!("read too early")).is_none());
+        assert!(
+            files
+                .poll(at(2), |id| {
+                    let mut tree = read(id)?;
+                    tree.read_at += 2_000;
+                    Some(tree)
+                })
+                .is_none()
+        );
+        assert!(files.poll(at(30), read).is_some());
+        assert!(
+            files
+                .poll(at(32), |id| {
+                    let mut tree = read(id)?;
+                    tree.branch = Some("new-branch".into());
+                    Some(tree)
+                })
+                .is_some()
+        );
+        files.select(Want { project: Some(2), files: true, ..Want::default() });
+        assert_eq!(files.poll(at(32), |_| Some(sample.clone())), Some((2, sample)));
+    }
 }

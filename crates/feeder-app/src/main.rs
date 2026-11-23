@@ -6,12 +6,16 @@
 mod agents;
 mod chrome;
 mod connect;
+mod curator_settings;
+mod curator_sign_in;
 mod feed;
+mod files;
 mod gardener;
 mod home;
 mod icon;
 mod keys;
 mod logos;
+mod media;
 mod notebook;
 #[cfg(target_os = "macos")]
 mod notify;
@@ -23,22 +27,23 @@ mod timeline;
 mod updater;
 mod watch;
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::process::{Child, Command};
 use std::sync::atomic::AtomicUsize;
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
-use feeder_core::{FeedUpdate, MediaKind, ProjectSummary, Reply, Settings, Theme, TodoItem, media_kind_for_path, now_ms, parse_attention};
+use feeder_core::{FeedUpdate, ProjectSummary, Reply, Settings, Theme, now_ms, parse_attention};
 use rune::{AppSpec, Cx, El, Image, ImageCache, Player, PointerPress, Taskbar, TextEdit, Tx, Waker, WindowHandle, col, el};
 use rune_kit::search::Fold;
 use rune_kit::shell::TOOLBAR_HEIGHT;
 use rune_kit::{ImageZoom, ToastEvent, ToastStack};
 
+pub use media::{MediaSlide, media_slides};
 use watch::{Want, Watcher};
 
-const PAGE: usize = 60;
+const PAGE: usize = 25;
 
 static WINDOW_HANDLE: OnceLock<Mutex<Option<WindowHandle>>> = OnceLock::new();
 
@@ -87,8 +92,17 @@ pub enum FeedFilter {
 #[derive(Clone, Debug, PartialEq)]
 pub enum ToastKind {
     Info,
-    UndoArchive { project_id: i64, was_archived: bool },
-    UndoDismiss { update_id: i64 },
+    UndoArchive {
+        project_id: i64,
+        was_archived: bool,
+    },
+    UndoDismiss {
+        update_id: i64,
+    },
+    /// A Feed update went to Curator; the action opens its project's review.
+    Flagged {
+        project_id: Option<i64>,
+    },
     Error,
 }
 
@@ -113,6 +127,11 @@ pub struct State {
     pub tab: Tab,
     /// The Notebook tab: shared lessons across projects.
     pub notebook: notebook::Notebook,
+    /// The project's Files view: its working tree as a map and a list.
+    pub files: files::FilesState,
+    curator_sign_in: curator_sign_in::SignIn,
+    pub curator: curator_settings::Curator,
+    window_visible: bool,
     pub projects: Vec<ProjectSummary>,
     /// Every project's updates, newest first (the Feed tab).
     pub timeline: Vec<FeedUpdate>,
@@ -127,9 +146,6 @@ pub struct State {
     pub feed: Vec<FeedUpdate>,
     /// Which project `feed` belongs to, so a stale feed never shows under another project.
     pub feed_for: Option<i64>,
-    /// Per-project optional to-do list items for `todos_for`.
-    pub todos: Vec<TodoItem>,
-    pub todos_for: Option<i64>,
     pub limit: usize,
     pub hovered: Option<i64>,
     pub home_filter: HomeFilter,
@@ -139,7 +155,7 @@ pub struct State {
     pub branch_filter: Option<String>,
     pub project_search_open: bool,
     pub project_search: TextEdit,
-    pub project_gallery: bool,
+    pub project_media_only: bool,
     pub now: i64,
     pub clock: f64,
     pub window_size: [f32; 2],
@@ -152,12 +168,6 @@ pub struct State {
     /// Pinned brief editing state for a project id.
     pub brief_editing: Option<i64>,
     pub brief_draft: TextEdit,
-    /// Project id whose optional to-do card is open (even while empty).
-    pub todo_open: Option<i64>,
-    pub todo_draft: TextEdit,
-    pub todo_editing: Option<i64>,
-    pub todo_edit_draft: TextEdit,
-    pub todo_clear_confirm: Option<i64>,
     /// Inline update edit state.
     pub editing_update: Option<i64>,
     pub edit_update_body: TextEdit,
@@ -168,7 +178,8 @@ pub struct State {
     pub icon: bool,
     pub settings: Settings,
     pub settings_open: bool,
-    /// Settings → Agents: installed tools and whether each starts Feeder.
+    pub settings_page: chrome::SettingsPage,
+    /// Settings → Connected Tools: installed tools and whether each starts Feeder.
     pub agents: connect::Agents,
     #[cfg(feeder_sparkle)]
     pub updates: updater::Updates,
@@ -210,10 +221,13 @@ pub struct State {
     pub pending_scroll: Option<String>,
     last_badge: Option<usize>,
     watcher: Option<Watcher>,
-    wake: Option<Waker>,
-    images: Option<ImageCache>,
+    pub(crate) wake: Option<Waker>,
+    pub(crate) images: Option<ImageCache>,
     /// Decoded screenshots keyed by `media_id`.
     pub shots: HashMap<i64, Image>,
+    /// Visible row ranges reported by the virtualized Feed and Project Updates lists.
+    pub feed_visible_rows: Option<std::ops::Range<usize>>,
+    pub project_visible_rows: Option<std::ops::Range<usize>>,
     /// Video players keyed by `media_id`.
     pub videos: HashMap<i64, Player>,
     /// App icons for agents without a logo, by agent name.
@@ -225,35 +239,6 @@ pub struct State {
     menubar_child: Option<Child>,
 }
 
-/// One visual slide attached to an update (from `update.media`, with fallback to `update.screenshot`).
-#[derive(Clone, Debug)]
-pub struct MediaSlide {
-    pub id: i64,
-    pub path: PathBuf,
-    pub width: Option<u32>,
-    pub height: Option<u32>,
-}
-
-impl MediaSlide {
-    pub fn kind(&self) -> Option<MediaKind> {
-        media_kind_for_path(&self.path)
-    }
-
-    pub fn is_image(&self) -> bool {
-        self.kind() == Some(MediaKind::Image)
-    }
-}
-
-pub fn media_slides(u: &FeedUpdate) -> Vec<MediaSlide> {
-    if !u.media.is_empty() {
-        u.media.iter().map(|m| MediaSlide { id: m.id, path: m.path.clone(), width: m.width, height: m.height }).collect()
-    } else if let Some(path) = &u.screenshot {
-        vec![MediaSlide { id: -u.id, path: path.clone(), width: u.media_w, height: u.media_h }]
-    } else {
-        Vec::new()
-    }
-}
-
 impl Drop for State {
     fn drop(&mut self) {
         self.stop_menubar();
@@ -261,10 +246,14 @@ impl Drop for State {
 }
 
 impl State {
-    fn new() -> State {
+    pub(crate) fn new() -> State {
         State {
             tab: Tab::Home,
             notebook: notebook::Notebook::default(),
+            files: files::FilesState::default(),
+            curator_sign_in: curator_sign_in::SignIn::default(),
+            curator: curator_settings::Curator::load(),
+            window_visible: true,
             projects: vec![],
             timeline: vec![],
             timeline_limit: watch::TIMELINE_PAGE,
@@ -274,8 +263,6 @@ impl State {
             open: None,
             feed: vec![],
             feed_for: None,
-            todos: vec![],
-            todos_for: None,
             limit: PAGE,
             hovered: None,
             home_filter: HomeFilter::All,
@@ -285,7 +272,7 @@ impl State {
             branch_filter: None,
             project_search_open: false,
             project_search: TextEdit::new(""),
-            project_gallery: false,
+            project_media_only: false,
             now: now_ms(),
             clock: 0.0,
             window_size: [1180.0, 760.0],
@@ -294,11 +281,6 @@ impl State {
             scratch_edit: TextEdit::new(""),
             brief_editing: None,
             brief_draft: TextEdit::new(""),
-            todo_open: None,
-            todo_draft: TextEdit::new(""),
-            todo_editing: None,
-            todo_edit_draft: TextEdit::new(""),
-            todo_clear_confirm: None,
             editing_update: None,
             edit_update_body: TextEdit::new(""),
             replying_to: None,
@@ -306,6 +288,7 @@ impl State {
             icon: false,
             settings: Settings::load(&feeder_core::data_dir()),
             settings_open: false,
+            settings_page: chrome::SettingsPage::default(),
             agents: connect::Agents::default(),
             #[cfg(feeder_sparkle)]
             updates: updater::Updates::default(),
@@ -337,6 +320,8 @@ impl State {
             wake: None,
             images: None,
             shots: HashMap::new(),
+            feed_visible_rows: None,
+            project_visible_rows: None,
             videos: HashMap::new(),
             agent_icons: HashMap::new(),
             shots_ready: 0,
@@ -350,14 +335,26 @@ impl State {
     pub fn is_typing(&self) -> bool {
         self.editing.is_some()
             || self.brief_editing.is_some()
-            || self.todo_draft.focused
-            || self.todo_editing.is_some()
             || self.editing_update.is_some()
             || self.replying_to.is_some()
             || self.palette_open
             || self.feed_search.focused
             || self.project_search.focused
             || self.notebook.is_typing()
+            || self.curator.is_typing()
+    }
+
+    pub fn close_settings(&mut self) {
+        self.settings_open = false;
+        self.curator.close_select();
+    }
+
+    pub fn dismiss_menus(&mut self) {
+        self.menu_open = false;
+        self.orb_menu = None;
+        self.post_menu = None;
+        self.notebook.action_menu_open = false;
+        self.curator.close_picker();
     }
 
     pub fn has_active_pulse(&self) -> bool {
@@ -367,23 +364,22 @@ impl State {
     pub fn open_project(&mut self, id: i64) {
         self.open = Some(id);
         self.hovered = None;
-        self.orb_menu = None;
+        self.dismiss_menus();
+        self.close_settings();
         self.close_lightbox();
         self.palette_open = false;
         self.delete_confirm = None;
+        self.editing = None;
         self.branch_filter = None;
         self.project_search_open = false;
         self.project_search = TextEdit::new("");
-        self.project_gallery = false;
+        self.project_media_only = false;
         self.brief_editing = None;
-        self.todo_open = None;
-        self.todo_draft = TextEdit::new("");
-        self.todo_editing = None;
-        self.todo_clear_confirm = None;
         self.editing_update = None;
         self.replying_to = None;
         self.feed_selected = None;
         self.pending_scroll = None;
+        self.project_visible_rows = None;
         self.limit = PAGE;
         // Pre-seed synchronously from timeline updates so Frame 0 renders cards & cached shots
         // immediately without waiting on the Watcher background round-trip.
@@ -394,10 +390,6 @@ impl State {
         } else if self.feed_for != Some(id) {
             self.feed.clear();
             self.feed_for = None;
-        }
-        if self.todos_for != Some(id) {
-            self.todos.clear();
-            self.todos_for = None;
         }
         if let Some(p) = self.projects.iter_mut().find(|p| p.project.id == id) {
             let seen = now_ms().max(p.last_at.unwrap_or(0));
@@ -411,20 +403,18 @@ impl State {
 
     pub fn close_project(&mut self) {
         self.open = None;
+        self.dismiss_menus();
         self.editing = None;
         self.brief_editing = None;
-        self.todo_open = None;
-        self.todo_draft = TextEdit::new("");
-        self.todo_editing = None;
-        self.todo_clear_confirm = None;
         self.editing_update = None;
         self.replying_to = None;
         self.branch_filter = None;
         self.project_search_open = false;
         self.project_search = TextEdit::new("");
-        self.project_gallery = false;
+        self.project_media_only = false;
         self.feed_selected = None;
         self.pending_scroll = None;
+        self.project_visible_rows = None;
         self.close_lightbox();
         self.delete_confirm = None;
         self.ask();
@@ -456,6 +446,7 @@ impl State {
         self.lightbox_compare = None;
         self.lightbox_split = 0.5;
         self.clear_copied(CopyTarget::LightboxImage);
+        media::sync(self);
         tx.focus_when_shown(rune_kit::image_zoom::KEY, false);
     }
 
@@ -468,6 +459,7 @@ impl State {
             let uid = u.id;
             self.card_slide.insert(uid, slide_idx);
         }
+        media::sync(self);
     }
 
     pub fn close_lightbox(&mut self) {
@@ -475,22 +467,28 @@ impl State {
         self.lightbox_zoom.reset();
         self.lightbox_compare = None;
         self.clear_copied(CopyTarget::LightboxImage);
+        media::sync(self);
     }
 
     pub fn toggle_lightbox_compare(&mut self) {
         if self.lightbox_compare.is_some() {
             self.lightbox_compare = None;
+            media::sync(self);
             return;
         }
         let Some(id) = self.lightbox else { return };
         // Prefer comparing against another slide from the same update first (ideal for before/after pairs).
-        let same_update_other = self
-            .find_media(id)
-            .and_then(|(_, _, slides)| slides.into_iter().map(|s| s.id).find(|&x| x != id && self.shots.contains_key(&x)));
-        let other = same_update_other.or_else(|| self.lightbox_ids().into_iter().find(|&x| x != id && self.shots.contains_key(&x)));
+        let same_update_other =
+            self.find_media(id).and_then(|(_, _, slides)| slides.into_iter().find(|s| s.id != id && s.is_image()).map(|s| s.id));
+        let other = same_update_other.or_else(|| {
+            self.lightbox_ids().into_iter().find(|&x| {
+                x != id && self.find_media(x).and_then(|(_, i, slides)| slides.get(i).map(MediaSlide::is_image)).unwrap_or(false)
+            })
+        });
         if let Some(other) = other {
             self.lightbox_compare = Some(other);
             self.lightbox_split = 0.5;
+            media::sync(self);
         }
     }
 
@@ -501,176 +499,6 @@ impl State {
             } else {
                 player.play();
             }
-        }
-    }
-
-    pub fn project_todos(&self, id: i64) -> &[TodoItem] {
-        if self.todos_for == Some(id) { &self.todos } else { &[] }
-    }
-
-    pub fn open_todo_editor(&mut self, id: i64, tx: &mut Tx) {
-        self.todo_open = Some(id);
-        self.todo_clear_confirm = None;
-        self.todo_draft.focused = true;
-        tx.focus_when_shown("todo-add-input", false);
-        tx.scroll_into_view("todo-card");
-    }
-
-    pub fn close_empty_todo(&mut self) {
-        self.todo_draft.focused = false;
-        self.todo_clear_confirm = None;
-        if self.todo_open.is_some_and(|id| self.project_todos(id).is_empty()) {
-            self.todo_open = None;
-            self.todo_draft = TextEdit::new("");
-        }
-    }
-
-    pub fn submit_todo(&mut self, project_id: i64, tx: &mut Tx) {
-        let title = self.todo_draft.text.split_whitespace().collect::<Vec<_>>().join(" ");
-        if title.is_empty() {
-            return;
-        }
-        let chars = title.chars().count();
-        if chars > feeder_core::MAX_TODO_CHARS {
-            self.push_toast(
-                "todo-too-long",
-                ToastItem {
-                    title: format!("To-do is {chars} characters"),
-                    description: Some(format!("Keep items to {} characters or fewer.", feeder_core::MAX_TODO_CHARS)),
-                    kind: ToastKind::Error,
-                },
-                Some(4.0),
-            );
-            return;
-        }
-        self.todo_draft = TextEdit::new("");
-        self.todo_draft.focused = true;
-        self.todo_open = Some(project_id);
-        self.todo_clear_confirm = None;
-        tx.focus_when_shown("todo-add-input", false);
-
-        if self.todos_for != Some(project_id) {
-            self.todos.clear();
-            self.todos_for = Some(project_id);
-        }
-        let temp_id = self.todos.iter().map(|t| t.id).min().unwrap_or(0).min(0) - 1;
-        let position = self.todos.iter().map(|t| t.position).max().unwrap_or(0) + 1;
-        self.todos.push(TodoItem {
-            id: temp_id,
-            project_id,
-            title: title.clone(),
-            done: false,
-            position,
-            created_at: now_ms(),
-            completed_at: None,
-        });
-        if let Some(sum) = self.projects.iter_mut().find(|p| p.project.id == project_id) {
-            sum.open_todos += 1;
-        }
-        if let Some(w) = &self.watcher {
-            w.add_todo(project_id, title);
-        }
-    }
-
-    pub fn toggle_todo(&mut self, todo_id: i64) {
-        let Some(item) = self.todos.iter_mut().find(|t| t.id == todo_id) else { return };
-        let next = !item.done;
-        let project_id = item.project_id;
-        item.done = next;
-        item.completed_at = next.then(now_ms);
-        if let Some(sum) = self.projects.iter_mut().find(|p| p.project.id == project_id) {
-            if next {
-                sum.open_todos = (sum.open_todos - 1).max(0);
-            } else {
-                sum.open_todos += 1;
-            }
-        }
-        if todo_id > 0
-            && let Some(w) = &self.watcher
-        {
-            w.set_todo_done(todo_id, next);
-        }
-    }
-
-    pub fn start_edit_todo(&mut self, todo_id: i64, tx: &mut Tx) {
-        let Some(title) = self.todos.iter().find(|t| t.id == todo_id).map(|t| t.title.clone()) else {
-            return;
-        };
-        let mut edit = TextEdit::new(&title);
-        edit.focused = true;
-        edit.set_selection(0, edit.text.len());
-        self.todo_edit_draft = edit;
-        self.todo_editing = Some(todo_id);
-        tx.focus_when_shown(format!("todo-edit-{todo_id}"), false);
-    }
-
-    pub fn save_todo_edit(&mut self) {
-        let Some(todo_id) = self.todo_editing.take() else { return };
-        let title = self.todo_edit_draft.text.split_whitespace().collect::<Vec<_>>().join(" ");
-        if title.is_empty() {
-            return;
-        }
-        let chars = title.chars().count();
-        if chars > feeder_core::MAX_TODO_CHARS {
-            self.push_toast(
-                "todo-too-long",
-                ToastItem {
-                    title: format!("To-do is {chars} characters"),
-                    description: Some(format!("Keep items to {} characters or fewer.", feeder_core::MAX_TODO_CHARS)),
-                    kind: ToastKind::Error,
-                },
-                Some(4.0),
-            );
-            return;
-        }
-        if let Some(item) = self.todos.iter_mut().find(|t| t.id == todo_id) {
-            item.title = title.clone();
-        }
-        if todo_id > 0
-            && let Some(w) = &self.watcher
-        {
-            w.rename_todo(todo_id, title);
-        }
-    }
-
-    pub fn delete_todo(&mut self, todo_id: i64) {
-        let removed = self.todos.iter().find(|t| t.id == todo_id).map(|t| (t.project_id, t.done));
-        self.todos.retain(|t| t.id != todo_id);
-        if self.todo_editing == Some(todo_id) {
-            self.todo_editing = None;
-        }
-        if let Some((project_id, done)) = removed
-            && !done
-            && let Some(sum) = self.projects.iter_mut().find(|p| p.project.id == project_id)
-        {
-            sum.open_todos = (sum.open_todos - 1).max(0);
-        }
-        if todo_id > 0
-            && let Some(w) = &self.watcher
-        {
-            w.delete_todo(todo_id);
-        }
-    }
-
-    pub fn clear_completed_todos(&mut self, project_id: i64) {
-        self.todos.retain(|t| !(t.project_id == project_id && t.done));
-        self.todo_clear_confirm = None;
-        if let Some(w) = &self.watcher {
-            w.clear_completed_todos(project_id);
-        }
-    }
-
-    pub fn clear_project_todos(&mut self, project_id: i64) {
-        self.todos.retain(|t| t.project_id != project_id);
-        self.todo_open = None;
-        self.todo_draft = TextEdit::new("");
-        self.todo_editing = None;
-        self.todo_clear_confirm = None;
-        if let Some(sum) = self.projects.iter_mut().find(|p| p.project.id == project_id) {
-            sum.open_todos = 0;
-        }
-        if let Some(w) = &self.watcher {
-            w.clear_project_todos(project_id);
         }
     }
 
@@ -706,11 +534,12 @@ impl State {
     }
 
     pub fn save_update_edit(&mut self) {
-        let Some(uid) = self.editing_update.take() else { return };
+        let Some(uid) = self.editing_update else { return };
         let body = self.edit_update_body.text.trim().to_string();
         if body.is_empty() {
             return;
         }
+        self.editing_update = None;
         if let Some(u) = self.feed.iter_mut().find(|u| u.id == uid) {
             u.body = body.clone();
         }
@@ -733,14 +562,16 @@ impl State {
 
     pub fn submit_reply(&mut self, uid: i64) {
         let text = self.reply_draft.text.trim().to_string();
-        self.replying_to = None;
-        self.reply_draft = TextEdit::new("");
         if text.is_empty() {
             return;
         }
+        self.replying_to = None;
+        self.reply_draft = TextEdit::new("");
         let project_id = self.find_update(uid).map(|u| u.project_id).unwrap_or(0);
-        self.replies.entry(uid).or_default().push(Reply {
-            id: 0,
+        let entry = self.replies.entry(uid).or_default();
+        let temp_id = entry.iter().map(|r| r.id).min().unwrap_or(0).min(0) - 1;
+        entry.push(Reply {
+            id: temp_id,
             update_id: uid,
             project_id,
             author: "You".into(),
@@ -909,10 +740,9 @@ impl State {
     }
 
     pub fn open_palette(&mut self, tx: &mut Tx) {
-        self.menu_open = false;
-        self.orb_menu = None;
+        self.dismiss_menus();
         self.close_lightbox();
-        self.settings_open = false;
+        self.close_settings();
         self.delete_confirm = None;
         self.palette_open = true;
         self.palette_index = 0;
@@ -1024,6 +854,24 @@ impl State {
         self.projects.iter().filter(|p| p.unseen()).count()
     }
 
+    pub fn select_tab(&mut self, tab: Tab, tx: &mut Tx) {
+        if self.tab != tab || self.open.is_some() {
+            // Swap the whole page in one frame so the old page cannot cover the new one.
+            tx.instant();
+        }
+        if self.open.is_some() {
+            self.close_project();
+        } else {
+            self.dismiss_menus();
+            self.editing_update = None;
+            self.replying_to = None;
+            self.delete_confirm = None;
+            self.close_lightbox();
+        }
+        self.tab = tab;
+        self.sync_search();
+    }
+
     pub fn sync_search(&mut self) {
         let active = if self.palette_open {
             self.palette_query.text.trim()
@@ -1051,17 +899,18 @@ impl State {
         let rest = rest.split(['?', '#']).next().unwrap_or("").trim_matches('/');
         if rest == "home" {
             self.close_project();
+            self.close_settings();
             self.tab = Tab::Home;
             return true;
         }
         if rest == "feed" {
             self.close_project();
+            self.close_settings();
             self.tab = Tab::Feed;
             return true;
         }
         if rest == "settings" {
-            self.menu_open = false;
-            self.orb_menu = None;
+            self.dismiss_menus();
             self.palette_open = false;
             self.close_lightbox();
             self.settings_open = true;
@@ -1069,8 +918,14 @@ impl State {
         }
         if let Some(page) = rest.strip_prefix("notebook") {
             self.close_project();
+            self.close_settings();
             self.tab = Tab::Notebook;
-            self.notebook.open = page.trim_start_matches('/').parse().ok();
+            if let Ok(id) = page.trim_start_matches('/').parse() {
+                self.notebook_open_page(id);
+            } else {
+                self.notebook.open = None;
+                self.notebook.sync_tree_selection();
+            }
             return true;
         }
         if let Some(after) = rest.strip_prefix("project/") {
@@ -1105,11 +960,16 @@ impl State {
         true
     }
 
+    fn timeline_source(&self) -> (bool, &[FeedUpdate]) {
+        let query = self.feed_search.text.trim();
+        let using_db = !query.is_empty() && self.search_snapshot_query == query;
+        (using_db, if using_db { &self.search_hits } else { &self.timeline })
+    }
+
     pub fn filtered_timeline(&self) -> Vec<(&FeedUpdate, &ProjectSummary)> {
         let fold = Fold::default();
         let query = self.feed_search.text.trim();
-        let using_db = !query.is_empty() && self.search_snapshot_query == query;
-        let source: &[FeedUpdate] = if using_db { &self.search_hits } else { &self.timeline };
+        let (using_db, source) = self.timeline_source();
         source
             .iter()
             .filter_map(|u| {
@@ -1163,8 +1023,7 @@ impl State {
     }
 
     pub fn lightbox_ids(&self) -> Vec<i64> {
-        let has_media = |id: i64| self.shots.contains_key(&id) || self.videos.contains_key(&id);
-        let collect_update = |u: &FeedUpdate| media_slides(u).into_iter().map(|m| m.id).filter(|&id| has_media(id)).collect::<Vec<_>>();
+        let collect_update = |u: &FeedUpdate| media_slides(u).into_iter().map(|m| m.id).collect::<Vec<_>>();
         if let Some(open) = self.open {
             if self.feed_for == Some(open) { feed::visible_feed(self).into_iter().flat_map(collect_update).collect() } else { vec![] }
         } else {
@@ -1201,43 +1060,24 @@ impl State {
 
     fn ask(&self) {
         if let Some(w) = &self.watcher {
-            w.want(Want { project: self.open, limit: self.limit });
+            // Git is read only while a project's Files view is showing.
+            let files = self.window_visible && self.open.is_some() && self.files.view == files::ProjectView::Files;
+            w.want(Want { project: self.open, limit: self.limit, files, visible: self.window_visible });
         }
     }
 
-    fn load_images(&mut self) {
-        let Some(cache) = &self.images else { return };
-        let mut live = HashSet::new();
-        for u in self.feed.iter().chain(&self.timeline).chain(&self.search_hits) {
-            for slide in media_slides(u) {
-                live.insert(slide.id);
-                match media_kind_for_path(&slide.path) {
-                    Some(MediaKind::Video) => {
-                        self.videos.entry(slide.id).or_insert_with(|| {
-                            let player = Player::file(&slide.path);
-                            player.set_looping(true);
-                            player.preload();
-                            if let Some(w) = &self.wake {
-                                player.set_waker(w.clone());
-                            }
-                            player
-                        });
-                    }
-                    Some(MediaKind::Image) | None => {
-                        self.shots.entry(slide.id).or_insert_with(|| {
-                            let img = cache.file(&slide.path, 960.0, 2.0);
-                            // Headless frames run ahead of the decoder; wait so snapshots show it.
-                            if rune::tooling::headless_run().is_some() {
-                                let _ = img.wait();
-                            }
-                            img
-                        });
-                    }
-                }
-            }
+    /// True only when a breathing orb pulse halo is actually drawn on screen.
+    fn pulse_halo_visible(&self) -> bool {
+        if !self.window_visible {
+            return false;
         }
-        self.shots.retain(|id, _| live.contains(id));
-        self.videos.retain(|id, _| live.contains(id));
+        match self.open {
+            Some(id) if self.files.view == files::ProjectView::Updates => {
+                self.summary(id).is_some_and(|sum| !sum.project.archived && sum.active_pulse.is_some())
+            }
+            Some(_) => false,
+            None => self.tab == Tab::Home && self.has_active_pulse(),
+        }
     }
 }
 
@@ -1268,9 +1108,14 @@ fn view(s: &State, cx: &mut Cx<State>) -> El {
     let shell = if s.open.is_none() && s.tab == Tab::Notebook {
         notebook::view(s, &p, &k, inset, reduced_motion, &mut layer)
     } else {
-        let (leading, trailing) = if let Some(id) = s.open { feed::bar_chrome(s, id, &p) } else { (el(), Some(chrome::tabs(s, &k))) };
+        let (leading, trailing) = if let Some(id) = s.open { feed::bar_chrome(s, id, &p, &k) } else { (el(), Some(chrome::tabs(s, &k))) };
         let header = chrome::bar(s, &p, &k, &mut layer, inset, leading, trailing);
         let page = match s.open {
+            Some(id) if s.files.view == files::ProjectView::Files => {
+                // The space under the bar, from the last frame's window size.
+                let [w, h] = cx.layout_size("shell").unwrap_or([1180.0, 760.0]);
+                files::view(s, id, &p, &k, [w, h - TOOLBAR_HEIGHT])
+            }
             Some(id) => feed::view(s, id, &p, &k, reduced_motion),
             None if s.tab == Tab::Feed => timeline::view(s, &p, &k, &mut layer),
             None => home::view(s, &p, &k, reduced_motion, &mut layer),
@@ -1282,7 +1127,7 @@ fn view(s: &State, cx: &mut Cx<State>) -> El {
     layer.extend(chrome::palette(s, &p, &k));
     layer.extend(chrome::lightbox(s, inset, &p, &k, reduced_motion));
     layer.extend(chrome::delete_confirm(s, &p, &k));
-    layer.extend(chrome::settings(s, &p, &k));
+    chrome::settings(s, &p, &k, &mut layer);
     layer.extend(chrome::toasts(s, &k));
     let base = el()
         .key("root")
@@ -1311,12 +1156,29 @@ fn setup(s: &mut State, wake: Waker) {
 fn poll(s: &mut State, clock: f64, tx: &mut Tx) -> bool {
     let mut changed = false;
     s.clock = clock;
+    changed |= s.files.poll(tx, s.images.as_ref());
     #[cfg(feeder_sparkle)]
     {
         changed |= updater::poll(s);
     }
     s.sync_search();
     changed |= s.notebook.chat.drain();
+    s.curator_sign_in.follow_accounts(s.settings_open && s.settings_page == chrome::SettingsPage::Curator, s.wake.as_ref());
+    changed |= s.curator_sign_in.poll();
+    changed |= s.curator.poll();
+    if s.settings_open && s.settings_page == chrome::SettingsPage::Curator {
+        let wake = s.wake.clone();
+        for b in s.curator.prefs.enabled() {
+            s.curator.want_models(b, wake.as_ref());
+        }
+    } else if s.open.is_none()
+        && s.tab == Tab::Notebook
+        && s.notebook.shelf == notebook::Shelf::Gardener
+        && let Some(b) = curator_settings::selected(s)
+    {
+        let wake = s.wake.clone();
+        s.curator.want_models(b, wake.as_ref());
+    }
     s.agents.follow_settings(s.settings_open, s.wake.as_ref());
     changed |= s.agents.take();
     if let Some(cache) = &s.images {
@@ -1446,8 +1308,6 @@ fn poll(s: &mut State, clock: f64, tx: &mut Tx) -> bool {
         if snap.want.project == s.open && snap.want.project.is_some() {
             s.feed = snap.feed;
             s.feed_for = snap.want.project;
-            s.todos = snap.todos;
-            s.todos_for = snap.want.project;
         }
         if let Some(id) = s.open
             && s.loaded
@@ -1456,10 +1316,9 @@ fn poll(s: &mut State, clock: f64, tx: &mut Tx) -> bool {
         {
             s.open = None; // removed from another client
         }
-        s.load_images();
+        media::sync(s);
         if let Some(id) = s.lightbox
-            && !s.shots.contains_key(&id)
-            && !s.videos.contains_key(&id)
+            && s.find_media(id).is_none()
         {
             s.close_lightbox();
         }
@@ -1474,6 +1333,15 @@ fn poll(s: &mut State, clock: f64, tx: &mut Tx) -> bool {
                 });
             }
         }
+        changed = true;
+    }
+
+    let files_visible = s.open.is_some() && s.files.view == files::ProjectView::Files;
+    if let Some((id, wt)) = s.watcher.as_ref().and_then(Watcher::take_files)
+        && files_visible
+        && s.open == Some(id)
+    {
+        s.files.apply(id, wt);
         changed = true;
     }
 
@@ -1497,8 +1365,11 @@ fn poll(s: &mut State, clock: f64, tx: &mut Tx) -> bool {
         s.last_badge = Some(unseen);
     }
 
-    // Gentle breathing halo animation while any project has a live pulse.
-    if rune::tooling::headless_run().is_none() && s.has_active_pulse() && (s.open.is_some() || s.tab == Tab::Home || s.tab == Tab::Feed) {
+    // Keep decoded images and preloaded videos scoped to what the current view can display.
+    media::sync(s);
+
+    // Gentle breathing halo animation only when a pulsing orb halo is actually visible.
+    if rune::tooling::headless_run().is_none() && s.pulse_halo_visible() {
         if clock - s.last_pulse_tick >= 0.065 {
             s.last_pulse_tick = clock;
             changed = true;
@@ -1543,6 +1414,17 @@ fn is_app_icon_scene() -> bool {
         }
     }
     false
+}
+
+#[cfg(target_os = "macos")]
+fn system_font_faces() -> &'static [&'static [u8]] {
+    // Register the faces Rune uses for "System Font" so it checks their glyph coverage
+    // before asking Core Text to resolve the same font as a fallback.
+    let Ok(regular) = std::fs::read("/System/Library/Fonts/SFNS.ttf") else { return &[] };
+    let Ok(italic) = std::fs::read("/System/Library/Fonts/SFNSItalic.ttf") else { return &[] };
+    // AppSpec borrows these bytes for the lifetime of the process.
+    let faces: [&'static [u8]; 2] = [regular.leak(), italic.leak()];
+    Box::leak(Box::new(faces))
 }
 
 fn main() {
@@ -1730,15 +1612,42 @@ fn main() {
                 s.notebook_new_page();
             }),
             ("settings", |s| s.settings_open = true),
+            ("settings-curator", |s| {
+                s.notebook.gardener.backends = feeder_core::gardener::Backend::ALL.to_vec();
+                s.curator_sign_in.demo();
+                s.curator.demo();
+                s.settings_page = chrome::SettingsPage::Curator;
+                s.settings_open = true;
+            }),
+            ("curator-off", |s| {
+                s.notebook.gardener.backends = feeder_core::gardener::Backend::ALL.to_vec();
+                s.curator.prefs = feeder_core::gardener::CuratorPrefs::default();
+                s.tab = Tab::Notebook;
+                s.notebook.shelf = notebook::Shelf::Gardener;
+            }),
+            ("curator-picker", |s| {
+                s.notebook.gardener.backends = feeder_core::gardener::Backend::ALL.to_vec();
+                s.curator_sign_in.demo();
+                s.curator.demo();
+                s.tab = Tab::Notebook;
+                s.notebook.shelf = notebook::Shelf::Gardener;
+                s.curator.picker_open = true;
+            }),
         ],
         setup: Some(setup),
         poll: Some(poll),
         on_key: Some(keys::on_key),
         families: style::FONT_FAMILIES,
+        #[cfg(target_os = "macos")]
+        fonts: system_font_faces(),
         ..AppSpec::new("Feeder", (1180.0, 760.0), State::new, view)
     })
     // Every view's bar is rune-kit's toolbar band, so the traffic lights centre in its height.
     .titlebar(rune::Titlebar::new(TOOLBAR_HEIGHT).traffic_lights(18.0, (TOOLBAR_HEIGHT - 14.0) / 2.0))
+    .on_visibility(|s, visible, _| {
+        s.window_visible = visible;
+        s.ask();
+    })
     .keep_running()
     .standard_menus()
     .on_window(|handle| {
@@ -1928,34 +1837,124 @@ mod tests {
     }
 
     #[test]
-    fn project_todo_optimistic_state_updates_cleanly() {
+    fn pulse_halo_only_animates_when_actually_visible() {
+        let mut s = State::new();
+        let mut pulsing = sample_summary(1, "alpha", "Alpha");
+        pulsing.active_pulse = Some(feeder_core::Pulse {
+            project_id: 1,
+            agent: "Claude Code".into(),
+            branch: None,
+            status: "Working".into(),
+            updated_at: 100,
+            expires_at: 200,
+        });
+        let quiet = sample_summary(2, "beta", "Beta");
+        s.projects = vec![pulsing, quiet];
+
+        s.tab = Tab::Home;
+        assert!(s.pulse_halo_visible());
+        s.tab = Tab::Feed;
+        assert!(!s.pulse_halo_visible(), "Feed draws a Spinner, never a breathing orb halo");
+        s.tab = Tab::Notebook;
+        assert!(!s.pulse_halo_visible());
+
+        s.open = Some(2);
+        assert!(!s.pulse_halo_visible(), "a quiet open project does not tick for another project's pulse");
+        s.open = Some(1);
+        assert!(s.pulse_halo_visible());
+        s.files.view = files::ProjectView::Files;
+        assert!(!s.pulse_halo_visible());
+        s.files.view = files::ProjectView::Updates;
+        s.window_visible = false;
+        assert!(!s.pulse_halo_visible());
+    }
+
+    #[test]
+    fn empty_edits_stay_open_and_rapid_replies_get_distinct_temp_ids() {
         let mut s = State::new();
         s.projects.push(sample_summary(1, "alpha", "Alpha"));
-        s.open_project(1);
-        assert!(s.project_todos(1).is_empty());
+        s.feed.push(sample_update(10, 1, "Initial body"));
 
-        s.todos_for = Some(1);
-        s.todos.push(TodoItem {
-            id: 10,
-            project_id: 1,
-            title: "Ship checklist".into(),
-            done: false,
-            position: 1,
-            created_at: 1_000,
-            completed_at: None,
-        });
-        s.projects[0].open_todos = 1;
+        s.editing_update = Some(10);
+        s.edit_update_body = TextEdit::new("   ");
+        s.save_update_edit();
+        assert_eq!(s.editing_update, Some(10), "blank edit must stay open instead of discarding silently");
 
-        s.toggle_todo(10);
-        assert!(s.todos[0].done);
-        assert_eq!(s.projects[0].open_todos, 0);
+        s.replying_to = Some(10);
+        s.reply_draft = TextEdit::new("   ");
+        s.submit_reply(10);
+        assert_eq!(s.replying_to, Some(10), "blank reply must stay open");
 
-        s.toggle_todo(10);
-        assert!(!s.todos[0].done);
-        assert_eq!(s.projects[0].open_todos, 1);
+        s.reply_draft = TextEdit::new("First reply");
+        s.submit_reply(10);
+        s.replying_to = Some(10);
+        s.reply_draft = TextEdit::new("Second reply");
+        s.submit_reply(10);
+        let ids: Vec<i64> = s.replies[&10].iter().map(|r| r.id).collect();
+        assert_eq!(ids.len(), 2);
+        assert_ne!(ids[0], ids[1]);
+    }
 
-        s.delete_todo(10);
-        assert!(s.todos.is_empty());
-        assert_eq!(s.projects[0].open_todos, 0);
+    fn sample_flag(id: i64, project_id: Option<i64>, source_update_id: Option<i64>) -> feeder_core::Flag {
+        feeder_core::Flag {
+            id,
+            kind: feeder_core::FlagKind::Missing,
+            page_id: None,
+            project_id,
+            agent: "you".into(),
+            note: "Remember this".into(),
+            suggestion: None,
+            status: feeder_core::FlagStatus::Open,
+            resolution: None,
+            resolved_by: None,
+            change_id: None,
+            created_at: 0,
+            resolved_at: None,
+            source_update_id,
+        }
+    }
+
+    #[test]
+    fn flagged_update_stays_marked_until_its_flag_closes() {
+        let mut s = State::new();
+        s.notebook.gardener.open_flags.push(sample_flag(1, Some(1), Some(10)));
+        assert!(s.open_flag_for_update(10));
+        assert!(!s.open_flag_for_update(11));
+        s.notebook.gardener.open_flags.clear();
+        assert!(!s.open_flag_for_update(10));
+    }
+
+    #[test]
+    fn review_card_counts_only_flags_in_the_chat_scope() {
+        let mut s = State::new();
+        s.notebook.gardener.open_flags.push(sample_flag(1, Some(1), Some(10)));
+        s.notebook.gardener.open_flags.push(sample_flag(2, Some(2), Some(20)));
+        assert_eq!(gardener::scoped_flags(&s).len(), 2);
+        s.notebook.chat.scope = feeder_core::gardener::Scope::Project(1);
+        let ids: Vec<i64> = gardener::scoped_flags(&s).iter().map(|f| f.id).collect();
+        assert_eq!(ids, vec![1]);
+    }
+
+    #[test]
+    fn home_shows_the_question_behind_needs_you() {
+        let mut sum = sample_summary(1, "alpha", "Alpha");
+        sum.needs_you = true;
+        sum.last_body = Some("Done: drafted pricing.\n\nDecision needed: should EU prices include tax?".into());
+        assert_eq!(home::needs_you_question(&sum).as_deref(), Some("Should EU prices include tax?"));
+        sum.last_body = Some("Done: nothing to ask.".into());
+        assert_eq!(home::needs_you_question(&sum), None);
+    }
+
+    #[test]
+    fn media_filter_keeps_only_updates_with_media() {
+        let mut s = State::new();
+        s.feed.push(sample_update(1, 1, "Done: text only."));
+        let mut shot = sample_update(2, 1, "Done: with a screenshot.");
+        shot.screenshot = Some(PathBuf::from("/tmp/x.png"));
+        s.feed.push(shot);
+        assert_eq!(feed::visible_feed(&s).len(), 2);
+        s.project_media_only = true;
+        let ids: Vec<i64> = feed::visible_feed(&s).iter().map(|u| u.id).collect();
+        assert_eq!(ids, vec![2]);
     }
 }

@@ -787,21 +787,40 @@ fn strip_markdown_line(line: &str) -> String {
             && chars[close_br + 1] == '('
             && let Some(close_par) = (close_br + 2..chars.len()).find(|&j| chars[j] == ')')
         {
-            for &ch in &chars[i + 1..close_br] {
-                if !matches!(ch, '*' | '_' | '`' | '~') {
-                    out.push(ch);
-                }
-            }
+            push_stripped_inline(&chars[i + 1..close_br], &mut out);
             i = close_par + 1;
             continue;
         }
+        if chars[i] == '~' && chars.get(i + 1) == Some(&'~') {
+            i += 2;
+            continue;
+        }
         let ch = chars[i];
-        if !matches!(ch, '*' | '_' | '`' | '~') {
+        let keep_underscore =
+            ch == '_' && i > 0 && chars[i - 1].is_alphanumeric() && chars.get(i + 1).is_some_and(|next| next.is_alphanumeric());
+        if keep_underscore || !matches!(ch, '*' | '_' | '`') {
             out.push(ch);
         }
         i += 1;
     }
     squash(&out)
+}
+
+fn push_stripped_inline(chars: &[char], out: &mut String) {
+    let mut i = 0;
+    while i < chars.len() {
+        if chars[i] == '~' && chars.get(i + 1) == Some(&'~') {
+            i += 2;
+            continue;
+        }
+        let ch = chars[i];
+        let keep_underscore =
+            ch == '_' && i > 0 && chars[i - 1].is_alphanumeric() && chars.get(i + 1).is_some_and(|next| next.is_alphanumeric());
+        if keep_underscore || !matches!(ch, '*' | '_' | '`') {
+            out.push(ch);
+        }
+        i += 1;
+    }
 }
 
 /// Toggles the `task_index`-th GFM task list checkbox outside fenced code blocks.
@@ -883,7 +902,11 @@ fn passes(p: &Page, f: &PageFilter) -> bool {
             let want = normalize_topic(t).unwrap_or_else(|| t.to_ascii_lowercase());
             p.topic == want
         })
-        && f.tag.as_deref().is_none_or(|t| p.tags.iter().any(|pt| pt == t))
+        && f.tag.as_deref().is_none_or(|t| {
+            let trimmed = t.trim().trim_start_matches('#');
+            let want = crate::slugify(trimmed);
+            p.tags.iter().any(|pt| pt == &want || pt.eq_ignore_ascii_case(trimmed))
+        })
         && f.project_id.is_none_or(|id| p.project_id == Some(id))
 }
 
@@ -1267,6 +1290,12 @@ mod tests {
         assert_eq!(hits.first().map(|p| p.id), Some(b.id));
         let by_tag = s.search_pages("", &PageFilter { tag: Some("sqlite".into()), ..PageFilter::default() }, 5).unwrap();
         assert_eq!(by_tag.iter().map(|p| p.id).collect::<Vec<_>>(), [a.id]);
+        let by_tag_hash = s.search_pages("", &PageFilter { tag: Some("#SQLite".into()), ..PageFilter::default() }, 5).unwrap();
+        assert_eq!(by_tag_hash.iter().map(|p| p.id).collect::<Vec<_>>(), [a.id]);
+        assert_eq!(
+            markdown_excerpt("Set `busy_timeout` in ~/Library/db and ~~old~~ _italic_ text.", 120),
+            "Set busy_timeout in ~/Library/db and old italic text."
+        );
         let by_topic = s.search_pages("", &PageFilter { topic: Some("Rust".into()), ..PageFilter::default() }, 5).unwrap();
         assert_eq!(by_topic.len(), 2);
         let substring = s.search_pages("viewpo", &PageFilter::default(), 5).unwrap();

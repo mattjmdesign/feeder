@@ -1,6 +1,6 @@
 //! Agent tool marks from Simple Icons (CC0), one 24×24 path each, drawn in their element's colour.
-//! Generated from the published SVGs; edit by re-fetching them. Tools without one here (T3 Code,
-//! Antigravity) show their installed app's own icon instead; Feeder ships no other artwork.
+//! Generated from the published SVGs; edit by re-fetching them. Tools without one here (T3 Code)
+//! show their installed app's own icon instead; Feeder ships no other artwork.
 
 use rune::Icon;
 
@@ -43,3 +43,11 @@ pub static ZED: Icon = Icon {
 /// OpenCode's mark (Simple Icons, CC0).
 pub static OPENCODE: Icon =
     Icon { name: "opencode", view: 24.0, body: r#"<path fill="currentColor" d="M22 24H2V0h20zM17 4.8H7v14.4h10z"/>"# };
+
+/// Antigravity's arch, the outline of Google's own mark (antigravity.google/favicon.svg) without its
+/// colour wash, refit to 24×24 so it sits level with the others.
+pub static ANTIGRAVITY: Icon = Icon {
+    name: "antigravity",
+    view: 24.0,
+    body: r#"<path fill="currentColor" d="M20.599 21.040C21.775 21.922 23.538 21.334 21.922 19.717C17.071 15.013 18.100 2.078 12.073 2.078C6.047 2.078 7.076 15.013 2.225 19.717C0.462 21.481 2.372 21.922 3.548 21.040C8.105 17.953 7.811 12.514 12.073 12.514C16.336 12.514 16.042 17.953 20.599 21.040Z"/>"#,
+};

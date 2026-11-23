@@ -6,8 +6,11 @@
 //! agent thinks, says and does as [`Event`]s, takes follow-up messages, and can be stopped.
 
 mod acp;
+mod auth;
+mod browser_login;
 mod chat;
 mod parse;
+mod prefs;
 mod profile;
 mod session;
 
@@ -15,7 +18,9 @@ use std::path::PathBuf;
 
 use rusqlite::{Connection, OptionalExtension, Row, Transaction, TransactionBehavior, params};
 
+pub use auth::{AccountStatus, ConnectionStatus};
 pub use chat::{ChatOpening, ChatSummary, StoredEvent};
+pub use prefs::{ModelInfo, NICKNAME_CHARS, Prefs as CuratorPrefs, Provider as CuratorProvider, RunConfig, effort_label};
 pub use session::{Event, Session, SessionEnv, ToolCall, demo_events};
 
 use crate::{Error, Result, Store, now_ms, setup};
@@ -155,8 +160,12 @@ impl Backend {
     pub fn connect(self, state_dir: &std::path::Path) -> Result<()> {
         let bin = self.binary().ok_or_else(|| Error::NotFound(format!("{} isn't installed", self.label())))?;
         let mut cmd = profile::command(self, &bin, state_dir)?;
+        if self == Self::Antigravity {
+            cmd.args(["acp", "--include-default-customizations=false", "--gemini-dir"]).arg(profile::gemini_dir(state_dir)?);
+        }
         cmd.args(match self {
-            Self::OpenCode | Self::Antigravity => &["acp", "--login"][..],
+            Self::OpenCode => &["auth", "login", "--standalone"][..],
+            Self::Antigravity => &["--login"],
             Self::ClaudeCode => &["auth", "login"],
             Self::Codex => &["login"],
         });

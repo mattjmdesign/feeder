@@ -1,4 +1,4 @@
-//! Settings → Agents: the coding tools installed on this Mac, whether each one starts Feeder's
+//! Settings → Connected Tools: the coding tools installed on this Mac, whether each one starts Feeder's
 //! MCP server, and connecting one with a press. Scans and config edits read and write files in
 //! the user's home folder, so they run on a worker thread and land through `State::poll`.
 

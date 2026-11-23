@@ -16,7 +16,7 @@ use rune_kit::{
 
 use crate::connect::Link;
 use crate::style::{self, Palette};
-use crate::{CopyTarget, State, Tab, ToastItem, ToastKind, agents, feed, orb};
+use crate::{CopyTarget, State, Tab, ToastItem, ToastKind, agents, curator_settings, feed, orb};
 
 static PLUS_ICON: Icon = Icon {
     name: "feeder-plus",
@@ -41,10 +41,7 @@ pub fn tabs(s: &State, k: &Kit) -> El {
     SegmentedControl::new(&labels, Tab::ALL.iter().position(|t| *t == s.tab))
         .label("View")
         .fit()
-        .on_pick(|s: &mut State, i: usize, _: &mut Tx| {
-            s.tab = Tab::ALL.get(i).copied().unwrap_or_default();
-            s.sync_search();
-        })
+        .on_pick(|s: &mut State, i: usize, tx: &mut Tx| s.select_tab(Tab::ALL.get(i).copied().unwrap_or_default(), tx))
         .build(k)
 }
 
@@ -138,7 +135,8 @@ pub fn menu(s: &State, p: &Palette, k: &Kit, layer: &mut Vec<El>) -> El {
         .open(s.menu_open)
         .placement(Placement::BottomEnd)
         .min_width(236.0)
-        .on_close(|s: &mut State| s.menu_open = false)
+        .on_close(|s: &mut State| s.menu_open = false);
+    m = feed::project_menu(s, m)
         .item(MenuItem::new("Quick Jump…").shortcut("⌘K").on_select_tx(|s: &mut State, tx: &mut Tx| s.open_palette(tx)))
         .item(MenuItem::new("Settings…").shortcut("⌘,").on_select(|s: &mut State| {
             s.menu_open = false;
@@ -152,11 +150,9 @@ pub fn menu(s: &State, p: &Palette, k: &Kit, layer: &mut Vec<El>) -> El {
     }
     if archived_count > 0 {
         let label = if s.show_archived { "Hide Archived Projects".to_string() } else { format!("Show Archived ({archived_count})") };
-        m = m.item(MenuItem::new(label).on_select(|s: &mut State| {
-            s.menu_open = false;
-            s.open = None;
-            s.tab = Tab::Home;
+        m = m.item(MenuItem::new(label).on_select_tx(|s: &mut State, tx: &mut Tx| {
             s.show_archived = !s.show_archived;
+            s.select_tab(Tab::Home, tx);
         }));
     }
     m.item(MenuItem::new("Connect Agents…").on_select_tx(|s: &mut State, tx: &mut Tx| {
@@ -305,13 +301,46 @@ pub fn lightbox(s: &State, inset: f32, p: &Palette, k: &Kit, reduced_motion: boo
         return Some(scrim);
     }
 
-    let img = s.shots.get(&id)?;
-    let [w, h] = img.size()?;
+    let Some((img, [w, h])) = s.shots.get(&id).and_then(|img| Some((img, img.size()?))) else {
+        let mut top = lightbox_top_chrome(s, inset, p, &caption, pos, total, false, None);
+        top = top.child(
+            bar_button("lightbox-close", "×", p)
+                .fill(p.card)
+                .border(1.0, p.hairline)
+                .label("Close preview")
+                .on_press(|s: &mut State| s.close_lightbox()),
+        );
+        let mut scrim = el()
+            .key("lightbox-scrim")
+            .absolute(0.0, 0.0)
+            .w_full()
+            .h_full()
+            .fill(backdrop)
+            .center()
+            .on_press(|s: &mut State| s.close_lightbox())
+            .child(
+                el().px(18.0)
+                    .py(12.0)
+                    .radius(10.0)
+                    .fill(p.card)
+                    .border(1.0, p.hairline)
+                    .child(text("Loading…").font(style::META).color(p.text_2)),
+            )
+            .child(top);
+        if let Some(strip) = strip {
+            scrim = scrim.child(strip);
+        }
+        return Some(scrim);
+    };
 
-    let compare_target = s.lightbox_compare.and_then(|cid| (cid != id && s.shots.contains_key(&cid)).then_some(cid));
+    let compare_target = s.lightbox_compare.filter(|&cid| cid != id);
 
-    let img_ids: Vec<i64> = ids.iter().copied().filter(|x| s.shots.contains_key(x)).collect();
-    let can_compare = img_ids.len() >= 2;
+    let can_compare = ids
+        .iter()
+        .filter(|&&x| s.find_media(x).and_then(|(_, i, slides)| slides.get(i).map(crate::MediaSlide::is_image)).unwrap_or(false))
+        .take(2)
+        .count()
+        >= 2;
 
     let mut top = lightbox_top_chrome(s, inset, p, &caption, pos, total, can_compare, compare_target);
     if let Some(path) = media_path {
@@ -677,47 +706,30 @@ pub fn move_palette(s: &mut State, delta: isize) {
     s.palette_index = (s.palette_index.min(len - 1) as isize + delta).rem_euclid(len as isize) as usize;
 }
 
-pub fn run_palette(s: &mut State) {
+pub fn run_palette(s: &mut State, tx: &mut Tx) {
     let items = palette_items(s);
     if items.is_empty() {
         return;
     }
     let idx = s.palette_index.min(items.len() - 1);
-    execute_palette_action(s, items[idx].action.clone());
+    execute_palette_action(s, items[idx].action.clone(), tx);
 }
 
-fn execute_palette_action(s: &mut State, action: PaletteAction) {
+fn execute_palette_action(s: &mut State, action: PaletteAction, tx: &mut Tx) {
     s.close_palette();
     match action {
         PaletteAction::OpenProject(id) => s.open_project(id),
-        PaletteAction::GoHome => {
-            s.open = None;
-            s.tab = Tab::Home;
-            s.sync_search();
-        }
-        PaletteAction::GoFeed => {
-            s.open = None;
-            s.tab = Tab::Feed;
-            s.sync_search();
-        }
-        PaletteAction::GoNotebook => {
-            s.open = None;
-            s.tab = Tab::Notebook;
-            s.sync_search();
-        }
+        PaletteAction::GoHome => s.select_tab(Tab::Home, tx),
+        PaletteAction::GoFeed => s.select_tab(Tab::Feed, tx),
+        PaletteAction::GoNotebook => s.select_tab(Tab::Notebook, tx),
         PaletteAction::OpenPage(id) => {
-            s.open = None;
-            s.tab = Tab::Notebook;
-            s.notebook.editor = None;
-            s.notebook.open = Some(id);
-            s.sync_search();
+            s.select_tab(Tab::Notebook, tx);
+            s.notebook_open_page(id);
         }
         PaletteAction::MarkAllRead => s.mark_all_seen(),
         PaletteAction::ToggleArchived => {
-            s.open = None;
-            s.tab = Tab::Home;
             s.show_archived = !s.show_archived;
-            s.sync_search();
+            s.select_tab(Tab::Home, tx);
         }
         PaletteAction::OpenSettings => s.settings_open = true,
     }
@@ -744,7 +756,7 @@ pub fn palette(s: &State, p: &Palette, _k: &Kit) -> Option<El> {
             s.palette_index = 0;
             &mut s.palette_query
         })
-        .on_submit(|s: &mut State, _tx: &mut Tx| run_palette(s))
+        .on_submit(run_palette)
         .on_input_key(|s: &mut State, e: &KeyEvent, _tx: &mut Tx| match e.key {
             Key::Escape => {
                 s.close_palette();
@@ -782,7 +794,7 @@ pub fn palette(s: &State, p: &Palette, _k: &Kit) -> Option<El> {
                 .fill(if active { p.hover } else { p.card.alpha(0.0) })
                 .hover(p.hover)
                 .cursor(Cursor::Pointer)
-                .on_press(move |s: &mut State| execute_palette_action(s, action.clone()));
+                .on_press_tx(move |s: &mut State, tx| execute_palette_action(s, action.clone(), tx));
 
             if let Some(pid) = item.project_id
                 && let Some(sum) = s.summary(pid)
@@ -878,6 +890,12 @@ pub fn toasts(s: &State, k: &Kit) -> Option<El> {
                     s.undismiss_attention(update_id);
                 });
             }
+            ToastKind::Flagged { project_id } => {
+                t = t.icon(k, k.glyph.check).action(k, "Review", true, move |s: &mut State, tx: &mut Tx| {
+                    s.dismiss_toast(tid);
+                    s.open_flag_review(project_id, tx);
+                });
+            }
             ToastKind::Error => {
                 t = t.icon(k, k.glyph.circle_x);
             }
@@ -924,9 +942,36 @@ pub fn delete_confirm(s: &State, p: &Palette, k: &Kit) -> Option<El> {
 }
 
 /// The Settings sheet over a dimmed window, or nothing while it's closed.
-pub fn settings(s: &State, p: &Palette, k: &Kit) -> Option<El> {
+/// Settings' pages, listed in its sidebar.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum SettingsPage {
+    #[default]
+    General,
+    Projects,
+    Agents,
+    Curator,
+    Storage,
+}
+
+impl SettingsPage {
+    const ALL: [SettingsPage; 5] = [Self::General, Self::Projects, Self::Agents, Self::Curator, Self::Storage];
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::General => "General",
+            Self::Projects => "Projects & Updates",
+            Self::Agents => "Connected Tools",
+            Self::Curator => "Curator",
+            Self::Storage => "Storage",
+        }
+    }
+}
+
+/// Settings: a window-sized sheet with a sidebar of pages. Pushes its own dropdowns after itself,
+/// so they open above it.
+pub fn settings(s: &State, p: &Palette, k: &Kit, layer: &mut Vec<El>) {
     if !s.settings_open {
-        return None;
+        return;
     }
     let st = s.settings;
     let theme = SegmentedControl::new(&["System", "Light", "Dark"], Some(st.theme as usize))
@@ -996,37 +1041,111 @@ pub fn settings(s: &State, p: &Palette, k: &Kit) -> Option<El> {
                 .on_press(|_: &mut State| reveal_path(&feeder_core::data_dir())),
         );
 
-    let body = col()
-        .w_full()
-        .px(24.0)
-        .pt(4.0)
-        .pb(24.0)
-        .gap(24.0)
-        .child(section(p, "Appearance", vec![setting(p, "Theme", None, theme), setting(p, "Orb size", None, size)]))
-        .child(section(
+    let mut pops = Vec::new();
+    let page = match s.settings_page {
+        SettingsPage::General => col().w_full().gap(28.0).child(curator_settings::header(p, "General", "")).child(curator_settings::group(
             p,
-            "Projects and updates",
+            None,
             vec![
-                setting(p, "Order", None, order),
-                setting(p, "Show folder names", Some("Under projects you renamed"), folders),
-                setting(p, "New update banners", Some("A macOS notification when an agent posts"), notify),
-                setting(p, "Menu bar item", Some("Shows working agents and projects that need you"), menubar),
+                curator_settings::labeled(p, "Theme", None, theme),
+                curator_settings::labeled(p, "Orb size", None, size),
+                curator_settings::labeled(p, "New update banners", Some("A macOS notification when an agent posts"), notify),
+                curator_settings::labeled(p, "Menu bar item", Some("Shows working agents and projects that need you"), menubar),
             ],
-        ))
-        .child(agents_section(s, p, k))
-        .child(section(p, "Storage", vec![storage]))
-        .child(uninstall_section(s, p, k))
-        .child(text(format!("Feeder {}", env!("CARGO_PKG_VERSION"))).font(style::META).color(p.text_3).self_center());
+        )),
+        SettingsPage::Projects => col()
+            .w_full()
+            .gap(28.0)
+            .child(curator_settings::header(p, "Projects & Updates", "How projects are sorted and named on Home."))
+            .child(curator_settings::group(
+                p,
+                None,
+                vec![
+                    curator_settings::labeled(p, "Order", None, order),
+                    curator_settings::labeled(p, "Show folder names", Some("Under projects you renamed"), folders),
+                ],
+            )),
+        SettingsPage::Agents => col()
+            .w_full()
+            .gap(28.0)
+            .child(curator_settings::header(
+                p,
+                "Connected Tools",
+                "Tools connected here can post updates to Feeder and read the Notebook. This doesn’t give Curator your subscription.",
+            ))
+            .child(agents_section(s, p, k)),
+        SettingsPage::Curator => curator_settings::pane(s, p, k, &mut pops),
+        SettingsPage::Storage => col()
+            .w_full()
+            .gap(28.0)
+            .child(curator_settings::header(p, "Storage", "Everything Feeder keeps stays on this Mac."))
+            .child(section(p, "Data folder", vec![storage]))
+            .child(uninstall_section(s, p, k))
+            .child(text(format!("Feeder {}", env!("CARGO_PKG_VERSION"))).font(style::META).color(p.text_3)),
+    };
 
-    // In a window shorter than the sheet, the sheet shrinks to the scrim's padding and the
-    // sections scroll under a fixed title row.
-    let panel = col()
+    let mut nav =
+        col().key("settings-nav").w(200.0).h_full().gap(2.0).px(12.0).pt(20.0).pb(16.0).fill(p.bg).role("tablist").label("Settings pages");
+    nav = nav.child(text("Settings").font(style::HEADING).color(p.text).px(10.0).pb(14.0));
+    for page in SettingsPage::ALL {
+        let current = s.settings_page == page;
+        nav = nav.child(
+            row()
+                .key(format!("settings-nav-{page:?}"))
+                .w_full()
+                .px(10.0)
+                .h(30.0)
+                .center_y()
+                .radius(7.0)
+                .role("tab")
+                .checked(current)
+                .label(page.label())
+                .focusable(true)
+                .focus_ring(2.0, 1.0, k.c.border_focus)
+                .fill(if current { p.hover } else { rune::Color::TRANSPARENT })
+                .hover(p.hover)
+                .on_press(move |s: &mut State| {
+                    s.settings_page = page;
+                    s.curator.close_select();
+                })
+                .child(text(page.label()).font(if current { style::NAME } else { style::BODY }).color(if current {
+                    p.text
+                } else {
+                    p.text_2
+                })),
+        );
+    }
+
+    let done = row().w_full().px(20.0).pt(14.0).child(rune::spacer()).child(
+        Button::new("Done")
+            .variant(ButtonVariant::Ghost)
+            .control_size(ControlSize::Small)
+            .on_press(|s: &mut State| s.close_settings())
+            .build(k)
+            .key("settings-done"),
+    );
+
+    let scroll = col()
+        .key("settings-body")
+        .grow(1.0)
+        .min_w(0.0)
+        .min_h(0.0)
+        .child(col().w_full().px(36.0).pt(4.0).pb(32.0).child(page).key(format!("settings-page-{:?}", s.settings_page)))
+        .scroll(ScrollSpec { stick_bottom: false })
+        .scroll_edge_fade(12.0);
+
+    let content = col().grow(1.0).min_w(0.0).h_full().child(done).child(scroll);
+
+    // In a window smaller than the sheet, the sheet shrinks to the scrim's padding and the page
+    // scrolls beside a fixed sidebar.
+    let panel = row()
         .key("settings")
         .role("dialog")
         .label("Settings")
-        .w(480.0)
-        .max_h(720.0)
+        .w(840.0)
+        .h(640.0)
         .shrink()
+        .min_w(0.0)
         .min_h(0.0)
         .radius(16.0)
         .fill(p.card)
@@ -1034,30 +1153,12 @@ pub fn settings(s: &State, p: &Palette, k: &Kit) -> Option<El> {
         .clip_rounded(16.0)
         .shadow(18.0, 60.0, oklch(0.0, 0.0, 0.0).alpha(if p.dark { 0.5 } else { 0.18 }))
         .transition(Transition::scale(0.96).combined(Transition::opacity()))
-        .modal(true, |s: &mut State| s.settings_open = false)
-        .child(
-            row()
-                .w_full()
-                .px(24.0)
-                .pt(20.0)
-                .pb(16.0)
-                .center_y()
-                .child(text("Settings").font(style::HEADING).color(p.text))
-                .child(rune::spacer())
-                .child(Button::new("Done").variant(ButtonVariant::Ghost).on_press(|s: &mut State| s.settings_open = false).build(k)),
-        )
-        .child(
-            col()
-                .key("settings-body")
-                .w_full()
-                .shrink()
-                .min_h(0.0)
-                .child(body)
-                .scroll(ScrollSpec { stick_bottom: false })
-                .scroll_edge_fade(12.0),
-        );
+        .modal(true, |s: &mut State| s.close_settings())
+        .child(nav)
+        .child(el().w(1.0).h_full().fill(p.hairline))
+        .child(content);
 
-    Some(
+    layer.push(
         col()
             .key("settings-scrim")
             .absolute(0.0, 0.0)
@@ -1065,28 +1166,27 @@ pub fn settings(s: &State, p: &Palette, k: &Kit) -> Option<El> {
             .h_full()
             .fill(p.scrim)
             .center()
-            .py(24.0)
+            .padding(24.0)
             .transition(Transition::opacity())
             .child(panel),
-    )
+    );
+    layer.extend(pops);
 }
 
-/// Opens Settings scrolled to Agents, for the places that are about connecting a tool: the empty
-/// Home and "Connect Agents…". Agents sits below Appearance and Projects, out of first view.
-pub fn open_agent_setup(s: &mut State, tx: &mut Tx) {
+/// Opens Settings on Agents, for the places that are about connecting a tool: the empty Home and
+/// "Connect Agents…".
+pub fn open_agent_setup(s: &mut State, _tx: &mut Tx) {
+    s.settings_page = SettingsPage::Agents;
     s.settings_open = true;
-    tx.scroll_key_to(AGENTS_SECTION_KEY, 0.0);
 }
 
 const AGENTS_SECTION_KEY: &str = "settings-agents";
 
-/// Settings → Agents: a row per installed tool with its own connect control, then a config any
+/// Settings → Connected Tools: a row per installed tool with its own connect control, then a config any
 /// other MCP tool can read. Nothing connects until it's pressed.
 fn agents_section(s: &State, p: &Palette, k: &Kit) -> El {
     let note = |t: &str| text(t.to_string()).font(style::META).color(p.text_3).wrap();
-    let mut rows = vec![note(
-        "Connecting a tool adds Feeder's MCP server and two skills to its settings. Agents in that tool can then post updates and use the notebook.",
-    )];
+    let mut rows = vec![note("Connecting a tool adds Feeder's MCP server and two skills to its settings.")];
     match &s.agents.rows {
         None => rows.push(note("Looking for tools on this Mac…")),
         Some(found) if found.is_empty() => {
@@ -1116,7 +1216,7 @@ fn agents_section(s: &State, p: &Palette, k: &Kit) -> El {
             )),
     );
     rows.push(note("Restart a tool after connecting or disconnecting it. Then ask an agent in any project to post a Feeder update."));
-    section(p, "Agents", rows).key(AGENTS_SECTION_KEY)
+    section(p, "Tools on this Mac", rows).key(AGENTS_SECTION_KEY)
 }
 
 /// One installed tool: its mark and name, where it stands under the name, and the one action
@@ -1199,17 +1299,9 @@ fn uninstall_section(s: &State, p: &Palette, k: &Kit) -> El {
 }
 
 fn section(p: &Palette, title: &str, rows: Vec<El>) -> El {
-    let mut c = col().w_full().gap(12.0).child(text(title.to_uppercase()).font(style::LABEL).color(p.text_3));
+    let mut c = col().w_full().gap(12.0).child(text(title.to_string()).font(style::NAME).color(p.text_2));
     for r in rows {
         c = c.child(r);
     }
     c
-}
-
-fn setting(p: &Palette, label: &str, hint: Option<&str>, control: El) -> El {
-    let mut words = col().grow(1.0).min_w(0.0).gap(2.0).child(text(label.to_string()).font(style::NAME).color(p.text).truncate());
-    if let Some(h) = hint {
-        words = words.child(text(h.to_string()).font(style::META).color(p.text_3));
-    }
-    row().w_full().gap(16.0).center_y().child(words).child(control)
 }

@@ -17,7 +17,7 @@ so it opens instantly and stays small. Your Feed and Notebook are stored on your
 1. Download [Feeder.dmg](https://github.com/mattjmdesign/feeder/releases/latest/download/Feeder.dmg),
    open it and drag Feeder into Applications.
 2. Open Feeder.
-3. Go to **Settings → Agents**, press **Connect** next to each tool you use, then restart those tools.
+3. Go to **Settings → Connected Tools**, press **Connect** next to each tool you use, then restart those tools.
 
 Supported tools: Claude Code, Claude Desktop, Codex, Cursor, Antigravity, T3 Code and OpenCode.
 For any other tool, **Copy Config** gives you a snippet to paste into its MCP settings.

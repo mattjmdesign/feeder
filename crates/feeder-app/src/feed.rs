@@ -1,14 +1,15 @@
 //! One project's feed: the orb & brief up top, then every update newest first along a
-//! timeline (or contact-sheet Gallery), plus inline edit, two-way replies, and video playback.
+//! timeline (optionally only updates with media), plus inline edit, two-way replies, and video playback.
 
 use feeder_core::{AttentionKind, FeedUpdate, Orb, ProjectSummary, ago, day_key, day_label, parse_attention};
-use rune::tok::motion;
 use rune::{
-    Cursor, DragItem, El, Key, KeyEvent, ScrollSpec, Spring, SurfaceFit, Transition, Tx, auto_grow, col, el, oklch, row, text, text_input,
+    Cursor, DragItem, El, GrowthSpec, Key, KeyEvent, ScrollSpec, Spring, SurfaceFit, Transition, Tx, auto_grow, col, el, memo, oklch, row,
+    text, text_input,
 };
 use rune_kit::search::Fold;
-use rune_kit::{Button, ButtonVariant, Checkbox, Kit, Markdown, MarkdownStyle, scroll_bar};
+use rune_kit::{Button, ButtonVariant, Kit, Markdown, MarkdownStyle, Menu, MenuItem, SegmentedControl, scroll_bar};
 
+use crate::files::ProjectView;
 use crate::style::{self, Palette};
 use crate::{CopyTarget, State, Tab, agents, chrome, orb, prose};
 
@@ -25,6 +26,7 @@ pub fn visible_feed(s: &State) -> Vec<&FeedUpdate> {
             Some(b) => u.branch.as_deref() == Some(b.as_str()),
             None => true,
         })
+        .filter(|u| !s.project_media_only || u.has_media())
         .filter(|u| {
             query.is_empty()
                 || fold.contains(&u.body, query)
@@ -34,7 +36,7 @@ pub fn visible_feed(s: &State) -> Vec<&FeedUpdate> {
         .collect()
 }
 
-pub fn bar_chrome(s: &State, id: i64, p: &Palette) -> (El, Option<El>) {
+pub fn bar_chrome(s: &State, id: i64, p: &Palette, k: &Kit) -> (El, Option<El>) {
     let (back_text, back_a11y) = match s.tab {
         Tab::Home => ("‹  Home", "Back to Home"),
         Tab::Feed => ("‹  Feed", "Back to Feed"),
@@ -46,47 +48,97 @@ pub fn bar_chrome(s: &State, id: i64, p: &Palette) -> (El, Option<El>) {
         return (back, None);
     };
     let archived = summary.project.archived;
-    let project_todos = s.project_todos(id);
-    let open_todo_count = if s.todos_for == Some(id) {
-        project_todos.iter().filter(|t| !t.done).count()
-    } else {
-        usize::try_from(summary.open_todos.max(0)).unwrap_or(0)
-    };
-    let todo_label = if open_todo_count > 0 { format!("To-Do · {open_todo_count}") } else { "To-Do".to_string() };
-
     // Show in Finder and Pin are on the project's orb menu on Home, so the header doesn't repeat
     // them; Copy Context covers what the old resume prompt did.
     let mut actions = row().gap(4.0).center_y();
+    // Updates is what agents said; Files is what changed on disk.
+    let views = [ProjectView::Updates, ProjectView::Files];
+    actions = actions.child(
+        SegmentedControl::new(&["Updates", "Files"], views.iter().position(|v| *v == s.files.view))
+            .label("Project view")
+            .fit()
+            .on_pick(move |s: &mut State, i: usize, _: &mut Tx| {
+                s.files.view = views.get(i).copied().unwrap_or_default();
+                s.ask();
+            })
+            .build(k)
+            .mr(8.0),
+    );
+    if compact_toolbar(s) {
+        return (back, Some(actions));
+    }
     if !archived {
         actions = actions.child(
             chrome::bar_button("project-curator-btn", "Update Notes", p)
                 .label("Run Curator for this project")
-                .on_press(move |s: &mut State| s.start_project_curator(id)),
+                .on_press_tx(move |s: &mut State, tx: &mut Tx| s.start_project_curator(id, tx)),
         );
     }
-    actions = actions.child(
-        chrome::bar_button("project-todo-btn", &todo_label, p)
-            .label("Open project to-do list")
-            .on_press_tx(move |s: &mut State, tx: &mut Tx| s.open_todo_editor(id, tx)),
-    );
     if s.feed_for == Some(id) && !s.feed.is_empty() {
         let context_label = if s.is_copied(CopyTarget::ProjectContext) { "Copied" } else { "Copy Context" };
-        let payload = handoff_markdown(summary, &s.feed, s.now);
         actions = actions.child(chrome::bar_button("copy-context", context_label, p).on_press_tx(move |s: &mut State, tx: &mut Tx| {
-            tx.copy(payload.clone());
-            s.mark_copied(CopyTarget::ProjectContext);
+            copy_project_context(s, id, tx);
         }));
     }
     actions = actions
-        .child(
-            chrome::bar_button("rename-button", if s.editing.is_some() { "Done" } else { "Rename" }, p)
-                .on_press_tx(|s: &mut State, tx: &mut Tx| if s.editing.is_some() { s.commit_rename() } else { s.start_rename(tx) }),
-        )
+        .child(chrome::bar_button("rename-button", if s.editing.is_some() { "Done" } else { "Rename" }, p).on_press_tx(rename_project))
         .child(
             chrome::bar_button("archive-button", if archived { "Unarchive" } else { "Archive" }, p)
                 .on_press(move |s: &mut State| s.set_archived(id, !archived)),
         );
     (back, Some(actions))
+}
+
+fn compact_toolbar(s: &State) -> bool {
+    s.window_size[0] < 800.0
+}
+
+pub fn project_menu(s: &State, mut menu: Menu) -> Menu {
+    let Some(id) = s.open.filter(|_| compact_toolbar(s)) else { return menu };
+    let Some(summary) = s.summary(id) else { return menu };
+    let archived = summary.project.archived;
+    if !archived {
+        menu = menu.item(MenuItem::new("Update Notes").on_select_tx(move |s: &mut State, tx: &mut Tx| {
+            s.menu_open = false;
+            s.start_project_curator(id, tx);
+        }));
+    }
+    if s.feed_for == Some(id) && !s.feed.is_empty() {
+        menu = menu.item(MenuItem::new("Copy Context").on_select_tx(move |s: &mut State, tx: &mut Tx| {
+            s.menu_open = false;
+            copy_project_context(s, id, tx);
+        }));
+    }
+    let rename = if s.editing.is_some() { "Done Renaming" } else { "Rename" };
+    let archive = if archived { "Unarchive" } else { "Archive" };
+    menu.item(MenuItem::new(rename).on_select_tx(|s: &mut State, tx: &mut Tx| {
+        s.menu_open = false;
+        rename_project(s, tx);
+    }))
+    .item(MenuItem::new(archive).on_select(move |s: &mut State| {
+        s.menu_open = false;
+        s.set_archived(id, !archived);
+    }))
+    .separator()
+}
+
+fn copy_project_context(s: &mut State, id: i64, tx: &mut Tx) {
+    if let Some(summary) = s.summary(id) {
+        tx.copy(handoff_markdown(summary, &s.feed, s.now));
+        s.mark_copied(CopyTarget::ProjectContext);
+    }
+}
+
+fn rename_project(s: &mut State, tx: &mut Tx) {
+    if s.editing.is_some() {
+        s.commit_rename();
+    } else {
+        if s.files.view == ProjectView::Files {
+            s.files.view = ProjectView::Updates;
+            s.ask();
+        }
+        s.start_rename(tx);
+    }
 }
 
 pub fn view(s: &State, id: i64, p: &Palette, k: &Kit, reduced_motion: bool) -> El {
@@ -161,23 +213,33 @@ pub fn view(s: &State, id: i64, p: &Palette, k: &Kit, reduced_motion: bool) -> E
         }
 
         let visible = visible_feed(s);
-        if s.project_gallery {
-            timeline = timeline.child(gallery_grid(s, p, &visible));
-        } else {
+        {
             let n = visible.len();
-            let mut prev_day: Option<i64> = None;
-            for (i, u) in visible.iter().enumerate() {
-                let dk = day_key(u.created_at);
-                if prev_day != Some(dk) {
-                    timeline = timeline.child(day_divider(day_label(u.created_at, s.now), p, i > 0));
-                    prev_day = Some(dk);
+            if n > 0 {
+                let mut rows = col().key("project-posts").w_full().growth(GrowthSpec::default()).virtualize(260.0).on_visible_rows(
+                    |s: &mut State, range| {
+                        s.project_visible_rows = Some(range);
+                        crate::media::sync(s);
+                        false
+                    },
+                );
+                let mut prev_day: Option<i64> = None;
+                for (i, u) in visible.iter().enumerate() {
+                    let dk = day_key(u.created_at);
+                    let mut row_el = col().key(format!("u-{}", u.id)).w_full();
+                    if prev_day != Some(dk) {
+                        row_el = row_el.child(day_divider(day_label(u.created_at, s.now), p, i > 0));
+                        prev_day = Some(dk);
+                    }
+                    let same_next = visible.get(i + 1).is_some_and(|next| day_key(next.created_at) == dk);
+                    rows = rows.child(row_el.child(entry(s, (p, k, &md), u, &summary.project.orb, i == 0, !same_next)));
                 }
-                let same_next = visible.get(i + 1).is_some_and(|next| day_key(next.created_at) == dk);
-                timeline = timeline.child(entry(s, (p, k, &md), u, &summary.project.orb, i == 0, !same_next));
-            }
-            if n == 0 {
+                timeline = timeline.child(rows);
+            } else {
                 let empty_msg = if !s.project_search.text.trim().is_empty() {
                     "No updates match this filter."
+                } else if s.project_media_only {
+                    "No updates with media yet."
                 } else if s.branch_filter.is_some() {
                     "No updates on this branch."
                 } else {
@@ -186,6 +248,7 @@ pub fn view(s: &State, id: i64, p: &Palette, k: &Kit, reduced_motion: bool) -> E
                 timeline = timeline.child(text(empty_msg).font(style::META).color(p.text_3).self_center().py(16.0));
             }
             if s.branch_filter.is_none()
+                && !s.project_media_only
                 && s.project_search.text.trim().is_empty()
                 && s.feed.len() >= s.limit
                 && (s.feed.len() as i64) < summary.updates
@@ -209,19 +272,15 @@ pub fn view(s: &State, id: i64, p: &Palette, k: &Kit, reduced_motion: bool) -> E
         .child(col().w_full().items_center().px(28.0).pt(36.0).pb(80.0).child(column))
         .scroll(ScrollSpec { stick_bottom: false })
         .scroll_edge_fade(24.0);
-    let scroller = scroll_bar(k, "feed-scroll-area", "feed-scroll", viewport).w_full().grow(1.0).min_h(0.0);
+    let scroller = scroll_bar(k, "feed-scroll-area", &format!("feed-scroll-{id}"), viewport).w_full().grow(1.0).min_h(0.0);
 
-    col().key("feed").w_full().grow(1.0).min_h(0.0).transition(Transition::opacity()).child(scroller)
+    col().key("feed").w_full().grow(1.0).min_h(0.0).transition(Transition::none()).child(scroller)
 }
 
-fn intro_extras(s: &State, p: &Palette, k: &Kit, summary: &ProjectSummary, mut intro: El) -> El {
+fn intro_extras(s: &State, p: &Palette, k: &Kit, summary: &ProjectSummary, intro: El) -> El {
     let id = summary.project.id;
     let has_brief = s.brief_editing == Some(id) || summary.project.brief.as_deref().map(str::trim).is_some_and(|b| !b.is_empty());
-    let todos = s.project_todos(id);
-    let show_todo = s.todo_open == Some(id) || !todos.is_empty();
-
-    // The header's To-Do button adds to-dos, so this row only offers the brief.
-    if !has_brief && !show_todo {
+    if !has_brief {
         return intro.child(
             row().key("intro-actions").mt(4.0).center_y().child(
                 chrome::bar_button("add-brief", "+ Add Project Brief", p)
@@ -231,166 +290,7 @@ fn intro_extras(s: &State, p: &Palette, k: &Kit, summary: &ProjectSummary, mut i
         );
     }
 
-    intro = intro.child(brief_card(s, p, k, summary));
-    if show_todo {
-        intro = intro.child(todo_card(s, p, k, id, todos));
-    }
-    intro
-}
-
-fn todo_card(s: &State, p: &Palette, k: &Kit, id: i64, todos: &[feeder_core::TodoItem]) -> El {
-    let open_count = todos.iter().filter(|t| !t.done).count();
-    let done_count = todos.len().saturating_sub(open_count);
-    let status_label = if todos.is_empty() {
-        None
-    } else if open_count == 0 {
-        Some("All done".to_string())
-    } else {
-        Some(format!("{open_count} open"))
-    };
-
-    let mut header = row().w_full().center_y().gap(8.0).child(text("TO-DO").font(style::LABEL).color(p.text_3));
-    if let Some(status) = status_label {
-        header = header.child(text(status).font(style::META).color(p.text_3));
-    }
-    header = header.child(rune::spacer());
-
-    if s.todo_clear_confirm == Some(id) {
-        header = header
-            .child(text("Clear list?").font(style::META).color(p.text_2))
-            .child(
-                chrome::bar_button("todo-clear-cancel", "Cancel", p).h(22.0).px(8.0).on_press(|s: &mut State| s.todo_clear_confirm = None),
-            )
-            .child(
-                chrome::bar_button("todo-clear-confirm", "Clear All", p)
-                    .h(22.0)
-                    .px(8.0)
-                    .border(1.0, p.amber.alpha(0.5))
-                    .on_press(move |s: &mut State| s.clear_project_todos(id)),
-            );
-    } else {
-        if done_count > 0 {
-            header = header.child(
-                chrome::bar_button("todo-clear-done", "Clear Done", p)
-                    .h(22.0)
-                    .px(8.0)
-                    .on_press(move |s: &mut State| s.clear_completed_todos(id)),
-            );
-        }
-        if !todos.is_empty() {
-            header = header.child(
-                chrome::bar_button("todo-clear-all", "Clear All", p)
-                    .h(22.0)
-                    .px(8.0)
-                    .on_press(move |s: &mut State| s.todo_clear_confirm = Some(id)),
-            );
-        } else {
-            header = header.child(
-                chrome::bar_button("todo-close-empty", "×", p)
-                    .label("Close empty to-do list")
-                    .h(22.0)
-                    .px(8.0)
-                    .on_press(|s: &mut State| s.close_empty_todo()),
-            );
-        }
-    }
-
-    let mut items_col = col().w_full().gap(4.0);
-    for item in todos {
-        let tid = item.id;
-        let check = Checkbox::new(item.done)
-            .hide_label()
-            .label(format!("Toggle {}", item.title))
-            .on_toggle(move |s: &mut State| s.toggle_todo(tid))
-            .build(k);
-
-        let middle = if s.todo_editing == Some(tid) {
-            let edit_field = text_input(&s.todo_edit_draft, style::BODY)
-                .key(format!("todo-edit-{tid}"))
-                .label("Edit to-do item")
-                .single_line()
-                .grow(1.0)
-                .min_w(0.0)
-                .color(p.text)
-                .caret(p.text, p.selection)
-                .on_edit(|s: &mut State| &mut s.todo_edit_draft)
-                .on_submit(|s: &mut State, _tx: &mut Tx| s.save_todo_edit())
-                .on_input_key(|s: &mut State, e: &KeyEvent, _tx: &mut Tx| {
-                    if matches!(e.key, Key::Escape) {
-                        s.todo_editing = None;
-                        return true;
-                    }
-                    false
-                });
-            row().grow(1.0).min_w(0.0).px(8.0).py(4.0).radius(6.0).fill(p.bg).border(1.0, p.hairline).child(edit_field)
-        } else {
-            let mut label_el = text(item.title.clone()).font(style::BODY).color(if item.done { p.text_3 } else { p.text }).wrap();
-            if item.done {
-                label_el = label_el.strike(0, item.title.len(), Some(p.text_3));
-            }
-            el().grow(1.0)
-                .min_w(0.0)
-                .py(2.0)
-                .cursor(Cursor::Text)
-                .on_press_tx(move |s: &mut State, tx: &mut Tx| s.start_edit_todo(tid, tx))
-                .child(label_el)
-        };
-
-        let del = chrome::bar_button(&format!("todo-del-{tid}"), "×", p)
-            .label(format!("Delete {}", item.title))
-            .h(22.0)
-            .px(6.0)
-            .on_press(move |s: &mut State| s.delete_todo(tid));
-
-        items_col =
-            items_col.child(row().key(format!("todo-item-{tid}")).w_full().gap(8.0).center_y().child(check).child(middle).child(del));
-    }
-
-    let add_field = text_input(&s.todo_draft, style::BODY)
-        .key("todo-add-input")
-        .label("Add a to-do item")
-        .single_line()
-        .grow(1.0)
-        .min_w(0.0)
-        .color(p.text)
-        .caret(p.text, p.selection)
-        .placeholder("Add a to-do…", p.text_3)
-        .on_edit(|s: &mut State| &mut s.todo_draft)
-        .on_submit(move |s: &mut State, tx: &mut Tx| s.submit_todo(id, tx))
-        .on_input_key(|s: &mut State, e: &KeyEvent, _tx: &mut Tx| {
-            if matches!(e.key, Key::Escape) {
-                s.close_empty_todo();
-                return true;
-            }
-            false
-        });
-
-    let mut add_row = row().w_full().gap(8.0).px(10.0).py(6.0).center_y().radius(8.0).fill(p.bg).border(1.0, p.hairline).child(add_field);
-    if !s.todo_draft.text.trim().is_empty() {
-        add_row = add_row.child(
-            chrome::bar_button("todo-add-submit", "Add", p)
-                .h(22.0)
-                .px(8.0)
-                .border(1.0, p.hairline)
-                .on_press_tx(move |s: &mut State, tx: &mut Tx| s.submit_todo(id, tx)),
-        );
-    }
-
-    let mut card = col()
-        .key("todo-card")
-        .w_full()
-        .max_w(COLUMN)
-        .mt(8.0)
-        .padding(14.0)
-        .gap(10.0)
-        .radius(12.0)
-        .fill(p.card)
-        .border(1.0, p.hairline)
-        .child(header);
-    if !todos.is_empty() {
-        card = card.child(items_col);
-    }
-    card.child(add_row)
+    intro.child(brief_card(s, p, k, summary))
 }
 
 fn brief_card(s: &State, p: &Palette, k: &Kit, summary: &ProjectSummary) -> El {
@@ -559,91 +459,13 @@ fn project_toolbar(s: &State, p: &Palette, has_media: bool) -> El {
     }
     if has_media {
         bar = bar
-            .child(chip("pv-all", "Updates", !s.project_gallery).on_press(|s: &mut State| s.project_gallery = false))
-            .child(chip("pv-gallery", "Gallery", s.project_gallery).on_press(|s: &mut State| s.project_gallery = true));
+            .child(chip("pv-all", "All", !s.project_media_only).on_press(|s: &mut State| s.project_media_only = false))
+            .child(chip("pv-media", "With media", s.project_media_only).on_press(|s: &mut State| s.project_media_only = true));
     }
     if let Some(branch) = &s.branch_filter {
         bar = bar.child(chip("pv-branch-clear", &format!("Branch: {branch} ×"), true).on_press(|s: &mut State| s.branch_filter = None));
     }
     bar
-}
-
-fn gallery_grid(s: &State, p: &Palette, visible: &[&FeedUpdate]) -> El {
-    let mut items: Vec<(&FeedUpdate, usize, usize, crate::MediaSlide)> = Vec::new();
-    for &u in visible {
-        let slides = crate::media_slides(u);
-        let total = slides.len();
-        for (idx, slide) in slides.into_iter().enumerate() {
-            items.push((u, idx, total, slide));
-        }
-    }
-    if items.is_empty() {
-        return text("No media attached yet.").font(style::META).color(p.text_3).self_center().py(24.0);
-    }
-    let tile_w = (COLUMN - 14.0) / 2.0;
-    let mut grid = row().key("gallery-grid").w_full().flex_wrap().gap(14.0);
-    for (u, slide_idx, total_slides, slide) in items {
-        let mid = slide.id;
-        let thumb_h = 196.0;
-        let mut media = if let Some(img) = s.shots.get(&mid) {
-            el().w_full().h(thumb_h).pixels_fit(img.pixels(), SurfaceFit::Fit)
-        } else if let Some(player) = s.videos.get(&mid) {
-            el().w_full().h(thumb_h).video(player, SurfaceFit::Fit).child(
-                el().pin(None, Some(8.0), Some(8.0), None)
-                    .px(7.0)
-                    .py(2.0)
-                    .radius(5.0)
-                    .fill(p.bg.alpha(0.8))
-                    .child(text("Video").font(style::META).color(p.text)),
-            )
-        } else {
-            el().w_full().h(thumb_h).fill(p.hover).center().child(text("Loading…").font(style::META).color(p.text_3))
-        };
-
-        if total_slides > 1 {
-            media = media.child(
-                el().pin(Some(8.0), Some(8.0), None, None)
-                    .px(7.0)
-                    .py(2.0)
-                    .radius(6.0)
-                    .fill(oklch(0.10, 0.0, 0.0).alpha(0.72))
-                    .border(1.0, oklch(1.0, 0.0, 0.0).alpha(0.16))
-                    .child(text(format!("{}/{}", slide_idx + 1, total_slides)).font(style::META).color(oklch(0.96, 0.0, 0.0))),
-            );
-        }
-
-        let mut footer = row()
-            .w_full()
-            .px(10.0)
-            .py(8.0)
-            .gap(6.0)
-            .center_y()
-            .child(agents::mark(&u.agent, p, 12.0, s.agent_icon(&u.agent)))
-            .child(text(u.agent.clone()).font(style::META).color(p.text_2).truncate().shrink());
-        if let Some(b) = &u.branch {
-            footer = footer.child(text(b.clone()).font(style::PATH).color(p.text_3).truncate().max_w(110.0));
-        }
-        footer = footer.child(rune::spacer()).child(text(ago(u.created_at, s.now)).font(style::META).color(p.text_3));
-
-        grid = grid.child(
-            col()
-                .key(format!("gal-{mid}"))
-                .role("button")
-                .label("Open media")
-                .focusable(true)
-                .w(tile_w)
-                .radius(12.0)
-                .fill(p.card)
-                .border(1.0, p.hairline)
-                .cursor(Cursor::Pointer)
-                .press_scale(0.985)
-                .on_press_tx(move |s: &mut State, tx: &mut Tx| s.open_lightbox(mid, tx))
-                .child(media)
-                .child(rune::rule(1.0, p.hairline))
-                .child(footer),
-        );
-    }
-    grid
 }
 
 pub fn day_divider(label: String, p: &Palette, spaced: bool) -> El {
@@ -844,6 +666,32 @@ pub fn card_actions(s: &State, p: &Palette, u: &FeedUpdate) -> El {
     row().gap(2.0).center_y().child(copy_btn).child(edit_btn).child(reply_btn).child(flag_btn).child(delete_btn)
 }
 
+/// While this update's flag waits for Curator: a quiet "Flagged" pill that opens the review.
+/// Once Curator writes the note, `notebook_link` takes over, so the card always shows where it is.
+pub fn flag_pill(s: &State, p: &Palette, u: &FeedUpdate) -> Option<El> {
+    if !s.open_flag_for_update(u.id) {
+        return None;
+    }
+    let (uid, project_id) = (u.id, u.project_id);
+    Some(
+        row()
+            .key(format!("flagged-u-{uid}"))
+            .role("button")
+            .label("Flagged for Notebook, review with Curator")
+            .help("Review with Curator")
+            .focusable(true)
+            .px(7.0)
+            .py(1.5)
+            .radius(5.0)
+            .center_y()
+            .border(1.0, p.hairline)
+            .hover(p.hover)
+            .cursor(Cursor::Pointer)
+            .on_press_tx(move |s: &mut State, tx: &mut Tx| s.open_flag_review(Some(project_id), tx))
+            .child(text("Flagged · Review").font(style::META).color(p.text_2)),
+    )
+}
+
 /// A quiet link to the Notebook page written from this Feed update, when one exists.
 pub fn notebook_link(s: &State, p: &Palette, update_id: i64) -> Option<El> {
     let change = s.notebook.gardener.changes.iter().find(|c| !c.is_reverted() && c.source_updates.contains(&update_id))?;
@@ -905,6 +753,10 @@ fn entry(s: &State, (p, k, md): (&Palette, &Kit, &MarkdownStyle), u: &FeedUpdate
         tags = tags.child(badge);
         has_tags = true;
     }
+    if let Some(flag) = flag_pill(s, p, u) {
+        tags = tags.child(flag);
+        has_tags = true;
+    }
 
     let border_color = if selected {
         accent.alpha(0.75)
@@ -936,16 +788,7 @@ fn entry(s: &State, (p, k, md): (&Palette, &Kit, &MarkdownStyle), u: &FeedUpdate
         card = card.child(replies);
     }
 
-    row()
-        .key(format!("u-{}", u.id))
-        .w_full()
-        .gap(12.0)
-        .pb(20.0)
-        .items_stretch()
-        .transition(Transition::opacity())
-        .motion(motion::DEFAULT)
-        .child(rail)
-        .child(card)
+    row().w_full().gap(12.0).pb(20.0).items_stretch().child(rail).child(card)
 }
 
 pub fn edit_or_body(s: &State, p: &Palette, k: &Kit, md: &MarkdownStyle, u: &FeedUpdate, strong: bool) -> El {
@@ -981,10 +824,16 @@ pub fn edit_or_body(s: &State, p: &Palette, k: &Kit, md: &MarkdownStyle, u: &Fee
                     .child(text("⌘Enter to save").font(style::META).color(p.text_3))
                     .child(rune::spacer())
                     .child(Button::new("Cancel").variant(ButtonVariant::Ghost).on_press(|s: &mut State| s.editing_update = None).build(k))
-                    .child(Button::new("Save").variant(ButtonVariant::Submit).on_press(|s: &mut State| s.save_update_edit()).build(k)),
+                    .child(
+                        Button::new("Save")
+                            .variant(ButtonVariant::Submit)
+                            .disabled(s.edit_update_body.text.trim().is_empty())
+                            .on_press(|s: &mut State| s.save_update_edit())
+                            .build(k),
+                    ),
             );
     }
-    body(p, md, u, strong)
+    memo(format!("f-body-{uid}"), (p.dark, strong, &u.body), || body(p, md, u, strong))
 }
 
 /// An update's text: each paragraph under its label, as Markdown.
@@ -1092,7 +941,13 @@ pub fn replies_section(s: &State, p: &Palette, k: &Kit, u: &FeedUpdate) -> Optio
                 .gap(8.0)
                 .center_y()
                 .child(row().grow(1.0).min_w(0.0).h(30.0).px(10.0).center_y().radius(8.0).fill(p.bg).border(1.0, p.hairline).child(input))
-                .child(Button::new("Send").variant(ButtonVariant::Submit).on_press(move |s: &mut State| s.submit_reply(uid)).build(k))
+                .child(
+                    Button::new("Send")
+                        .variant(ButtonVariant::Submit)
+                        .disabled(s.reply_draft.text.trim().is_empty())
+                        .on_press(move |s: &mut State| s.submit_reply(uid))
+                        .build(k),
+                )
                 .child(Button::new("Cancel").variant(ButtonVariant::Ghost).on_press(|s: &mut State| s.replying_to = None).build(k)),
         );
     }

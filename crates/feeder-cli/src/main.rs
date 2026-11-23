@@ -509,7 +509,11 @@ fn run(command: Command) -> Result<(), String> {
                 let diff = u.diff_stat.as_deref().map(|d| format!(" · {d}")).unwrap_or_default();
                 println!("── {} · {}{branch}{diff} (#{})", u.agent, ago(u.created_at, now), u.id);
                 println!("{}", u.body);
-                if let Some(shot) = &u.screenshot {
+                if !u.media.is_empty() {
+                    for m in &u.media {
+                        println!("[media] {}", m.path.display());
+                    }
+                } else if let Some(shot) = &u.screenshot {
                     println!("[media] {}", shot.display());
                 }
                 for r in replies.iter().filter(|r| r.update_id == u.id) {
@@ -610,9 +614,14 @@ fn run(command: Command) -> Result<(), String> {
             let p = resolve_existing(&store, project.as_deref())?;
             if clear {
                 store.set_project_brief(p.id, None).map_err(|e| e.to_string())?;
-            } else if !text.is_empty() || !std::io::stdin().is_terminal() {
+            } else if !text.is_empty() {
                 let body = read_body(text)?;
                 store.set_project_brief(p.id, Some(&body)).map_err(|e| e.to_string())?;
+            } else if !std::io::stdin().is_terminal() {
+                let body = read_body(text)?;
+                if !body.trim().is_empty() {
+                    store.set_project_brief(p.id, Some(&body)).map_err(|e| e.to_string())?;
+                }
             }
             let updated = store.project(p.id).map_err(|e| e.to_string())?.ok_or("project vanished")?;
             if json {
@@ -885,7 +894,11 @@ fn run(command: Command) -> Result<(), String> {
                 let branch = u.branch.as_deref().map(|b| format!(" · {b}")).unwrap_or_default();
                 println!("── {proj} · {} · {}{branch} (#{})", u.agent, ago(u.created_at, now), u.id);
                 println!("{}", u.body);
-                if let Some(shot) = &u.screenshot {
+                if !u.media.is_empty() {
+                    for m in &u.media {
+                        println!("[media] {}", m.path.display());
+                    }
+                } else if let Some(shot) = &u.screenshot {
                     println!("[media] {}", shot.display());
                 }
             }

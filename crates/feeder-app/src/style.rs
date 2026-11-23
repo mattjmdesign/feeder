@@ -60,6 +60,12 @@ pub fn palette(dark: bool) -> Palette {
 pub fn kit(p: &Palette) -> Kit {
     let mut k = Kit::from_palette(PaletteSeed { bg: p.card, fg: p.text, accent: oklch(0.65, 0.14, 255.0) });
     k.c.bg_deep = p.bg;
+    // rune-kit paints switch knobs in the text colour, which is near-black in light mode, so a
+    // switch read as disabled. macOS knobs are light on both themes.
+    if !p.dark {
+        k.c.knob = p.card;
+        k.c.knob_on = p.card;
+    }
     // rune-kit's 11 pt captions join the app's 12 pt step, so its controls stay on the scale.
     let t = &mut k.ty;
     t.small = TextStyle::new(12.0, t.small.weight).lh(16.0);

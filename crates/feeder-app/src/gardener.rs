@@ -6,15 +6,13 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 use feeder_core::gardener::{
-    Backend, ChatOpening, ChatSummary, Event, RunStatus, Scope, Session, SessionEnv, SessionMode, StoredEvent, ToolCall,
+    Backend, ChatOpening, ChatSummary, Event, OPENING, RunStatus, Scope, Session, SessionEnv, SessionMode, StoredEvent, ToolCall,
 };
-use feeder_core::{Change, ago};
-use rune::{Cursor, El, Icon, Key, KeyEvent, TextEdit, Tx, col, el, icon, row, text};
+use feeder_core::{Change, Flag, ago};
+use rune::{Cursor, El, Icon, TextEdit, Tx, Waker, col, el, icon, row, text};
 use rune_kit::diff::{FileDiff, LineKind};
 use rune_kit::shell::{Sidebar, SidebarRow, SidebarSection};
-use rune_kit::{
-    Badge, BadgeVariant, Button, ButtonVariant, Card, ControlSize, Divider, IconButton, IconButtonVariant, Kit, Placement, Select, Spinner,
-};
+use rune_kit::{Badge, BadgeVariant, Button, ButtonVariant, Card, ControlSize, Divider, IconButton, IconButtonVariant, Kit, Spinner};
 
 use crate::State;
 use crate::style::{self, Palette};
@@ -145,13 +143,24 @@ impl Chat {
         changed
     }
 
-    fn session_send(&self, message: String) {
+    fn session_send(&self, message: String, wake: Option<Waker>) {
         let session = Arc::clone(&self.session);
         let inbox = Arc::clone(&self.inbox);
         std::thread::spawn(move || {
             let sent = session.lock().unwrap_or_else(|e| e.into_inner()).as_ref().map(|s| s.send(&message));
-            if let Some(Err(e)) = sent {
-                inbox.lock().unwrap_or_else(|e| e.into_inner()).push(Event::Failed(e.to_string()));
+            let err = match sent {
+                Some(Ok(())) => None,
+                Some(Err(e)) => Some(e.to_string()),
+                None => Some("This Curator session has already ended. Start a new chat to continue.".into()),
+            };
+            if let Some(why) = err {
+                let mut pending = inbox.lock().unwrap_or_else(|e| e.into_inner());
+                pending.push(Event::Failed(why));
+                pending.push(Event::Ended);
+                drop(pending);
+                if let Some(wake) = wake {
+                    wake();
+                }
             }
         });
     }
@@ -227,11 +236,12 @@ impl State {
         match self.notebook.chat.phase {
             Phase::Working => {}
             Phase::Ready => {
+                let wake = self.wake.clone();
                 let chat = &mut self.notebook.chat;
                 chat.input = TextEdit::new("");
                 chat.items.push(Item::You(typed.clone()));
                 chat.phase = Phase::Working;
-                chat.session_send(typed);
+                chat.session_send(typed, wake);
             }
             Phase::Idle | Phase::Ended => self.gardener_start(self.notebook.chat.scope, mode, typed, None),
         }
@@ -244,8 +254,12 @@ impl State {
             _ => None,
         });
         let scope = self.notebook.chat.scope;
+        let backend = self.notebook.chat.backend;
         self.gardener_close();
         self.notebook.chat.scope = scope;
+        if let Some(backend) = backend {
+            self.notebook.curator_backend = Some(backend);
+        }
         if let Some(question) = last {
             self.notebook.chat.input = TextEdit::new(question);
             self.gardener_submit();
@@ -297,9 +311,9 @@ impl State {
     }
 
     /// Opens the Curator page pre-scoped to `project_id` so the user can review scope before starting.
-    pub fn start_project_curator(&mut self, project_id: i64) {
-        self.open = None;
-        self.tab = crate::Tab::Notebook;
+    pub fn start_project_curator(&mut self, project_id: i64, tx: &mut Tx) {
+        self.close_project();
+        self.select_tab(crate::Tab::Notebook, tx);
         self.notebook_shelf(crate::notebook::Shelf::Gardener);
         if self.notebook.chat.phase == Phase::Working {
             return;
@@ -314,9 +328,12 @@ impl State {
     fn gardener_start(&mut self, scope: Scope, mode: SessionMode, message: String, job: Option<&'static str>) {
         let Some(backend) = selected_backend(self) else { return };
         let Some(wake) = self.wake.clone() else { return };
+        let mut env = SessionEnv::detect();
+        env.run = self.curator.prefs.run(backend);
         if self.notebook.gardener.running.is_some() {
             return;
         }
+        self.curator_sign_in.begin_run();
         let chat = &mut self.notebook.chat;
         *chat = Chat::default();
         if job.is_none() {
@@ -340,7 +357,7 @@ impl State {
                 Some(title) => ChatOpening::Job { title, prompt: &message },
                 None => ChatOpening::Message(&message),
             };
-            match Session::start_curator_chat(backend, SessionEnv::detect(), scope, mode, opening, sink) {
+            match Session::start_curator_chat(backend, env, scope, mode, opening, sink) {
                 Ok(session) => {
                     let mut slot = slot.lock().unwrap_or_else(|e| e.into_inner());
                     if stop_requested.load(Ordering::Acquire) {
@@ -360,7 +377,7 @@ impl State {
         });
     }
 
-    fn gardener_stop(&mut self) {
+    pub(crate) fn gardener_stop(&mut self) {
         let chat = &self.notebook.chat;
         chat.stop_requested.store(true, Ordering::Release);
         let session = Arc::clone(&chat.session);
@@ -376,36 +393,86 @@ impl State {
         self.gardener_stop();
         self.notebook.chat = Chat::default();
     }
+
+    /// Starts a Review run over the open flags in the chat's scope.
+    fn gardener_review_flags(&mut self) {
+        if matches!(self.notebook.chat.phase, Phase::Idle | Phase::Ended) && self.notebook.chat.viewing.is_none() {
+            let scope = self.notebook.chat.scope;
+            self.gardener_start(scope, SessionMode::Review, OPENING.to_string(), Some(REVIEW_JOB));
+        }
+    }
 }
 
-/// The provider a new chat runs on: the person's pick if it's still installed, else the first found.
+/// The saved-chat title for a Review run started from the flag card.
+const REVIEW_JOB: &str = "Review Flagged Updates";
+
+/// Open flags inside the chat's scope.
+pub fn scoped_flags(s: &State) -> Vec<&Flag> {
+    let scope = s.notebook.chat.scope;
+    let page_project = |id| s.notebook.page(id).and_then(|page| page.project_id);
+    s.notebook
+        .gardener
+        .open_flags
+        .iter()
+        .filter(|flag| {
+            let page_project_id = flag.page_id.and_then(page_project);
+            scope.includes(flag.project_id.or(page_project_id)) && page_project_id.is_none_or(|id| scope.includes(Some(id)))
+        })
+        .collect()
+}
+
+/// Above a fresh composer when flags are waiting: how many, and one button to review them.
+/// Nothing at zero, so the empty composer stays clean.
+fn review_card(s: &State, p: &Palette, k: &Kit) -> Option<El> {
+    let chat = &s.notebook.chat;
+    if chat.viewing.is_some() || !matches!(chat.phase, Phase::Idle | Phase::Ended) {
+        return None;
+    }
+    let n = scoped_flags(s).len();
+    if n == 0 {
+        return None;
+    }
+    let g = &s.notebook.gardener;
+    let ready = selected_backend(s).is_some() && g.running.is_none();
+    let title = if n == 1 { "1 flagged update to review".to_string() } else { format!("{n} flagged updates to review") };
+    Some(
+        row()
+            .key("gardener-review-card")
+            .role("group")
+            .label(title.clone())
+            .w_full()
+            .gap(10.0)
+            .px(14.0)
+            .py(10.0)
+            .radius(10.0)
+            .border(1.0, p.hairline)
+            .center_y()
+            .child(el().size(6.0, 6.0).radius(3.0).fill(p.amber))
+            .child(text(title).font(style::META).color(p.text).truncate().shrink().min_w(0.0))
+            .child(rune::spacer())
+            .child(
+                Button::new("Review Now")
+                    .variant(ButtonVariant::Outline)
+                    .control_size(ControlSize::Small)
+                    .disabled(!ready)
+                    .on_press(|s: &mut State| s.gardener_review_flags())
+                    .build(k)
+                    .key("gardener-review-flags"),
+            ),
+    )
+}
+
+/// The subscription a new chat runs on. `None` until one is turned on in Settings → Curator.
 pub fn selected_backend(s: &State) -> Option<Backend> {
-    let installed = &s.notebook.gardener.backends;
-    s.notebook.curator_backend.filter(|b| installed.contains(b)).or_else(|| installed.first().copied())
+    crate::curator_settings::selected(s)
 }
 
-/// The provider picker beside the send button. Locked to the running chat's provider mid-chat.
+/// The model picker beside the send button. Shows the running chat's subscription mid-chat.
 fn provider_picker(s: &State, p: &Palette, k: &Kit, layer: &mut Vec<El>) -> Option<El> {
-    let installed = &s.notebook.gardener.backends;
     let chat = &s.notebook.chat;
     let locked = matches!(chat.phase, Phase::Working | Phase::Ready);
     let current = if locked { chat.backend } else { selected_backend(s) }?;
-    let labels: Vec<&str> = if locked { vec![current.label()] } else { installed.iter().map(|b| b.label()).collect() };
-    let choices = installed.clone();
-    let mark = crate::agents::mark(current.label(), p, 14.0, s.agent_icon(current.label()));
-    let select = Select::new("gardener-provider", &labels)
-        .label("Provider")
-        .current(Some(current.label()))
-        .open(s.notebook.provider_open && !locked)
-        .placement(Placement::TopEnd)
-        .on_toggle(|s: &mut State| s.notebook.provider_open = !s.notebook.provider_open)
-        .on_close(|s: &mut State| s.notebook.provider_open = false)
-        .on_choose(move |s: &mut State, chosen: &str, _| {
-            s.notebook.curator_backend = choices.iter().copied().find(|b| b.label() == chosen);
-            s.notebook.provider_open = false;
-        })
-        .build(k, layer);
-    Some(row().gap(2.0).center_y().child(mark).child(select))
+    Some(crate::curator_settings::picker(s, current, locked, p, k, layer))
 }
 
 /// Current live status text while Curator is working.
@@ -430,6 +497,30 @@ pub fn view(s: &State, p: &Palette, k: &Kit, max_w: f32, reduced_motion: bool) -
 fn is_fresh(s: &State) -> bool {
     let chat = &s.notebook.chat;
     chat.items.is_empty() && chat.phase == Phase::Idle
+}
+
+/// True when Curator has no messages, is idle, isn't viewing a saved thread, and has no recent
+/// changes to list — so the composer sits centred instead of pinned to the bottom of a blank page.
+pub fn is_empty_idle(s: &State) -> bool {
+    if !is_fresh(s) || s.notebook.chat.viewing.is_some() {
+        return false;
+    }
+    let scope = s.notebook.chat.scope;
+    !s.notebook.gardener.changes.iter().any(|c| scope.includes(s.notebook.page(c.page_id).and_then(|pg| pg.project_id)))
+}
+
+/// Centred composer for an empty Curator chat, with any active scope/status bar directly above it.
+pub fn empty_view(s: &State, p: &Palette, k: &Kit, max_w: f32, layer: &mut Vec<El>) -> El {
+    let mut stack = col().key("gardener-empty").w_full().items_center();
+    if let Some(bar) = top_bar(s, p, k) {
+        stack = stack.child(col().w_full().max_w(max_w.min(CHAT_MAX_W)).px(40.0).child(bar));
+    }
+    if let Some(card) = review_card(s, p, k) {
+        // Same edges as the composer box below it.
+        stack = stack.child(col().w_full().items_center().px(40.0).pb(4.0).child(card.max_w(max_w.min(CHAT_MAX_W))));
+    }
+    stack = stack.child(composer(s, p, k, max_w, layer));
+    col().w_full().grow(1.0).min_h(0.0).justify_center().items_center().pb(48.0).child(stack)
 }
 
 /// Compact bar shown only when there is an active control, scope chip, or status to display.
@@ -489,24 +580,50 @@ fn status_line(s: &State, p: &Palette) -> Option<El> {
     }
     let backend = chat.backend.or_else(|| g.backends.first().copied());
     let line = match (backend, &g.running, &g.last_run) {
-        (None, _, _) => "Install and sign in to Claude Code or Codex to run Curator.".to_string(),
+        (None, _, _) if g.backends.is_empty() => "Install Claude Code, Codex, OpenCode, or Antigravity to use Curator.".to_string(),
+        (None, _, _) => return None,
         (_, Some(run), _) => format!("Active run started {}", ago(run.started_at, s.now)),
         (_, None, Some(run)) if run.status == RunStatus::Failed => {
-            format!("Last run failed {}: {}", ago(run.started_at, s.now), run.error.clone().unwrap_or_default())
+            let when = ago(run.started_at, s.now);
+            match run.error.as_deref().map(str::trim).filter(|e| !e.is_empty()) {
+                Some(err) => format!("Last run failed {when}: {err}"),
+                None => format!("Last run failed {when}"),
+            }
         }
         (_, None, _) => return None,
     };
-    Some(text(line).font(style::META).color(p.text_3).wrap())
+    Some(text(line).font(style::META).color(p.text_3).wrap().shrink().min_w(0.0))
 }
 
 /// Pinned composer using native `rune_kit::TextInput` and `Button`.
 pub fn composer(s: &State, p: &Palette, k: &Kit, max_w: f32, layer: &mut Vec<El>) -> El {
     let chat = &s.notebook.chat;
-    // A saved thread is a record; New Chat in the sidebar starts the next conversation.
+    // A saved thread is a record: say so where the composer would be, with the way forward.
     if chat.viewing.is_some() {
-        return el();
+        let bar = row()
+            .key("gardener-saved-bar")
+            .w_full()
+            .max_w(max_w.min(CHAT_MAX_W))
+            .gap(8.0)
+            .px(14.0)
+            .py(8.0)
+            .radius(COMPOSER_RADIUS)
+            .border(1.0, p.hairline)
+            .center_y()
+            .child(text("Saved chat · Read-only").font(style::META).color(p.text_3))
+            .child(rune::spacer())
+            .child(
+                Button::new("New Chat")
+                    .variant(ButtonVariant::Outline)
+                    .control_size(ControlSize::Small)
+                    .on_press(|s: &mut State| s.gardener_close())
+                    .build(k)
+                    .key("gardener-saved-new-chat"),
+            );
+        return col().w_full().items_center().px(40.0).pt(8.0).pb(14.0).child(bar);
     }
-    let backend = chat.backend.or_else(|| selected_backend(s));
+    let locked = matches!(chat.phase, Phase::Working | Phase::Ready);
+    let backend = if locked { chat.backend } else { selected_backend(s) };
     let placeholder = match chat.phase {
         Phase::Working => "Working…",
         Phase::Ready => "Ask a follow-up…",
@@ -514,7 +631,7 @@ pub fn composer(s: &State, p: &Palette, k: &Kit, max_w: f32, layer: &mut Vec<El>
     };
     let disabled = backend.is_none() || chat.phase == Phase::Working;
     // The field sits borderless inside the composer box, as in T3 Code and Claude: Return sends,
-    // Shift-Return breaks the line, Esc stops a run.
+    // Shift-Return breaks the line, Esc stops a run (handled in `keys.rs`).
     let mut field = rune::text_input(&chat.input, style::BODY)
         .key("gardener-input")
         .w_full()
@@ -524,16 +641,7 @@ pub fn composer(s: &State, p: &Palette, k: &Kit, max_w: f32, layer: &mut Vec<El>
         .label("Message Curator")
         .disabled(disabled);
     if !disabled {
-        field = field
-            .on_edit(|s: &mut State| &mut s.notebook.chat.input)
-            .on_submit(|s: &mut State, _tx: &mut Tx| s.gardener_submit())
-            .on_input_key(|s: &mut State, e: &KeyEvent, _tx: &mut Tx| {
-                if matches!(e.key, Key::Escape) && s.notebook.chat.phase == Phase::Working {
-                    s.gardener_stop();
-                    return true;
-                }
-                false
-            });
+        field = field.on_edit(|s: &mut State| &mut s.notebook.chat.input).on_submit(|s: &mut State, _tx: &mut Tx| s.gardener_submit());
     }
     let input = rune::auto_grow(field, 1, 8);
 
@@ -564,6 +672,15 @@ pub fn composer(s: &State, p: &Palette, k: &Kit, max_w: f32, layer: &mut Vec<El>
     toolbar = toolbar.child(rune::spacer());
     if let Some(picker) = provider_picker(s, p, k, layer) {
         toolbar = toolbar.child(picker);
+    } else if !s.notebook.gardener.backends.is_empty() {
+        toolbar = toolbar.child(
+            Button::new("Choose Subscription…")
+                .variant(ButtonVariant::Outline)
+                .control_size(ControlSize::Small)
+                .on_press(crate::curator_settings::open_settings)
+                .build(k)
+                .key("curator-choose-subscription"),
+        );
     }
     let card = col()
         .key("gardener-composer")
@@ -594,34 +711,14 @@ pub(crate) static SEND_ICON: Icon = Icon {
 static STOP_ICON: Icon =
     Icon { name: "curator-stop", view: 16.0, body: r#"<rect x="4.5" y="4.5" width="7" height="7" rx="1.5" fill="currentColor"/>"# };
 
-/// The provider asked for sign-in: one press runs its own login in Terminal (which opens the
-/// browser for the person's subscription account), then Try Again re-sends the question.
-fn sign_in_card(i: usize, backend: Backend, p: &Palette, k: &Kit) -> El {
-    let actions = row()
-        .gap(6.0)
-        .pt(2.0)
-        .child(
-            Button::new("Sign In")
-                .variant(ButtonVariant::Submit)
-                .control_size(ControlSize::Small)
-                .on_press(move |_: &mut State| open_sign_in(backend))
-                .build(k)
-                .key(format!("gardener-signin-open-{i}")),
-        )
-        .child(
-            Button::new("Try Again")
-                .variant(ButtonVariant::Outline)
-                .control_size(ControlSize::Small)
-                .on_press(|s: &mut State| s.gardener_retry())
-                .build(k)
-                .key(format!("gardener-signin-retry-{i}")),
-        );
+/// Curator keeps the failed request on screen while the provider signs in.
+fn sign_in_panel(s: &State, key: impl Into<String>, backend: Backend, p: &Palette, k: &Kit, retry: Option<fn(&mut State)>) -> El {
     col()
-        .key(format!("gardener-signin-{i}"))
+        .key(key.into())
         .role("group")
         .label(format!("Sign in to {}", backend.label()))
         .w_full()
-        .gap(6.0)
+        .gap(8.0)
         .px(14.0)
         .py(12.0)
         .radius(10.0)
@@ -630,33 +727,10 @@ fn sign_in_card(i: usize, backend: Backend, p: &Palette, k: &Kit) -> El {
             row()
                 .gap(8.0)
                 .center_y()
-                .child(crate::agents::mark(backend.label(), p, 16.0, None))
+                .child(crate::agents::mark(backend.label(), p, 16.0, s.agent_icon(backend.label())))
                 .child(text(format!("Sign in to {}", backend.label())).font(style::NAME).color(p.text)),
         )
-        .child(
-            text(format!("Uses your {} account. Feeder never sees your password.", backend.label()))
-                .font(style::META)
-                .color(p.text_2)
-                .wrap(),
-        )
-        .child(actions)
-}
-
-/// Opens Terminal running the provider's own sign-in through Feeder's isolated Curator profile.
-fn open_sign_in(backend: Backend) {
-    let bin = feeder_core::setup::feeder_binary();
-    let shell = format!("'{}' curator connect --with {}", bin.display().to_string().replace('\'', "'\\''"), backend.as_str());
-    let script = shell.replace('\\', "\\\\").replace('"', "\\\"");
-    std::thread::spawn(move || {
-        let _ = std::process::Command::new("/usr/bin/osascript")
-            .args([
-                "-e",
-                "tell application \"Terminal\" to activate",
-                "-e",
-                &format!("tell application \"Terminal\" to do script \"{script}\""),
-            ])
-            .status();
-    });
+        .child(crate::curator_sign_in::controls(s, backend, p, k, retry))
 }
 
 /// Whether an item is a finished read/search step that folds into a collapsible group.
@@ -716,7 +790,7 @@ fn item_view(s: &State, i: usize, p: &Palette, k: &Kit) -> El {
         Item::Reply(reply) => crate::notebook::render_article_markdown(reply, None, p, k).key(format!("gardener-reply-{i}")),
         Item::Tool { call, result: Some(r), .. } if is_edit(&call.name) && !r.failed => edit_card(s, i, call, r, p, k),
         Item::Tool { call, result, open } => tool_step(s, i, call, result.as_ref(), *open, p, k),
-        Item::SignIn(backend) => sign_in_card(i, *backend, p, k),
+        Item::SignIn(backend) => sign_in_panel(s, format!("gardener-signin-{i}"), *backend, p, k, Some(State::gardener_retry)),
         Item::Failed(why) => {
             Card::new().accent(p.amber).title("Run stopped", None).description(why.clone()).build(k).key(format!("gardener-failed-{i}"))
         }
@@ -1015,6 +1089,9 @@ fn idle_view(s: &State, p: &Palette, k: &Kit) -> El {
     let changes: Vec<&Change> =
         s.notebook.gardener.changes.iter().filter(|c| scope.includes(s.notebook.page(c.page_id).and_then(|pg| pg.project_id))).collect();
     let mut page = col().w_full();
+    if let Some(card) = review_card(s, p, k) {
+        page = page.child(card.mb(16.0));
+    }
     if !changes.is_empty() {
         page = page.child(section_title("Recent changes", p)).child(change_list(s, &changes, p, k));
     }
@@ -1256,5 +1333,19 @@ mod tests {
         assert_eq!(change_id(r#"{"change_id":12,"action":"created"}"#), Some(12));
         assert_eq!(change_id("Revised page #1: x. Change #7 can be reverted by the person."), Some(7));
         assert_eq!(change_id("No change"), None);
+    }
+
+    #[test]
+    fn session_send_with_closed_session_recovers_and_wakes() {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let wake: Waker = Arc::new(move || {
+            let _ = tx.send(());
+        });
+        let mut chat = Chat { phase: Phase::Working, ..Chat::default() };
+        chat.session_send("follow-up".into(), Some(wake));
+        rx.recv_timeout(std::time::Duration::from_secs(2)).expect("session_send must wake the UI on failure");
+        assert!(chat.drain());
+        assert_eq!(chat.phase, Phase::Ended);
+        assert!(matches!(chat.items.last(), Some(Item::Failed(_))));
     }
 }

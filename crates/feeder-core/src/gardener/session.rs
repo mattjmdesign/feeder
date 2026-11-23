@@ -20,6 +20,7 @@ use serde_json::{Value, json};
 use super::acp::{self, Action as AcpAction};
 use super::chat::{ChatOpening, Recorder, StoredEvent};
 use super::parse::{StreamState, claude_line, codex_line, failure};
+use super::prefs::{self, RunConfig};
 use super::{Backend, Scope, SessionMode, clip, profile};
 use crate::{Error, Result, Store, data_dir, setup};
 
@@ -98,6 +99,8 @@ pub fn demo_events() -> Vec<Event> {
 pub struct SessionEnv {
     pub feeder: PathBuf,
     pub data_dir: PathBuf,
+    /// The model and thinking level the CLI runs with.
+    pub run: RunConfig,
 }
 
 impl SessionEnv {
@@ -105,7 +108,7 @@ impl SessionEnv {
     /// [`setup::feeder_binary`] picks (the app's bundled copy), and the active data folder.
     pub fn detect() -> SessionEnv {
         let sibling = std::env::current_exe().ok().and_then(|exe| Some(exe.parent()?.join("feeder"))).filter(|p| p.is_file());
-        SessionEnv { feeder: sibling.unwrap_or_else(setup::feeder_binary), data_dir: data_dir() }
+        SessionEnv { feeder: sibling.unwrap_or_else(setup::feeder_binary), data_dir: data_dir(), run: RunConfig::default() }
     }
 }
 
@@ -221,6 +224,7 @@ impl Session {
         opening: ChatOpening<'_>,
         sink: impl Fn(Event) + Send + Sync + 'static,
     ) -> Result<Session> {
+        env.run.validate()?;
         let bin = backend.binary().ok_or_else(|| Error::NotFound(format!("{} isn't installed", backend.label())))?;
         let scratch = Scratch::new()?;
         let store = Store::open(&env.data_dir)?;
@@ -336,32 +340,49 @@ impl Inner {
         probe.arg("--version");
         let (pipes, monitor) = self.spawn_provider(probe, false, Some(Duration::from_secs(5)))?;
         drop(pipes.stdin);
+        let probe_err = pipes.stderr.map(|mut stderr| {
+            std::thread::spawn(move || {
+                let _ = std::io::copy(&mut stderr, &mut std::io::sink());
+            })
+        });
         let mut version = String::new();
         pipes.stdout.ok_or_else(|| Error::Invalid("The provider has no version output".into()))?.take(512).read_to_string(&mut version)?;
         let status = process_status(monitor)?;
+        if let Some(t) = probe_err {
+            let _ = t.join();
+        }
         acp::check_version(self.backend, status, &version)?;
-        let cmd = acp::command(self.backend, bin, &self.env.data_dir, self.scratch.path(), self.mode, &server)?;
+        let cmd = acp::command(self.backend, bin, &self.env.data_dir, self.scratch.path(), self.mode, &server, &self.env.run)?;
+        match self.backend {
+            Backend::Antigravity => {
+                let mut acp = lock(&self.acp);
+                acp.model = prefs::antigravity_model(&self.env.run);
+                if acp.model.is_none() {
+                    acp.effort = self.env.run.effort.clone();
+                }
+            }
+            Backend::OpenCode => {
+                let mut acp = lock(&self.acp);
+                acp.model = self.env.run.model.clone();
+                acp.effort = self.env.run.effort.clone();
+            }
+            _ => {}
+        }
         let servers = if self.backend == Backend::Antigravity { json!([]) } else { json!([server]) };
         let (pipes, monitor) = self.spawn_provider(cmd, true, None)?;
         let stdout = pipes.stdout.ok_or_else(|| Error::Invalid("The provider has no ACP output".into()))?;
         let opening = format!("{}\n\n{opening}", self.mode.instructions());
         let inner = Arc::clone(self);
         let worker = std::thread::Builder::new().name("feeder-curator-acp".into()).spawn(move || {
-            let errors = pipes.stderr.map(|mut stderr| {
-                std::thread::spawn(move || {
-                    let _ = std::io::copy(&mut stderr, &mut std::io::sink());
-                })
-            });
+            let errors = pipes.stderr.map(|stderr| std::thread::spawn(move || stderr_tail(stderr)));
             let outcome = inner.read_acp(BufReader::new(stdout), &servers, &opening);
             inner.terminate();
             let _ = process_status(monitor);
-            if let Some(errors) = errors {
-                let _ = errors.join();
-            }
+            let stderr = errors.and_then(|t| t.join().ok()).unwrap_or_default();
             if let Err(e) = outcome
                 && !inner.stopping.load(Ordering::Acquire)
             {
-                let error = e.to_string();
+                let error = acp_error_message(&e, &stderr);
                 inner.forward(failure(error.clone()));
                 inner.end(Some(&error));
             }
@@ -392,6 +413,9 @@ impl Inner {
             if u64::try_from(len).unwrap_or(u64::MAX) > ACP_FRAME_BYTES {
                 return Err(Error::Invalid("An ACP message exceeded the Curator size limit".into()));
             }
+            if line.trim().is_empty() {
+                continue;
+            }
             let message = serde_json::from_str(&line).map_err(|_| Error::Invalid("The provider returned an invalid ACP message".into()))?;
             let actions = lock(&self.acp).receive(message, self.mode, self.scratch.path(), servers, opening)?;
             for action in actions {
@@ -415,10 +439,12 @@ impl Inner {
     }
 
     fn start_claude(self: &Arc<Self>, bin: &Path) -> Result<()> {
+        let helper = resolve_path(&self.env.feeder)?;
+        let data_dir = resolve_path(&self.env.data_dir)?;
         let config = json!({ "mcpServers": { "feeder": {
-            "command": self.env.feeder,
+            "command": helper,
             "args": ["mcp", "--gardener", "--gardener-run", &self.run_id.to_string()],
-            "env": { "FEEDER_HOME": self.env.data_dir },
+            "env": { "FEEDER_HOME": data_dir },
         } } });
         let config_path = self.scratch.path().join("mcp.json");
         std::fs::write(&config_path, config.to_string())?;
@@ -431,6 +457,12 @@ impl Inner {
             .args(["--no-session-persistence", "--append-system-prompt", self.mode.instructions()])
             .arg("--mcp-config")
             .arg(&config_path);
+        if let Some(model) = &self.env.run.model {
+            cmd.args(["--model", model]);
+        }
+        if let Some(effort) = &self.env.run.effort {
+            cmd.args(["--effort", effort]);
+        }
         let (pipes, monitor) = self.spawn_provider(cmd, true, None)?;
         self.watch(pipes, monitor, claude_line)
     }
@@ -445,6 +477,8 @@ impl Inner {
     }
 
     fn codex_turn(self: &Arc<Self>, bin: &Path, text: &str) -> Result<()> {
+        let helper = resolve_path(&self.env.feeder)?;
+        let data_dir = resolve_path(&self.env.data_dir)?;
         let thread = lock(&self.state).thread_id.clone();
         let mut cmd = profile::command(self.backend, bin, &self.env.data_dir)?;
         cmd.current_dir(self.scratch.path()).arg("exec");
@@ -458,9 +492,9 @@ impl Inner {
         // One inline table replaces the person's own MCP servers for this run.
         let server = format!(
             "mcp_servers={{feeder={{command={},args=[\"mcp\",\"--gardener\",\"--gardener-run\",\"{}\"],env={{FEEDER_HOME={}}},default_tools_approval_mode=\"approve\"}}}}",
-            toml_string(&self.env.feeder.to_string_lossy()),
+            toml_string(&helper.to_string_lossy()),
             self.run_id,
-            toml_string(&self.env.data_dir.to_string_lossy()),
+            toml_string(&data_dir.to_string_lossy()),
         );
         cmd.args([
             "-c",
@@ -474,6 +508,12 @@ impl Inner {
             "-c",
             "model_reasoning_summary=\"auto\"",
         ]);
+        if let Some(model) = &self.env.run.model {
+            cmd.args(["-m", model]);
+        }
+        if let Some(effort) = &self.env.run.effort {
+            cmd.args(["-c", &format!("model_reasoning_effort={}", toml_string(effort))]);
+        }
         cmd.arg("-");
         let (mut pipes, monitor) = self.spawn_provider(cmd, false, None)?;
         let mut stdin = pipes.stdin.take().ok_or_else(|| Error::Invalid("Codex has no input".into()))?;
@@ -488,14 +528,21 @@ impl Inner {
         let spawned = std::thread::Builder::new().name("feeder-gardener-stream".into()).spawn(move || {
             let errors = pipes.stderr.map(|e| std::thread::spawn(move || stderr_tail(e)));
             let mut turn_done = false;
+            let mut stream_error: Option<String> = None;
+            let mut needs_sign_in = false;
             for line in pipes.stdout.into_iter().flat_map(|out| BufReader::new(out).lines().map_while(std::io::Result::ok)) {
                 let events = parse(&line, &mut lock(&inner.state));
                 for event in events {
-                    if matches!(event, Event::TurnFinished) {
-                        turn_done = true;
-                        if inner.backend == Backend::Codex {
-                            continue;
+                    match &event {
+                        Event::TurnFinished => {
+                            turn_done = true;
+                            if inner.backend == Backend::Codex {
+                                continue;
+                            }
                         }
+                        Event::Failed(why) => stream_error = Some(why.clone()),
+                        Event::NeedsSignIn => needs_sign_in = true,
+                        _ => {}
                     }
                     inner.forward(event);
                 }
@@ -509,16 +556,34 @@ impl Inner {
             match inner.backend {
                 // Claude Code exiting ends the session.
                 Backend::ClaudeCode => {
-                    let error = crashed.then(|| last_lines(&stderr));
-                    if let Some(e) = &error {
+                    let already_reported = needs_sign_in || stream_error.is_some();
+                    let error = if needs_sign_in {
+                        Some(format!("{} isn't signed in", inner.backend.label()))
+                    } else if stream_error.is_some() {
+                        stream_error
+                    } else {
+                        crashed.then(|| last_lines(&stderr))
+                    };
+                    if !already_reported && let Some(e) = &error {
                         inner.forward(failure(e.clone()));
                     }
                     inner.end(error.as_deref());
                 }
                 // Codex exits after every turn; only a turn that never finished is a failure.
                 Backend::Codex if crashed || !turn_done => {
-                    let error = if crashed { last_lines(&stderr) } else { "Codex exited before finishing its answer".into() };
-                    inner.forward(failure(error.clone()));
+                    let already_reported = needs_sign_in || stream_error.is_some();
+                    let error = if needs_sign_in {
+                        format!("{} isn't signed in", inner.backend.label())
+                    } else if let Some(why) = stream_error {
+                        why
+                    } else if crashed {
+                        last_lines(&stderr)
+                    } else {
+                        "Codex exited before finishing its answer".into()
+                    };
+                    if !already_reported {
+                        inner.forward(failure(error.clone()));
+                    }
                     inner.end(Some(&error));
                 }
                 Backend::Codex => inner.forward(Event::TurnFinished),
@@ -641,7 +706,7 @@ fn process_status(monitor: ProcessMonitor) -> std::io::Result<Option<ExitStatus>
     monitor.join().map_err(|_| std::io::Error::other("provider monitor stopped unexpectedly"))?
 }
 
-fn child_exited(id: u32) -> std::io::Result<bool> {
+pub(super) fn child_exited(id: u32) -> std::io::Result<bool> {
     // SAFETY: zero is valid for siginfo_t and provides a zero pid when no child is ready.
     let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
     // SAFETY: `info` is writable, id belongs to an owned child, and WNOWAIT leaves the leader
@@ -655,7 +720,7 @@ fn child_exited(id: u32) -> std::io::Result<bool> {
     if error.kind() == std::io::ErrorKind::Interrupted { Ok(false) } else { Err(error) }
 }
 
-fn terminate_child(child: &mut Child) -> std::io::Result<ExitStatus> {
+pub(super) fn terminate_child(child: &mut Child) -> std::io::Result<ExitStatus> {
     if let Ok(group) = libc::pid_t::try_from(child.id())
         && group > 0
     {
@@ -685,10 +750,27 @@ fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
     m.lock().expect("gardener session lock poisoned")
 }
 
-fn last_lines(stderr: &str) -> String {
+fn resolve_path(path: &Path) -> std::io::Result<PathBuf> {
+    std::fs::canonicalize(path).or_else(|_| std::path::absolute(path))
+}
+
+fn acp_error_message(err: &Error, stderr: &str) -> String {
+    let message = err.to_string();
+    let generic = message == "The provider returned an invalid ACP message" || message.ends_with(" closed the Curator session");
+    if generic && let Some(detail) = non_empty_last_lines(stderr) {
+        return detail;
+    }
+    message
+}
+
+fn non_empty_last_lines(stderr: &str) -> Option<String> {
     let tail: Vec<&str> = stderr.lines().filter(|l| !l.trim().is_empty()).rev().take(3).collect();
     let text = tail.into_iter().rev().collect::<Vec<_>>().join(" ");
-    if text.is_empty() { "the CLI stopped unexpectedly".into() } else { clip(&text, STDERR_CHARS) }
+    (!text.is_empty()).then(|| clip(&text, STDERR_CHARS))
+}
+
+fn last_lines(stderr: &str) -> String {
+    non_empty_last_lines(stderr).unwrap_or_else(|| "the CLI stopped unexpectedly".into())
 }
 
 /// A TOML basic string, for paths in Codex's `-c` overrides.
@@ -763,6 +845,17 @@ mod tests {
         let tail = stderr_tail(output.as_bytes());
         assert!(tail.len() <= STDERR_CHARS * 4);
         assert!(tail.ends_with("last diagnostic"));
+    }
+
+    #[test]
+    fn acp_error_surfaces_stderr_for_generic_transport_failures() {
+        let invalid = Error::Invalid("The provider returned an invalid ACP message".into());
+        assert_eq!(acp_error_message(&invalid, "ERROR\nUnrecognized flag: --standalone\n"), "ERROR Unrecognized flag: --standalone");
+        assert_eq!(acp_error_message(&invalid, "   \n"), "The provider returned an invalid ACP message");
+        let closed = Error::Invalid("OpenCode closed the Curator session".into());
+        assert_eq!(acp_error_message(&closed, "401 Unauthorized\n"), "401 Unauthorized");
+        let specific = Error::Invalid("Unknown model ID: bad".into());
+        assert_eq!(acp_error_message(&specific, "noisy debug log\n"), "Unknown model ID: bad");
     }
 
     #[test]

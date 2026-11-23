@@ -3,6 +3,7 @@
 
 mod agent;
 mod detect;
+mod file_preview;
 pub mod gardener;
 mod guide;
 mod knowledge;
@@ -13,12 +14,14 @@ pub mod setup;
 mod store;
 mod time;
 mod update;
+mod worktree;
 
 pub use agent::{agent_display_name, agent_from_env};
 pub use detect::{
     DetectedProject, GitMeta, detect_branch, detect_git_meta, detect_project, format_shortstat, install_post_commit_hook,
     latest_commit_summary, remove_post_commit_hook, slugify,
 };
+pub use file_preview::{FilePreview, read_file_preview};
 pub use guide::{GUIDE, NOTEBOOK_GUIDE, notebook_skill_markdown, skill_markdown};
 pub use knowledge::FeedReviewStatus;
 pub use knowledge::{
@@ -41,6 +44,7 @@ pub use update::{
     AttentionKind, MAX_CHARS, MAX_PARAGRAPHS, UpdateError, build_resume_prompt, extract_block, parse_attention, update_blocks,
     validate_body,
 };
+pub use worktree::{ChangeKind, Commit, FileChange, TreeStatus, WorkingTree, read_working_tree};
 
 pub type Result<T> = std::result::Result<T, Error>;
 

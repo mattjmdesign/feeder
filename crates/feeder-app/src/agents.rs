@@ -28,6 +28,8 @@ fn known(agent: &str, p: &Palette) -> Option<(&'static Icon, Color)> {
         (&logos::COPILOT, ink)
     } else if a.contains("windsurf") {
         (&logos::WINDSURF, ink)
+    } else if a.contains("antigravity") || a == "agy" {
+        (&logos::ANTIGRAVITY, ink)
     } else if a.contains("zed") {
         (&logos::ZED, ink)
     } else {

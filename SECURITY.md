@@ -21,9 +21,12 @@ These are the parts worth checking when you review it:
 - **Curator.** When you start a session, the selected CLI sends your messages and the sources
   it reads to the model provider it uses. Ask sessions can
   read only Notebook pages in scope. Review sessions can also read flags and Feed threads in
-  scope and make cited Notebook edits. The CLIs manage their own credentials in separate profiles
-  under Feeder's data directory. Curator does not pass through shell API keys or personal provider
-  config. Provider-managed policies may still apply.
+  scope and make cited Notebook edits. Each CLI manages its own credentials and reuses your
+  existing sign-in; Feeder stores none. Curator uses a subscription only after you turn it on in
+  Settings → Curator. Antigravity's Curator settings live in Feeder's data directory
+  (`--gemini-dir`), so Feeder never edits `~/.gemini`. Curator strips shell API keys and
+  disables personal hooks, built-in tools, and personal MCP servers. Provider-managed policies may
+  still apply.
 - **Network.** The app checks `github.com/mattjmdesign/feeder/releases` for updates about once an
   hour. `feeder mcp` speaks MCP over stdin and stdout and opens no port. `feeder serve` (an
   optional companion web page, off unless you run it) listens only on the address you give it,

@@ -7,7 +7,8 @@ use std::time::Duration;
 
 use clap::Subcommand;
 use feeder_core::gardener::{
-    Backend, ChatOpening, ChatSummary, Event, OPENING, Run, RunStatus, Scope, Session, SessionEnv, SessionMode, StoredEvent,
+    Backend, ChatOpening, ChatSummary, CuratorPrefs, Event, OPENING, Run, RunStatus, Scope, Session, SessionEnv, SessionMode, StoredEvent,
+    effort_label,
 };
 use feeder_core::{Change, Flag, FlagOutcome, FlagStatus, HUMAN_AUTHOR, NewFlag, Store, ago, now_ms};
 use serde_json::{Value, json};
@@ -17,9 +18,15 @@ pub enum GardenerCmd {
     /// Start Curator with an installed agent.
     /// It streams what the agent does; type follow-ups after each answer, or press Enter to end.
     Run {
-        /// `claude`, `codex`, `opencode`, or `antigravity`. Defaults to the first one installed.
+        /// `claude`, `codex`, `opencode`, or `antigravity`. Defaults to your Curator default or the first installed CLI.
         #[arg(long = "with")]
         backend: Option<String>,
+        /// Override the model ID or alias for this session.
+        #[arg(long)]
+        model: Option<String>,
+        /// Override the thinking/reasoning effort level for this session (for example `low`, `medium`, `high`).
+        #[arg(long)]
+        effort: Option<String>,
         /// Limit reads and edits to this project (name or ID).
         #[arg(long)]
         project: Option<String>,
@@ -110,11 +117,26 @@ pub fn flags(store: &Store, all: bool, dismiss: Option<i64>, reason: Option<Stri
 
 pub fn run(store: &Store, cmd: GardenerCmd) -> Result<(), String> {
     match cmd {
-        GardenerCmd::Run { backend, project, ask, message } => {
+        GardenerCmd::Run { backend, model, effort, project, ask, message } => {
+            let prefs = CuratorPrefs::load(store.dir());
+            let installed = Backend::installed();
             let backend = match backend {
                 Some(name) => name.parse::<Backend>().map_err(|e| e.to_string())?,
-                None => *Backend::installed().first().ok_or("Install Claude Code, Codex, OpenCode, or Antigravity to use Curator.")?,
+                None => prefs
+                    .default_backend()
+                    .filter(|b| installed.contains(b))
+                    .or_else(|| prefs.enabled().into_iter().find(|b| installed.contains(b)))
+                    .or_else(|| installed.first().copied())
+                    .ok_or("Install Claude Code, Codex, OpenCode, or Antigravity to use Curator.")?,
             };
+            let mut env = SessionEnv::detect();
+            env.run = prefs.run(backend);
+            if let Some(model) = model {
+                env.run.model = Some(model);
+            }
+            if let Some(effort) = effort {
+                env.run.effort = Some(effort);
+            }
             let text = message.join(" ");
             let opening = if message.is_empty() {
                 ChatOpening::Job { title: "Review Open Flags", prompt: OPENING }
@@ -126,13 +148,14 @@ pub fn run(store: &Store, cmd: GardenerCmd) -> Result<(), String> {
                 None => Scope::Notebook,
             };
             let mode = if ask { SessionMode::Ask } else { SessionMode::Review };
-            chat(backend, scope, mode, opening)?;
+            chat(backend, env, &prefs.name(backend), scope, mode, opening)?;
         }
         GardenerCmd::Connect { backend } => {
             backend.parse::<Backend>().and_then(|backend| backend.connect(store.dir())).map_err(|e| e.to_string())?;
         }
         GardenerCmd::Status { json } => {
             let installed = Backend::installed();
+            let prefs = CuratorPrefs::load(store.dir());
             let runs = store.gardener_runs(5).map_err(|e| e.to_string())?;
             let open = store.open_flag_count().map_err(|e| e.to_string())?;
             if json {
@@ -145,17 +168,54 @@ pub fn run(store: &Store, cmd: GardenerCmd) -> Result<(), String> {
                     })
                     .collect::<feeder_core::Result<Vec<_>>>()
                     .map_err(|e| e.to_string())?;
+                let subscriptions: Vec<Value> = installed
+                    .iter()
+                    .map(|&b| {
+                        let p = prefs.get(b);
+                        json!({
+                            "backend": b.as_str(),
+                            "label": b.label(),
+                            "name": prefs.name(b),
+                            "enabled": p.enabled,
+                            "default": prefs.default_backend() == Some(b),
+                            "model": p.model,
+                            "effort": p.effort,
+                        })
+                    })
+                    .collect();
                 println!(
                     "{}",
                     json!({
                         "backends": installed.iter().map(|b| b.as_str()).collect::<Vec<_>>(),
+                        "default": prefs.default_backend().map(Backend::as_str),
+                        "subscriptions": subscriptions,
                         "open_flags": open,
                         "runs": runs,
                     })
                 );
             } else {
                 let names: Vec<&str> = installed.iter().map(|b| b.label()).collect();
-                println!("Runs with: {}", if names.is_empty() { "no supported agents installed".into() } else { names.join(", ") });
+                println!("Installed CLIs: {}", if names.is_empty() { "none".into() } else { names.join(", ") });
+                let enabled: Vec<String> = prefs
+                    .enabled()
+                    .into_iter()
+                    .filter(|b| installed.contains(b))
+                    .map(|b| {
+                        let p = prefs.get(b);
+                        let mut parts = vec![prefs.name(b)];
+                        if let Some(m) = p.model {
+                            parts.push(m);
+                        }
+                        if let Some(e) = p.effort {
+                            parts.push(effort_label(&e));
+                        }
+                        if prefs.default_backend() == Some(b) { format!("{} (default)", parts.join(" · ")) } else { parts.join(" · ") }
+                    })
+                    .collect();
+                println!(
+                    "Enabled for Curator: {}",
+                    if enabled.is_empty() { "none (turn one on in Settings → Curator)".into() } else { enabled.join(", ") }
+                );
                 println!("Open flags: {open}");
                 match runs.first() {
                     Some(r) => print_run(r),
@@ -277,10 +337,17 @@ fn print_run(r: &Run) {
 }
 
 /// Runs a session in the terminal: streams events, then reads follow-ups until an empty line.
-fn chat(backend: Backend, scope: Scope, mode: SessionMode, opening: ChatOpening<'_>) -> Result<(), String> {
+fn chat(backend: Backend, env: SessionEnv, label: &str, scope: Scope, mode: SessionMode, opening: ChatOpening<'_>) -> Result<(), String> {
     let _signals = StopSignals::install().map_err(|e| e.to_string())?;
     let (tx, rx) = mpsc::channel();
-    let session = Session::start_curator_chat(backend, SessionEnv::detect(), scope, mode, opening, move |e| {
+    let mut header = vec![label.to_string()];
+    if let Some(model) = &env.run.model {
+        header.push(model.clone());
+    }
+    if let Some(effort) = &env.run.effort {
+        header.push(effort_label(effort));
+    }
+    let session = Session::start_curator_chat(backend, env, scope, mode, opening, move |e| {
         let _ = tx.send(e);
     })
     .map_err(|e| e.to_string())?;
@@ -288,7 +355,7 @@ fn chat(backend: Backend, scope: Scope, mode: SessionMode, opening: ChatOpening<
         SessionMode::Ask => "Ask the Notebook",
         SessionMode::Review => "Review and update notes",
     };
-    eprintln!("{task} · {}", backend.label());
+    eprintln!("{task} · {}", header.join(" · "));
     let interactive = std::io::stdin().is_terminal();
     let mut out = std::io::stdout().lock();
     while let Some(event) = receive(&rx)? {

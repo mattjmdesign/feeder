@@ -1,6 +1,6 @@
 //! Restricted ACP sessions for OpenCode and Antigravity.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::process::Command;
 use std::process::ExitStatus;
@@ -23,14 +23,23 @@ pub(super) fn check_version(backend: Backend, status: Option<ExitStatus>, versio
     Ok(())
 }
 
-pub(super) fn command(backend: Backend, binary: &Path, data: &Path, cwd: &Path, mode: SessionMode, server: &Value) -> Result<Command> {
+pub(super) fn command(
+    backend: Backend,
+    binary: &Path,
+    data: &Path,
+    cwd: &Path,
+    mode: SessionMode,
+    server: &Value,
+    run: &super::RunConfig,
+) -> Result<Command> {
     let mut cmd = super::profile::command(backend, binary, data)?;
     cmd.current_dir(cwd).arg("acp");
     match backend {
         Backend::OpenCode => {
-            let config = opencode_config(mode);
+            let config = opencode_config(mode, run.model.as_deref());
             std::fs::write(cwd.join("opencode.json"), config.to_string())?;
             // Account data is kept in the private profile, but model runs use only this config.
+            // `opencode acp` already spawns its own private server and rejects `--standalone`.
             let config_dir = cwd.join("config");
             std::fs::create_dir_all(&config_dir)?;
             cmd.env("XDG_CONFIG_HOME", &config_dir)
@@ -40,7 +49,8 @@ pub(super) fn command(backend: Backend, binary: &Path, data: &Path, cwd: &Path, 
         }
         Backend::Antigravity => {
             configure_antigravity(data, mode, server)?;
-            cmd.args(["--agent", "feeder-curator", "--sandbox", "--disable-telemetry"]);
+            cmd.arg("--gemini-dir").arg(super::profile::gemini_dir(data)?);
+            cmd.args(["--include-default-customizations=false", "--agent", "feeder-curator", "--sandbox", "--disable-telemetry"]);
         }
         _ => unreachable!("validated ACP backend"),
     }
@@ -56,7 +66,7 @@ fn supported_version(stdout: &str, minimum: (u32, u32, u32)) -> bool {
     stdout.split_whitespace().find_map(parse).is_some_and(|version| version.0 == minimum.0 && version >= minimum)
 }
 
-fn opencode_config(mode: SessionMode) -> Value {
+fn opencode_config(mode: SessionMode, model: Option<&str>) -> Value {
     let mut permissions = vec![json!({ "action": "*", "resource": "*", "effect": "deny" })];
     let mut policies = vec![
         policy("tool.use", "*", "deny"),
@@ -71,13 +81,18 @@ fn opencode_config(mode: SessionMode) -> Value {
         policies.push(policy("tool.use", &format!("{action}:*"), "allow"));
         permissions.push(policy(&action, "*", "allow"));
     }
-    json!({
+    let mut config = json!({
         "default_agent": "feeder-curator",
         "agents": { "feeder-curator": { "description": "Feeder Curator", "mode": "primary", "system": mode.instructions() } },
         "update": "disable",
         "permissions": permissions,
         "policies": policies,
-    })
+    });
+    if let Some(model) = model {
+        config["model"] = json!(model);
+        config["agents"]["feeder-curator"]["model"] = json!(model);
+    }
+    config
 }
 
 fn policy(action: &str, resource: &str, effect: &str) -> Value {
@@ -85,7 +100,7 @@ fn policy(action: &str, resource: &str, effect: &str) -> Value {
 }
 
 fn configure_antigravity(data: &Path, mode: SessionMode, server: &Value) -> Result<()> {
-    let home = super::profile::profile_dir(Backend::Antigravity, data)?.join(".gemini");
+    let home = super::profile::gemini_dir(data)?;
     let profile = home.join("antigravity-cli");
     std::fs::create_dir_all(&profile)?;
     let file = profile.join("settings.json");
@@ -129,18 +144,28 @@ fn configure_antigravity(data: &Path, mode: SessionMode, server: &Value) -> Resu
     Ok(())
 }
 
+#[derive(Debug)]
 pub(super) enum Action {
     Send(Value),
     Emit(Event),
 }
 
-/// The ACP session and its outstanding prompt. Provider IDs live only for this process.
+/// The ACP session and its outstanding requests. Provider IDs stay small safe integers
+/// (below JS `Number.MAX_SAFE_INTEGER`) and live only for this process.
 #[derive(Default)]
 pub(super) struct State {
     session: Option<String>,
     pending: Option<u64>,
+    pending_model: Option<u64>,
+    pending_effort: Option<u64>,
     next: u64,
     tools: HashSet<String>,
+    /// Tool calls seen in `pending` state with empty `rawInput`, waiting for populated arguments.
+    pending_tools: HashMap<String, &'static str>,
+    /// A model to switch to once the session exists (`session/set_config_option` or `session/set_model`).
+    pub(super) model: Option<String>,
+    /// A thinking level to apply once the session exists (`session/set_config_option`).
+    pub(super) effort: Option<String>,
 }
 
 impl State {
@@ -154,14 +179,21 @@ impl State {
         )
     }
 
+    fn next_id(&mut self) -> u64 {
+        self.next = self.next.saturating_add(1).max(3);
+        self.next
+    }
+
     pub(super) fn prompt(&mut self, text: &str) -> Result<Value> {
+        let id = self.next.saturating_add(1).max(3);
         let session = self.session.as_deref().ok_or_else(|| Error::Invalid("Curator is still connecting".into()))?;
         if self.pending.is_some() {
             return Err(Error::Invalid("Curator is still answering".into()));
         }
-        self.next = self.next.saturating_add(1).max(3);
-        self.pending = Some(self.next);
-        Ok(request(self.next, "session/prompt", json!({ "sessionId": session, "prompt": [{ "type": "text", "text": text }] })))
+        let req = request(id, "session/prompt", json!({ "sessionId": session, "prompt": [{ "type": "text", "text": text }] }));
+        self.next = id;
+        self.pending = Some(id);
+        Ok(req)
     }
 
     pub(super) fn ready(&self) -> bool {
@@ -171,7 +203,7 @@ impl State {
     pub(super) fn receive(&mut self, message: Value, mode: SessionMode, cwd: &Path, server: &Value, opening: &str) -> Result<Vec<Action>> {
         if let Some(method) = message["method"].as_str() {
             if let Some(id) = message.get("id") {
-                return Ok(vec![Action::Send(reject_request(id, method, &message["params"]))]);
+                return Ok(vec![Action::Send(handle_request(id, method, &message["params"], self.session.as_deref(), mode))]);
             }
             let session = message["params"]["sessionId"].as_str();
             if method == "session/update" && session.is_some() && session == self.session.as_deref() {
@@ -180,6 +212,14 @@ impl State {
             return Ok(Vec::new());
         }
         let Some(id) = message["id"].as_u64() else { return Ok(Vec::new()) };
+        if self.pending_model == Some(id) {
+            self.pending_model = None;
+            return check_config_response(&message);
+        }
+        if self.pending_effort == Some(id) {
+            self.pending_effort = None;
+            return check_config_response(&message);
+        }
         if !matches!(id, 1 | 2) && self.pending != Some(id) {
             return Ok(Vec::new());
         }
@@ -203,7 +243,38 @@ impl State {
                     return Err(Error::Invalid("The provider returned a duplicate session".into()));
                 }
                 self.session = Some(session.to_string());
-                Ok(vec![Action::Emit(Event::Started), Action::Send(self.prompt(opening)?)])
+                let config_options = message["result"]["configOptions"].as_array();
+                let mut actions = vec![Action::Emit(Event::Started)];
+                if let Some(model) = self.model.take() {
+                    let id = self.next_id();
+                    self.pending_model = Some(id);
+                    if let Some(config_id) = config_option_id(config_options, "model", &["model"]) {
+                        actions.push(Action::Send(request(
+                            id,
+                            "session/set_config_option",
+                            json!({ "sessionId": session, "configId": config_id, "value": model }),
+                        )));
+                    } else {
+                        actions.push(Action::Send(request(id, "session/set_model", json!({ "sessionId": session, "modelId": model }))));
+                    }
+                }
+                if let Some(effort) = self.effort.take() {
+                    let config_id = match config_options {
+                        Some(_) => config_option_id(config_options, "thought_level", &["effort", "thinking_level"]),
+                        None => Some("effort"),
+                    };
+                    if let Some(config_id) = config_id {
+                        let id = self.next_id();
+                        self.pending_effort = Some(id);
+                        actions.push(Action::Send(request(
+                            id,
+                            "session/set_config_option",
+                            json!({ "sessionId": session, "configId": config_id, "value": effort }),
+                        )));
+                    }
+                }
+                actions.push(Action::Send(self.prompt(opening)?));
+                Ok(actions)
             }
             _ => {
                 let reason = message["result"]["stopReason"].as_str().unwrap_or_default();
@@ -212,6 +283,7 @@ impl State {
                 }
                 self.pending = None;
                 self.tools.clear();
+                self.pending_tools.clear();
                 Ok(vec![Action::Emit(Event::TurnFinished)])
             }
         }
@@ -232,19 +304,31 @@ impl State {
 
     fn tool_update(&mut self, update: &Value, mode: SessionMode) -> Vec<Action> {
         let Some(id) = update["toolCallId"].as_str() else { return Vec::new() };
-        let mut actions = Vec::new();
-        if !self.tools.contains(id)
-            && let Some(name) = tool_name(update, mode)
-        {
-            self.tools.insert(id.to_string());
-            actions.push(Action::Emit(Event::ToolStarted(ToolCall {
-                id: id.to_string(),
-                name: name.to_string(),
-                input: update["rawInput"].clone(),
-            })));
-        }
         let status = update["status"].as_str().unwrap_or_default();
+        let raw_input = &update["rawInput"];
+        let empty_input = raw_input.is_null() || raw_input.as_object().is_some_and(serde_json::Map::is_empty);
+        let mut actions = Vec::new();
+        if !self.tools.contains(id) {
+            let name = tool_name(update, mode).or_else(|| self.pending_tools.get(id).copied());
+            if let Some(name) = name {
+                // OpenCode emits an initial `pending` tool_call with `rawInput: {}`, then sends
+                // the real arguments on the `in_progress` tool_call_update. Hold emission until
+                // arguments arrive or execution actually begins/finishes.
+                if status == "pending" && empty_input {
+                    self.pending_tools.insert(id.to_string(), name);
+                    return actions;
+                }
+                self.pending_tools.remove(id);
+                self.tools.insert(id.to_string());
+                actions.push(Action::Emit(Event::ToolStarted(ToolCall {
+                    id: id.to_string(),
+                    name: name.to_string(),
+                    input: raw_input.clone(),
+                })));
+            }
+        }
         if matches!(status, "completed" | "failed") && self.tools.remove(id) {
+            self.pending_tools.remove(id);
             let output = update["content"]
                 .as_array()
                 .into_iter()
@@ -263,6 +347,19 @@ impl State {
     }
 }
 
+fn check_config_response(message: &Value) -> Result<Vec<Action>> {
+    if let Some(error) = message.get("error") {
+        // Older providers that don't implement `set_config_option`/`set_model` return -32601;
+        // fall back to their default. Real validation errors (invalid model or effort) surface.
+        if error["code"].as_i64() == Some(-32601) {
+            return Ok(Vec::new());
+        }
+        let detail = error["message"].as_str().unwrap_or("The provider rejected the Curator model or thinking setting");
+        return Err(Error::Invalid(detail.to_string()));
+    }
+    Ok(Vec::new())
+}
+
 fn tool_name(call: &Value, mode: SessionMode) -> Option<&'static str> {
     ["name", "title"].into_iter().filter_map(|key| call[key].as_str()).find_map(|name| {
         let name = ["feeder_", "mcp__feeder__", "mcp_feeder_"].into_iter().find_map(|prefix| name.strip_prefix(prefix)).unwrap_or(name);
@@ -270,15 +367,32 @@ fn tool_name(call: &Value, mode: SessionMode) -> Option<&'static str> {
     })
 }
 
-fn reject_request(id: &Value, method: &str, params: &Value) -> Value {
+/// Strictly verifies a `session/request_permission` tool call against Feeder's MCP server tools
+/// for `mode`. Unlike display matching in [`tool_name`], this never reads `title`, requires an
+/// explicit Feeder MCP server prefix, and refuses local file/shell/network tool kinds.
+fn allowed_feeder_permission(params: &Value, active_session: Option<&str>, mode: SessionMode) -> bool {
+    if active_session.is_some() && params["sessionId"].as_str() != active_session {
+        return false;
+    }
+    let call = &params["toolCall"];
+    if !matches!(call["kind"].as_str(), None | Some("other")) {
+        return false;
+    }
+    let Some(raw_name) = call["name"].as_str() else { return false };
+    let Some(stripped) = ["feeder_", "mcp__feeder__", "mcp_feeder_"].into_iter().find_map(|prefix| raw_name.strip_prefix(prefix)) else {
+        return false;
+    };
+    mode.mcp_tools().contains(&stripped)
+}
+
+fn handle_request(id: &Value, method: &str, params: &Value, active_session: Option<&str>, mode: SessionMode) -> Value {
     if method == "session/request_permission" {
-        let reject = params["options"]
-            .as_array()
-            .into_iter()
-            .flatten()
-            .find(|option| option["kind"] == "reject_once")
-            .and_then(|option| option["optionId"].as_str());
-        let outcome = match reject {
+        let options = params["options"].as_array();
+        let find_option =
+            |kind: &str| options.into_iter().flatten().find(|option| option["kind"] == kind).and_then(|option| option["optionId"].as_str());
+        let selected =
+            if allowed_feeder_permission(params, active_session, mode) { find_option("allow_once") } else { find_option("reject_once") };
+        let outcome = match selected {
             Some(option) => json!({ "outcome": "selected", "optionId": option }),
             None => json!({ "outcome": "cancelled" }),
         };
@@ -286,6 +400,15 @@ fn reject_request(id: &Value, method: &str, params: &Value) -> Value {
     } else {
         json!({ "jsonrpc": "2.0", "id": id, "error": { "code": -32601, "message": "This Curator client does not offer this capability" } })
     }
+}
+
+fn config_option_id<'a>(options: Option<&'a Vec<Value>>, category: &str, ids: &[&str]) -> Option<&'a str> {
+    options?.iter().find_map(|option| {
+        let id = option["id"].as_str()?;
+        let matches_category = option["category"].as_str() == Some(category);
+        let matches_id = ids.contains(&id);
+        (matches_category || matches_id).then_some(id)
+    })
 }
 
 fn request(id: u64, method: &str, params: Value) -> Value {
@@ -323,17 +446,61 @@ mod tests {
 
     #[test]
     fn acp_refuses_local_client_capabilities_and_uses_exact_notebook_permissions() {
-        let shell = reject_request(
+        let options = json!([{ "kind": "allow_once", "optionId": "allow" }, { "kind": "reject_once", "optionId": "reject" }]);
+        let shell = handle_request(
             &json!(7),
             "session/request_permission",
-            &json!({
-                "options": [{ "kind": "allow_once", "optionId": "allow" }, { "kind": "reject_once", "optionId": "reject" }]
-            }),
+            &json!({ "sessionId": "s", "toolCall": { "name": "bash", "kind": "execute" }, "options": options }),
+            Some("s"),
+            SessionMode::Review,
         );
         assert_eq!(shell.pointer("/result/outcome/optionId"), Some(&json!("reject")));
-        assert_eq!(reject_request(&json!(7), "fs/read_text_file", &json!({})).pointer("/error/code"), Some(&json!(-32601)));
-        let ask = opencode_config(SessionMode::Ask);
-        let review = opencode_config(SessionMode::Review);
+        let spoofed_title = handle_request(
+            &json!(7),
+            "session/request_permission",
+            &json!({ "sessionId": "s", "toolCall": { "name": "bash", "title": "feeder_read_page", "kind": "other" }, "options": options }),
+            Some("s"),
+            SessionMode::Review,
+        );
+        assert_eq!(spoofed_title.pointer("/result/outcome/optionId"), Some(&json!("reject")));
+        let write_in_ask = handle_request(
+            &json!(7),
+            "session/request_permission",
+            &json!({ "sessionId": "s", "toolCall": { "name": "mcp_feeder_write_page", "kind": "other" }, "options": options }),
+            Some("s"),
+            SessionMode::Ask,
+        );
+        assert_eq!(write_in_ask.pointer("/result/outcome/optionId"), Some(&json!("reject")));
+        let wrong_session = handle_request(
+            &json!(7),
+            "session/request_permission",
+            &json!({ "sessionId": "other", "toolCall": { "name": "mcp_feeder_search_notebook", "kind": "other" }, "options": options }),
+            Some("s"),
+            SessionMode::Ask,
+        );
+        assert_eq!(wrong_session.pointer("/result/outcome/optionId"), Some(&json!("reject")));
+        let allowed_ask = handle_request(
+            &json!(7),
+            "session/request_permission",
+            &json!({ "sessionId": "s", "toolCall": { "name": "mcp_feeder_search_notebook", "kind": "other" }, "options": options }),
+            Some("s"),
+            SessionMode::Ask,
+        );
+        assert_eq!(allowed_ask.pointer("/result/outcome/optionId"), Some(&json!("allow")));
+        let allowed_review = handle_request(
+            &json!(7),
+            "session/request_permission",
+            &json!({ "sessionId": "s", "toolCall": { "name": "mcp_feeder_write_page", "kind": "other" }, "options": options }),
+            Some("s"),
+            SessionMode::Review,
+        );
+        assert_eq!(allowed_review.pointer("/result/outcome/optionId"), Some(&json!("allow")));
+        assert_eq!(
+            handle_request(&json!(7), "fs/read_text_file", &json!({}), Some("s"), SessionMode::Ask).pointer("/error/code"),
+            Some(&json!(-32601))
+        );
+        let ask = opencode_config(SessionMode::Ask, None);
+        let review = opencode_config(SessionMode::Review, Some("openai/gpt-6-sol"));
         let grants = |config: &Value, action: &str| {
             config["permissions"].as_array().unwrap().iter().any(|p| p["effect"] == "allow" && p["action"] == action)
         };
@@ -341,5 +508,122 @@ mod tests {
         assert!(!grants(&ask, "feeder_write_page"));
         assert!(grants(&review, "feeder_write_page"));
         assert!(!grants(&review, "shell"));
+        assert!(ask["model"].is_null());
+        assert_eq!(review["agents"]["feeder-curator"]["model"], "openai/gpt-6-sol");
+    }
+
+    #[test]
+    fn opencode_acp_command_omits_unsupported_standalone_flag() {
+        let dir = std::env::temp_dir().join(format!("feeder-acp-cmd-{}-{}", std::process::id(), fastrand::u32(..)));
+        let cwd = dir.join("cwd");
+        std::fs::create_dir_all(&cwd).unwrap();
+        let cmd = command(
+            Backend::OpenCode,
+            Path::new("/usr/bin/opencode"),
+            &dir,
+            &cwd,
+            SessionMode::Ask,
+            &json!({}),
+            &super::super::RunConfig::default(),
+        )
+        .unwrap();
+        let args: Vec<_> = cmd.get_args().map(|a| a.to_string_lossy().into_owned()).collect();
+        assert_eq!(args, ["acp"]);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn opencode_pending_tool_waits_for_real_input_on_in_progress_update() {
+        let mut state = State::default();
+        let (mode, cwd, tools) = (SessionMode::Ask, Path::new("/tmp"), json!([]));
+        state.receive(json!({ "id": 1, "result": { "protocolVersion": 1 } }), mode, cwd, &tools, "hi").unwrap();
+        state.receive(json!({ "id": 2, "result": { "sessionId": "s" } }), mode, cwd, &tools, "hi").unwrap();
+        let pending = json!({ "method": "session/update", "params": { "sessionId": "s", "update": {
+            "sessionUpdate": "tool_call", "toolCallId": "c1", "name": "feeder_search_notebook", "status": "pending", "rawInput": {}
+        } } });
+        assert!(state.receive(pending, mode, cwd, &tools, "hi").unwrap().is_empty());
+        let running = json!({ "method": "session/update", "params": { "sessionId": "s", "update": {
+            "sessionUpdate": "tool_call_update", "toolCallId": "c1", "title": "feeder_search_notebook", "status": "in_progress",
+            "rawInput": { "query": "SQLite" }
+        } } });
+        let started = state.receive(running, mode, cwd, &tools, "hi").unwrap();
+        assert!(
+            matches!(started.as_slice(), [Action::Emit(Event::ToolStarted(call))] if call.name == "search_notebook" && call.text_arg("query") == Some("SQLite"))
+        );
+        let finished = json!({ "method": "session/update", "params": { "sessionId": "s", "update": {
+            "sessionUpdate": "tool_call_update", "toolCallId": "c1", "status": "completed",
+            "content": [{ "type": "content", "content": { "type": "text", "text": "#1 SQLite" } }]
+        } } });
+        let done = state.receive(finished, mode, cwd, &tools, "hi").unwrap();
+        assert!(
+            matches!(done.as_slice(), [Action::Emit(Event::ToolFinished { id, output, failed: false })] if id == "c1" && output == "#1 SQLite")
+        );
+    }
+
+    #[test]
+    fn a_chosen_model_is_set_before_the_first_prompt() {
+        let mut state = State { model: Some("gemini-4-neon-high".into()), ..State::default() };
+        let (mode, cwd, tools) = (SessionMode::Ask, Path::new("/tmp"), json!([]));
+        state.receive(json!({ "id": 1, "result": { "protocolVersion": 1 } }), mode, cwd, &tools, "hi").unwrap();
+        let actions = state.receive(json!({ "id": 2, "result": { "sessionId": "s" } }), mode, cwd, &tools, "hi").unwrap();
+        let sent: Vec<&Value> = actions.iter().filter_map(|a| if let Action::Send(m) = a { Some(m) } else { None }).collect();
+        assert_eq!(sent[0]["id"], 3);
+        assert_eq!(sent[0]["method"], "session/set_model");
+        assert_eq!(sent[0]["params"]["modelId"], "gemini-4-neon-high");
+        assert_eq!(sent[1]["id"], 4);
+        assert_eq!(sent[1]["method"], "session/prompt");
+        // Method not found on older ACP servers is ignored; invalid params errors surface.
+        assert!(
+            state
+                .receive(json!({ "id": 3, "error": { "code": -32601, "message": "not implemented" } }), mode, cwd, &tools, "hi")
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn acp_config_options_set_model_and_effort_before_prompt() {
+        let mut state = State { model: Some("openai/gpt-6-sol".into()), effort: Some("high".into()), ..State::default() };
+        let (mode, cwd, tools) = (SessionMode::Ask, Path::new("/tmp"), json!([]));
+        state.receive(json!({ "id": 1, "result": { "protocolVersion": 1 } }), mode, cwd, &tools, "hi").unwrap();
+        let actions = state
+            .receive(
+                json!({
+                    "id": 2,
+                    "result": {
+                        "sessionId": "s",
+                        "configOptions": [
+                            { "id": "model", "category": "model" },
+                            { "id": "effort", "category": "thought_level" }
+                        ]
+                    }
+                }),
+                mode,
+                cwd,
+                &tools,
+                "hi",
+            )
+            .unwrap();
+        let sent: Vec<&Value> = actions.iter().filter_map(|a| if let Action::Send(m) = a { Some(m) } else { None }).collect();
+        assert_eq!(sent.len(), 3);
+        assert_eq!(sent[0]["id"], 3);
+        assert_eq!(sent[0]["method"], "session/set_config_option");
+        assert_eq!(sent[0]["params"], json!({ "sessionId": "s", "configId": "model", "value": "openai/gpt-6-sol" }));
+        assert_eq!(sent[1]["id"], 4);
+        assert_eq!(sent[1]["method"], "session/set_config_option");
+        assert_eq!(sent[1]["params"], json!({ "sessionId": "s", "configId": "effort", "value": "high" }));
+        assert_eq!(sent[2]["id"], 5);
+        assert_eq!(sent[2]["method"], "session/prompt");
+        assert!(state.receive(json!({ "id": 3, "result": {} }), mode, cwd, &tools, "hi").unwrap().is_empty());
+        let err = state
+            .receive(
+                json!({ "id": 4, "error": { "code": -32602, "message": "Invalid params: effort not found: high" } }),
+                mode,
+                cwd,
+                &tools,
+                "hi",
+            )
+            .unwrap_err();
+        assert!(err.to_string().contains("effort not found"));
     }
 }

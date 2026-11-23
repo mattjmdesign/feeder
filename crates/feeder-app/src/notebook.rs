@@ -28,7 +28,7 @@ use crate::{CopyTarget, State, ToastItem, ToastKind, agents, chrome, feed, orb};
 
 /// How far a list row's hover surface reaches past the text column on each side.
 const ROW_BLEED: f32 = 10.0;
-const INDEX_MAX_W: f32 = 760.0;
+const INDEX_MAX_W: f32 = 720.0;
 const DOC_MAX_W: f32 = 720.0;
 
 pub(crate) static PLUS_ICON: Icon = Icon {
@@ -208,7 +208,7 @@ impl Editor {
 
 impl Notebook {
     pub fn is_typing(&self) -> bool {
-        self.query.focused || self.editor.as_ref().is_some_and(Editor::is_typing)
+        self.query.focused || self.chat.input.focused || self.editor.as_ref().is_some_and(Editor::is_typing)
     }
 
     pub fn page(&self, id: i64) -> Option<&Page> {
@@ -327,7 +327,7 @@ fn score(p: &Page, words: &[String]) -> Option<usize> {
             6
         } else if topic_slug.contains(w.as_str()) || topic_name.contains(w.as_str()) {
             5
-        } else if p.tags.iter().any(|t| t.contains(w.as_str())) {
+        } else if p.tags.iter().any(|t| t.to_lowercase().contains(w.as_str())) {
             4
         } else if body.contains(w.as_str()) {
             2
@@ -422,11 +422,33 @@ impl State {
     /// Flags a Feed update for Curator review (idempotent on the store side).
     pub fn flag_update_for_notebook(&mut self, update_id: i64) {
         self.notebook_send(NotebookOp::FlagUpdate(update_id));
+        let project_id = self.feed.iter().chain(&self.timeline).chain(&self.search_hits).find(|u| u.id == update_id).map(|u| u.project_id);
         self.push_toast(
             "flagged-for-notebook",
-            ToastItem { title: "Flagged for Notebook".into(), description: None, kind: ToastKind::Info },
-            Some(2.5),
+            ToastItem {
+                title: "Flagged for Notebook".into(),
+                description: Some("Curator turns it into a note when you review.".into()),
+                kind: ToastKind::Flagged { project_id },
+            },
+            Some(5.0),
         );
+    }
+
+    /// Opens Curator on the flags waiting for review, scoped to a project when there is one.
+    pub fn open_flag_review(&mut self, project_id: Option<i64>, tx: &mut Tx) {
+        match project_id {
+            Some(id) => self.start_project_curator(id, tx),
+            None => {
+                self.close_project();
+                self.select_tab(crate::Tab::Notebook, tx);
+                self.notebook_shelf(Shelf::Gardener);
+            }
+        }
+    }
+
+    /// The open flag raised from this Feed update, if it's still waiting for review.
+    pub fn open_flag_for_update(&self, update_id: i64) -> bool {
+        self.notebook.gardener.open_flags.iter().any(|f| f.source_update_id == Some(update_id))
     }
 
     pub fn notebook_toggle_task(&mut self, page_id: i64, task_index: usize, checked: bool) {
@@ -465,10 +487,28 @@ impl State {
         let (title, id) = (draft.title.clone(), editor.id);
         match id {
             Some(id) => {
+                if let Some(page) = self.notebook.pages.iter_mut().find(|p| p.id == id) {
+                    page.title.clone_from(&draft.title);
+                    page.body.clone_from(&draft.body);
+                    page.kind = draft.kind;
+                    page.tags.clone_from(&draft.tags);
+                    if let Some(topic) = &draft.topic {
+                        page.topic.clone_from(topic);
+                    }
+                    page.updated_at = crate::now_ms();
+                }
                 self.notebook_send(NotebookOp::Revise(id, draft));
                 self.notebook.open = Some(id);
+                self.notebook.sync_tree();
             }
-            None => self.notebook_send(NotebookOp::Create(draft)),
+            None => {
+                if matches!(self.notebook.shelf, Shelf::Archived | Shelf::Gardener) {
+                    self.notebook.shelf = Shelf::All;
+                }
+                self.notebook.kind_filter = None;
+                self.notebook_send(NotebookOp::Create(draft));
+                self.notebook.sync_tree_selection();
+            }
         }
         self.notebook.editor = None;
         let verb = if id.is_some() { "Saved" } else { "Created" };
@@ -510,6 +550,7 @@ impl State {
         self.notebook.editor = None;
         self.notebook.delete_confirm = None;
         self.notebook.action_menu_open = false;
+        self.curator.close_picker();
         self.notebook.sync_tree_selection();
     }
 }
@@ -541,6 +582,14 @@ pub fn view(s: &State, p: &Palette, k: &Kit, inset: f32, reduced_motion: bool, l
     // pinned under the scroll area.
     let gardener = nb.editor.is_none() && nb.open.is_none() && nb.shelf == Shelf::Gardener;
     let following = gardener && !nb.chat.items.is_empty();
+    let scroll_key = match (&nb.editor, nb.open, &nb.shelf) {
+        (Some(_), _, _) => "notebook-scroll-editor".to_string(),
+        (None, Some(id), _) => format!("notebook-scroll-page-{id}"),
+        (None, None, Shelf::All) => "notebook-scroll-all".to_string(),
+        (None, None, Shelf::Topic(t)) => format!("notebook-scroll-topic-{t}"),
+        (None, None, Shelf::Archived) => "notebook-scroll-archived".to_string(),
+        (None, None, Shelf::Gardener) => "notebook-scroll-gardener".to_string(),
+    };
     let viewport = col()
         .w_full()
         .grow(1.0)
@@ -548,12 +597,22 @@ pub fn view(s: &State, p: &Palette, k: &Kit, inset: f32, reduced_motion: bool, l
         .child(col().w_full().items_center().px(40.0).pt(24.0).pb(if gardener { 24.0 } else { 80.0 }).child(body))
         .scroll(ScrollSpec { stick_bottom: following })
         .scroll_edge_fade(16.0);
-    let scroll_area = scroll_bar(k, "notebook-scroll-area", "notebook-scroll", viewport).w_full().grow(1.0).min_h(0.0);
-    let main_area = if gardener {
-        col().w_full().grow(1.0).min_h(0.0).child(scroll_area).child(crate::gardener::composer(s, p, k, INDEX_MAX_W, layer))
+    let scroll_area =
+        scroll_bar(k, "notebook-scroll-area", &scroll_key, viewport).w_full().grow(1.0).min_h(0.0).transition(Transition::none());
+    let main_inner = if gardener && crate::gardener::is_empty_idle(s) {
+        crate::gardener::empty_view(s, p, k, INDEX_MAX_W, layer).transition(Transition::none())
+    } else if gardener {
+        col().w_full().grow(1.0).min_h(0.0).transition(Transition::none()).child(scroll_area).child(crate::gardener::composer(
+            s,
+            p,
+            k,
+            INDEX_MAX_W,
+            layer,
+        ))
     } else {
         scroll_area
     };
+    let main_area = col().key("nb-main-area").w_full().grow(1.0).min_h(0.0).instant_changes().child(main_inner);
 
     let toolbar = Toolbar::new().leading(toolbar_breadcrumb(nb, p, k)).trailing(chrome::tabs(s, k)).trailing(chrome::menu(s, p, k, layer));
 
@@ -580,7 +639,7 @@ fn toolbar_breadcrumb(nb: &Notebook, p: &Palette, k: &Kit) -> El {
         btn.build(k).key(key.to_string())
     };
 
-    let mut row_el = row().key("nb-breadcrumb").gap(2.0).center_y().shrink().min_w(0.0);
+    let mut row_el = row().key("nb-breadcrumb").gap(2.0).center_y().shrink().min_w(0.0).instant_changes();
     if let Some(ed) = &nb.editor {
         let title_crumb = if ed.title.text.trim().is_empty() {
             if ed.id.is_some() { "Edit note".to_string() } else { "New note".to_string() }
@@ -588,7 +647,7 @@ fn toolbar_breadcrumb(nb: &Notebook, p: &Palette, k: &Kit) -> El {
             ed.title.text.trim().to_string()
         };
         row_el = row_el
-            .child(crumb_btn("nb-bc-all", "Notebook", false).on_press(|s: &mut State| {
+            .child(crumb_btn("nb-bc-root", "Notebook", false).on_press(|s: &mut State| {
                 s.notebook.editor = None;
                 s.notebook_shelf(Shelf::All);
             }))
@@ -611,19 +670,19 @@ fn toolbar_breadcrumb(nb: &Notebook, p: &Palette, k: &Kit) -> El {
     }
 
     match &nb.shelf {
-        Shelf::All => row_el.child(text("Notebook").font(k.ty.ui_medium).color(p.text).pl(CRUMB_PAD)),
+        Shelf::All => row_el.child(text("Notebook").key("nb-bc-root").font(k.ty.ui_compact).color(p.text).pl(CRUMB_PAD)),
         Shelf::Topic(slug) => row_el
-            .child(crumb_btn("nb-bc-all", "Notebook", false).on_press(|s: &mut State| s.notebook_shelf(Shelf::All)))
+            .child(crumb_btn("nb-bc-root", "Notebook", false).on_press(|s: &mut State| s.notebook_shelf(Shelf::All)))
             .child(sep())
-            .child(text(topic_label(slug).to_string()).font(k.ty.ui_medium).color(p.text).truncate().pl(CRUMB_PAD)),
+            .child(text(topic_label(slug).to_string()).font(k.ty.ui_compact).color(p.text).truncate().pl(CRUMB_PAD)),
         Shelf::Archived => row_el
-            .child(crumb_btn("nb-bc-all", "Notebook", false).on_press(|s: &mut State| s.notebook_shelf(Shelf::All)))
+            .child(crumb_btn("nb-bc-root", "Notebook", false).on_press(|s: &mut State| s.notebook_shelf(Shelf::All)))
             .child(sep())
-            .child(text("Archived").font(k.ty.ui_medium).color(p.text).pl(CRUMB_PAD)),
+            .child(text("Archived").font(k.ty.ui_compact).color(p.text).pl(CRUMB_PAD)),
         Shelf::Gardener => row_el
-            .child(crumb_btn("nb-bc-all", "Notebook", false).on_press(|s: &mut State| s.notebook_shelf(Shelf::All)))
+            .child(crumb_btn("nb-bc-root", "Notebook", false).on_press(|s: &mut State| s.notebook_shelf(Shelf::All)))
             .child(sep())
-            .child(text("Curator").font(k.ty.ui_medium).color(p.text).pl(CRUMB_PAD)),
+            .child(text("Curator").font(k.ty.ui_compact).color(p.text).pl(CRUMB_PAD)),
     }
 }
 
@@ -702,6 +761,7 @@ fn sidebar_view(s: &State, p: &Palette, k: &Kit) -> El {
             .w_full()
             .h_full()
             .min_h(0.0)
+            .instant_changes()
             .child(header)
             .child(if nb.gardener.chats.is_empty() {
                 el()
@@ -716,8 +776,14 @@ fn sidebar_view(s: &State, p: &Palette, k: &Kit) -> El {
         topics_head = topics_head.count(topics.len());
     }
 
-    let mut sb =
-        col().key("nb-sidebar").w_full().h_full().min_h(0.0).child(header).child(el().w_full().px(8.0).child(topics_head.build(k)));
+    let mut sb = col()
+        .key("nb-sidebar")
+        .w_full()
+        .h_full()
+        .min_h(0.0)
+        .instant_changes()
+        .child(header)
+        .child(el().w_full().px(8.0).child(topics_head.build(k)));
 
     if nb.tree.is_empty() {
         sb = sb.child(
@@ -988,7 +1054,7 @@ fn page_view(s: &State, page: &Page, p: &Palette, k: &Kit, layer: &mut Vec<El>) 
         .child(rune::spacer())
         .child(actions);
 
-    let mut doc = col().key(format!("nb-sheet-{id}")).w_full().max_w(DOC_MAX_W).transition(Transition::opacity()).child(top_bar);
+    let mut doc = col().key(format!("nb-sheet-{id}")).w_full().max_w(DOC_MAX_W).transition(Transition::none()).child(top_bar);
 
     if s.notebook.delete_confirm == Some(id) {
         let confirm = row()
@@ -1072,10 +1138,8 @@ fn page_view(s: &State, page: &Page, p: &Palette, k: &Kit, layer: &mut Vec<El>) 
         .child(text(revised).font(style::META).color(p.text_3));
 
     if !page.tags.is_empty() {
-        let page_topic = page.topic.clone();
         for tag in &page.tags {
             let t = tag.clone();
-            let topic_for_tag = page_topic.clone();
             meta = meta.child(
                 row()
                     .key(format!("nb-chip-{tag}"))
@@ -1090,7 +1154,7 @@ fn page_view(s: &State, page: &Page, p: &Palette, k: &Kit, layer: &mut Vec<El>) 
                     .hover(k.c.hover)
                     .cursor(Cursor::Pointer)
                     .on_press(move |s: &mut State| {
-                        s.notebook_shelf(Shelf::Topic(topic_for_tag.clone()));
+                        s.notebook_shelf(Shelf::All);
                         s.notebook.query = TextEdit::new(&t);
                         s.notebook.apply_tree_filter();
                     })
@@ -1609,7 +1673,7 @@ fn editor_view(nb: &Notebook, ed: &Editor, p: &Palette, k: &Kit, layer: &mut Vec
                         tx.focus_when_shown("nb-f-title", false);
                     }
                 })
-                .on_key(|s: &mut State, e: &KeyEvent, _| editor_common_key(s, e)),
+                .on_input_key(|s: &mut State, e: &KeyEvent, _| editor_common_key(s, e)),
         );
     }
 
@@ -1644,10 +1708,10 @@ fn editor_view(nb: &Notebook, ed: &Editor, p: &Palette, k: &Kit, layer: &mut Vec
                     tx.focus_when_shown("nb-f-body", false);
                 }
             })
-            .on_key(|s: &mut State, e: &KeyEvent, _| editor_common_key(s, e))
+            .on_input_key(|s: &mut State, e: &KeyEvent, _| editor_common_key(s, e))
     };
 
-    let mut page = col().key("nb-editor").w_full().max_w(DOC_MAX_W).transition(Transition::opacity()).child(top_bar).child(title_el);
+    let mut page = col().key("nb-editor").w_full().max_w(DOC_MAX_W).transition(Transition::none()).child(top_bar).child(title_el);
 
     if !ed.preview {
         page = page.child(format_toolbar(p, k).mt(14.0));
@@ -1679,7 +1743,7 @@ fn editor_view(nb: &Notebook, ed: &Editor, p: &Palette, k: &Kit, layer: &mut Vec
             .label("Note body")
             .on_edit(|s: &mut State| editor_field(s, |ed| &mut ed.body))
             .on_submit(|s: &mut State, _| smart_enter(s))
-            .on_key(|s: &mut State, e: &KeyEvent, _| body_key(s, e))
+            .on_input_key(|s: &mut State, e: &KeyEvent, _| body_key(s, e))
     };
 
     let word_count = ed.body.text.split_whitespace().count();
@@ -2395,5 +2459,34 @@ mod tests {
             assert!(s <= e && e <= src.len(), "out of bounds span {s}..{e}");
             assert!(src.is_char_boundary(s) && src.is_char_boundary(e), "non-char-boundary span {s}..{e}");
         }
+    }
+
+    #[test]
+    fn mixed_case_tags_match_search_and_curator_focus_blocks_shortcuts() {
+        let mut nb = Notebook::default();
+        nb.set_pages(vec![page(1, Kind::Note, "macos", "Window setup", &["macOS", "SQLite"], Standing::Current)]);
+        nb.query = TextEdit::new("sqlite");
+        assert_eq!(nb.visible().len(), 1);
+        nb.query = TextEdit::new("macos");
+        assert_eq!(nb.visible().len(), 1);
+
+        nb.query = TextEdit::new("");
+        assert!(!nb.is_typing());
+        nb.chat.input.focused = true;
+        assert!(nb.is_typing());
+    }
+
+    #[test]
+    fn saving_new_note_from_archived_shelf_switches_to_all() {
+        let mut s = State::new();
+        s.notebook = notebook();
+        s.notebook.shelf = Shelf::Archived;
+        s.notebook_new_page();
+        let ed = s.notebook.editor.as_mut().unwrap();
+        ed.title = TextEdit::new("Fresh note");
+        ed.body = TextEdit::new("Body content");
+        s.notebook_save();
+        assert!(s.notebook.editor.is_none());
+        assert_eq!(s.notebook.shelf, Shelf::All);
     }
 }

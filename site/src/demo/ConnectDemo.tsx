@@ -7,7 +7,7 @@ import { ToolLogo, type ToolKey } from './ToolLogo'
 import { useSiteTheme } from './theme'
 import './demos.css'
 
-// Connecting a tool in Settings → Agents. Beats, once in view: the cursor
+// Connecting a tool in Settings → Connected Tools. Beats, once in view: the cursor
 // goes to Codex's Connect and clicks it; the button settles as Connected
 // with a check, on the same button, and the row's note changes to say the
 // tool needs a restart. Claude Code is already connected, Cursor not yet.
@@ -87,7 +87,7 @@ export default function ConnectDemo() {
       {s => (
         <Window className="cd-win" title="Settings">
           <div className="cd-body">
-            <div className="cd-title">Agents</div>
+            <div className="cd-title">Connected Tools</div>
             <div className="cd-sub">Connect the tools you use. Restart a tool after connecting it.</div>
             <div className="cd-list">
               <ToolRow tool="claude" name="Claude Code" note="Connected" connected />

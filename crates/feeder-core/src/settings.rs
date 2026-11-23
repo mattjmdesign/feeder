@@ -107,10 +107,22 @@ impl Settings {
 
     /// Writes through a temporary file, so a crash never leaves half a file.
     pub fn save(&self, dir: &Path) -> std::io::Result<()> {
+        use std::io::Write;
         std::fs::create_dir_all(dir)?;
-        let tmp = dir.join("settings.json.tmp");
-        std::fs::write(&tmp, serde_json::to_string_pretty(self).expect("settings serialize"))?;
-        std::fs::rename(tmp, dir.join("settings.json"))
+        let tmp = dir.join(format!("settings.json.tmp-{}-{:08x}", std::process::id(), fastrand::u32(..)));
+        let data = serde_json::to_string_pretty(self).expect("settings serialize");
+        let written = (|| -> std::io::Result<()> {
+            let mut file = std::fs::OpenOptions::new().write(true).create_new(true).open(&tmp)?;
+            file.write_all(data.as_bytes())?;
+            file.sync_all()
+        })();
+        if let Err(error) = written {
+            let _ = std::fs::remove_file(&tmp);
+            return Err(error);
+        }
+        std::fs::rename(&tmp, dir.join("settings.json")).inspect_err(|_| {
+            let _ = std::fs::remove_file(&tmp);
+        })
     }
 }
 

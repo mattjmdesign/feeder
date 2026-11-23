@@ -3,12 +3,12 @@
 //! opens that project's full history.
 
 use std::collections::BTreeSet;
+use std::rc::Rc;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use feeder_core::{FeedUpdate, ProjectSummary, ago, day_key, day_label};
-use rune::tok::motion;
-use rune::{Cursor, El, Key, KeyEvent, ScrollPos, ScrollSpec, Transition, Tx, col, el, row, text, text_input};
+use rune::{Cursor, El, GrowthSpec, Key, KeyEvent, ScrollPos, ScrollSpec, Transition, Tx, col, el, memo, row, text, text_input};
 use rune_kit::{Divider, Kit, MarkdownStyle, Menu, MenuItem, Placement, Spinner, scroll_bar};
 
 use crate::style::{self, Palette};
@@ -24,7 +24,6 @@ const GUTTER: f32 = 12.0;
 const PRELOAD: f32 = 1200.0;
 
 pub fn view(s: &State, p: &Palette, k: &Kit, layer: &mut Vec<El>) -> El {
-    let md = feed::markdown_style(p, k);
     let total: i64 = s.projects.iter().filter(|p| !p.project.archived).map(|p| p.updates).sum();
     let visible = s.filtered_timeline();
     let query = s.feed_search.text.trim();
@@ -32,21 +31,11 @@ pub fn view(s: &State, p: &Palette, k: &Kit, layer: &mut Vec<El>) -> El {
     let more = unfiltered && (visible.len() as i64) < total;
 
     let filter_bar = filter_row(s, p);
-    let mut list = col().key("posts").w_full();
-    if unfiltered && let Some(live) = working_now(s, p, k) {
-        list = list.child(live);
-    }
-    let mut prev_day: Option<i64> = None;
-    for (i, (u, summary)) in visible.iter().enumerate() {
-        let dk = day_key(u.created_at);
-        if prev_day != Some(dk) {
-            list = list.child(feed::day_divider(day_label(u.created_at, s.now), p, i > 0));
-            prev_day = Some(dk);
-        } else {
-            list = list.child(Divider::horizontal().build(k).pl(AVATAR + GUTTER));
-        }
-        list = list.child(post(s, p, k, &md, u, summary, layer));
-    }
+    let waiting = unfiltered.then(|| needs_you_now(s, p)).flatten();
+    let live = unfiltered.then(|| working_now(s, p, k)).flatten();
+    let watcher = s.watcher.clone();
+    let asked = s.timeline_asked.clone();
+    let next = s.timeline.len().max(s.timeline_limit) + TIMELINE_PAGE;
     let footer = if !s.loaded {
         el()
     } else if visible.is_empty() {
@@ -57,34 +46,92 @@ pub fn view(s: &State, p: &Palette, k: &Kit, layer: &mut Vec<El>) -> El {
         let n = visible.len();
         text(format!("{n} match{} across full history", if n == 1 { "" } else { "es" })).font(style::META).color(p.text_3)
     } else if more {
-        text("Loading earlier updates…").font(style::META).color(p.text_3)
+        let asked_click = asked.clone();
+        chrome::bar_button("timeline-load-more", "Load Earlier Updates", p).border(1.0, p.hairline).on_press(move |s: &mut State| {
+            request(&asked_click, next, s.watcher.as_ref());
+        })
     } else {
         text("All caught up").font(style::META).color(p.text_3)
     };
 
-    let watcher = s.watcher.clone();
-    let asked = s.timeline_asked.clone();
-    let next = s.timeline.len().max(s.timeline_limit) + TIMELINE_PAGE;
     let near_end = move |at: ScrollPos| {
         if more && at.offset[1] + PRELOAD >= at.max[1] {
             request(&asked, next, watcher.as_ref());
         }
     };
 
-    let viewport =
-        col()
-            .w_full()
-            .grow(1.0)
-            .min_h(0.0)
-            .child(col().w_full().items_center().px(24.0).pt(12.0).pb(72.0).child(
-                col().w_full().max_w(COLUMN).gap(16.0).child(filter_bar).child(list).child(el().h(12.0)).child(footer.self_center()),
-            ))
-            .scroll(ScrollSpec { stick_bottom: false })
-            .scroll_edge_fade(20.0)
-            .on_scroll_offset(near_end);
+    let mut content = col().w_full().max_w(COLUMN).gap(16.0).child(filter_bar);
+    if let Some(waiting) = waiting {
+        content = content.child(waiting);
+    }
+    if let Some(live) = live {
+        content = content.child(live);
+    }
+    if !visible.is_empty() {
+        content = content.child(posts(s, p, k, &visible, layer));
+    }
+    content = content.child(el().h(12.0)).child(footer.self_center());
+
+    let viewport = col()
+        .w_full()
+        .grow(1.0)
+        .min_h(0.0)
+        .child(col().w_full().items_center().px(24.0).pt(12.0).pb(72.0).child(content))
+        .scroll(ScrollSpec { stick_bottom: false })
+        .scroll_edge_fade(20.0)
+        .on_scroll_offset(near_end);
     let scroller = scroll_bar(k, "timeline-scroll-area", "timeline-scroll", viewport).w_full().grow(1.0).min_h(0.0);
 
-    col().key("timeline").w_full().grow(1.0).min_h(0.0).transition(Transition::opacity()).child(scroller)
+    col().key("timeline").w_full().grow(1.0).min_h(0.0).transition(Transition::none()).child(scroller)
+}
+
+struct PostRow {
+    id: i64,
+    key: String,
+    starts_day: bool,
+}
+
+fn posts(s: &State, p: &Palette, k: &Kit, visible: &[(&FeedUpdate, &ProjectSummary)], layer: &mut Vec<El>) -> El {
+    let mut previous_day = None;
+    let rows: Rc<[PostRow]> = visible
+        .iter()
+        .map(|(update, _)| {
+            let day = day_key(update.created_at);
+            PostRow { id: update.id, key: format!("t-{}", update.id), starts_day: previous_day.replace(day) != Some(day) }
+        })
+        .collect();
+    let keys = rows.clone();
+    // Rune mounts the menu in the root overlay, independently of the lazy row that anchors it.
+    let menu = s.post_menu.filter(|id| rows.iter().any(|r| r.id == *id)).map(|id| (id, post_menu(id, p, k, layer)));
+    let (p, k) = (*p, k.clone());
+    let md = feed::markdown_style(&p, &k);
+    col()
+        .key("posts")
+        .w_full()
+        .growth(GrowthSpec::default())
+        .virtual_rows(
+            rows.len(),
+            240.0,
+            move |_: &State, i| keys[i].key.clone().into(),
+            move |s: &State, i| {
+                let PostRow { id, starts_day, .. } = rows[i];
+                let (_, source) = s.timeline_source();
+                let Some(u) = source.iter().find(|u| u.id == id) else { return el() };
+                let Some(summary) = s.summary(u.project_id) else { return el() };
+                let divider = if starts_day {
+                    feed::day_divider(day_label(u.created_at, s.now), &p, i > 0)
+                } else {
+                    Divider::horizontal().build(&k).pl(AVATAR + GUTTER)
+                };
+                let menu_trigger = menu.as_ref().filter(|(menu_id, _)| *menu_id == id).map(|(_, trigger)| trigger.clone());
+                col().w_full().child(divider).child(post(s, (&p, &k, &md), u, summary, menu_trigger))
+            },
+        )
+        .on_visible_rows(|s: &mut State, range| {
+            s.feed_visible_rows = Some(range);
+            crate::media::sync(s);
+            false
+        })
 }
 
 fn filter_row(s: &State, p: &Palette) -> El {
@@ -96,7 +143,8 @@ fn filter_row(s: &State, p: &Palette) -> El {
         .min_w(0.0)
         .color(p.text)
         .caret(p.text, p.selection)
-        .placeholder("Search updates…  ⌘F", p.text_3)
+        .placeholder("Search updates", p.text_3)
+        .help("Search updates (Command-F)")
         .on_edit(|s: &mut State| &mut s.feed_search)
         .on_input_key(|s: &mut State, e: &KeyEvent, _tx: &mut Tx| {
             if matches!(e.key, Key::Escape) && !s.feed_search.text.is_empty() {
@@ -166,7 +214,8 @@ fn filter_row(s: &State, p: &Palette) -> El {
         );
     }
     row_el = row_el.child(
-        chip("f-shots", "Media".into(), s.feed_filter == FeedFilter::Shots).on_press(|s: &mut State| s.feed_filter = FeedFilter::Shots),
+        chip("f-shots", "With media".into(), s.feed_filter == FeedFilter::Shots)
+            .on_press(|s: &mut State| s.feed_filter = FeedFilter::Shots),
     );
 
     let agents: Vec<String> = s.timeline.iter().map(|u| u.agent.clone()).collect::<BTreeSet<_>>().into_iter().collect();
@@ -203,13 +252,87 @@ fn request(asked: &Arc<AtomicUsize>, n: usize, watcher: Option<&crate::watch::Wa
     }
 }
 
+fn strip_label(label: &str, p: &Palette) -> El {
+    text(label.to_uppercase()).font(style::LABEL).color(p.text_3).pb(2.0)
+}
+
+/// Decisions waiting on the person, pinned above everything else: the question itself, and the
+/// ways to act on it without hunting for the post.
+fn needs_you_now(s: &State, p: &Palette) -> Option<El> {
+    let waiting: Vec<&ProjectSummary> = s.projects.iter().filter(|p| !p.project.archived && p.needs_you).collect();
+    if waiting.is_empty() {
+        return None;
+    }
+    let action = |key: String, label: &str, a11y: String| {
+        row()
+            .key(key)
+            .role("button")
+            .label(a11y)
+            .focusable(true)
+            .h(24.0)
+            .px(8.0)
+            .center_y()
+            .radius(6.0)
+            .border(1.0, p.hairline)
+            .hover(p.hover)
+            .cursor(Cursor::Pointer)
+            .child(text(label.to_string()).font(style::META).color(p.text_2))
+    };
+    let mut rows = col().key("needs-you-now").w_full().gap(6.0).pb(4.0).child(strip_label("Needs you", p));
+    for summary in waiting {
+        let id = summary.project.id;
+        let name = summary.project.name.clone();
+        let question = crate::home::needs_you_question(summary).unwrap_or_else(|| "Waiting for your reply".into());
+        let mut actions = row().gap(4.0).center_y();
+        if let Some(uid) = summary.last_update_id {
+            actions = actions
+                .child(action(format!("needs-reply-{id}"), "Reply", format!("Reply to {name}")).on_press_tx(
+                    move |s: &mut State, tx: &mut Tx| {
+                        // The Needs you filter puts this post first, so its reply box is on screen.
+                        s.feed_filter = FeedFilter::NeedsYou;
+                        s.start_reply(uid, tx);
+                    },
+                ))
+                .child(
+                    action(format!("needs-dismiss-{id}"), "Dismiss", format!("Dismiss Needs you for {name}"))
+                        .on_press(move |s: &mut State| s.dismiss_attention(uid)),
+                );
+        }
+        actions = actions
+            .child(action(format!("needs-open-{id}"), "Open", format!("Open {name}")).on_press(move |s: &mut State| s.open_project(id)));
+        rows = rows.child(
+            row()
+                .key(format!("needs-{id}"))
+                .w_full()
+                .gap(10.0)
+                .center_y()
+                .px(12.0)
+                .py(8.0)
+                .radius(10.0)
+                .fill(p.amber.alpha(0.08))
+                .border(1.0, p.amber.alpha(0.35))
+                .child(el().size(6.0, 6.0).radius(3.0).fill(p.amber))
+                .child(
+                    col()
+                        .grow(1.0)
+                        .min_w(0.0)
+                        .gap(2.0)
+                        .child(text(name.clone()).font(style::AGENT).color(p.text).truncate())
+                        .child(text(question).font(style::META).color(p.text_2).max_lines(2)),
+                )
+                .child(actions),
+        );
+    }
+    Some(rows)
+}
+
 /// Agents at work right now, pinned above the posts: native Spinner, who, where, and what.
 fn working_now(s: &State, p: &Palette, k: &Kit) -> Option<El> {
     let live: Vec<&ProjectSummary> = s.projects.iter().filter(|p| !p.project.archived && p.active_pulse.is_some()).collect();
     if live.is_empty() {
         return None;
     }
-    let mut rows = col().key("working-now").w_full().gap(6.0).pb(12.0);
+    let mut rows = col().key("working-now").w_full().gap(6.0).pb(12.0).child(strip_label("Working now", p));
     for summary in live {
         let Some(pulse) = &summary.active_pulse else { continue };
         let id = summary.project.id;
@@ -241,7 +364,7 @@ fn working_now(s: &State, p: &Palette, k: &Kit) -> Option<El> {
 /// One post, laid out like a timeline: the project's orb on the left; one header line of
 /// project, agent, branch and time; the update itself; then quiet actions that appear on hover
 /// or keyboard focus.
-fn post(s: &State, p: &Palette, k: &Kit, md: &MarkdownStyle, u: &FeedUpdate, summary: &ProjectSummary, layer: &mut Vec<El>) -> El {
+fn post(s: &State, (p, k, md): (&Palette, &Kit, &MarkdownStyle), u: &FeedUpdate, summary: &ProjectSummary, menu_trigger: Option<El>) -> El {
     let id = summary.project.id;
     let uid = u.id;
     let selected = s.timeline_selected == Some(uid);
@@ -255,7 +378,9 @@ fn post(s: &State, p: &Palette, k: &Kit, md: &MarkdownStyle, u: &FeedUpdate, sum
             .on_press(move |s: &mut State| s.open_project(id))
             .child(child)
     };
-    let avatar = open_project("avatar", orb::orb(&summary.project.orb, AVATAR)).size(AVATAR, AVATAR).press_scale(0.96);
+    let avatar = open_project("avatar", memo(format!("t-orb-{uid}"), id, || orb::orb(&summary.project.orb, AVATAR)))
+        .size(AVATAR, AVATAR)
+        .press_scale(0.96);
 
     let mut header = row()
         .w_full()
@@ -265,15 +390,16 @@ fn post(s: &State, p: &Palette, k: &Kit, md: &MarkdownStyle, u: &FeedUpdate, sum
         .child(agents::mark(&u.agent, p, 14.0, s.agent_icon(&u.agent)))
         .child(text(u.agent.clone()).font(style::META).color(p.text_2).truncate().shrink());
     if let Some(branch) = feed::branch_pill_clickable(s, p, u.branch.as_deref()) {
-        header = header.child(text("·").font(style::META).color(p.text_3)).child(branch);
+        header = header.child(action_dot(p)).child(branch);
     }
     header = header
         .child(rune::spacer())
-        .child(post_actions(s, p, k, u, layer))
+        .child(post_actions(s, p, u, menu_trigger))
         .child(text(ago(u.created_at, s.now)).font(style::META).color(p.text_3));
 
     let mut words = col().grow(1.0).min_w(0.0).gap(8.0).child(header);
-    let attention = feed::card_attention_tags(s, p, u);
+    let mut attention = feed::card_attention_tags(s, p, u);
+    attention.extend(feed::flag_pill(s, p, u));
     if !attention.is_empty() {
         let mut tags = row().gap(6.0).center_y();
         for tag in attention {
@@ -281,7 +407,11 @@ fn post(s: &State, p: &Palette, k: &Kit, md: &MarkdownStyle, u: &FeedUpdate, sum
         }
         words = words.child(tags);
     }
-    words = words.child(if s.editing_update == Some(uid) { feed::edit_or_body(s, p, k, md, u, true) } else { post_body(p, md, u) });
+    words = words.child(if s.editing_update == Some(uid) {
+        feed::edit_or_body(s, p, k, md, u, true)
+    } else {
+        memo(format!("t-body-{uid}"), (p.dark, &u.body), || post_body(p, md, u))
+    });
     if let Some(media) = feed::media_view(s, p, u, COLUMN - AVATAR - GUTTER) {
         words = words.child(media);
     }
@@ -293,7 +423,6 @@ fn post(s: &State, p: &Palette, k: &Kit, md: &MarkdownStyle, u: &FeedUpdate, sum
     }
 
     row()
-        .key(format!("t-{uid}"))
         .w_full()
         .gap(GUTTER)
         .items_start()
@@ -303,8 +432,6 @@ fn post(s: &State, p: &Palette, k: &Kit, md: &MarkdownStyle, u: &FeedUpdate, sum
         .radius(12.0)
         .fill(if selected { p.hover } else { p.hover.alpha(0.0) })
         .hover_group()
-        .transition(Transition::opacity())
-        .motion(motion::DEFAULT)
         .child(avatar)
         .child(words)
 }
@@ -340,40 +467,55 @@ fn sentence_case(label: &str) -> String {
     chars.next().map(|c| c.to_uppercase().chain(chars).collect()).unwrap_or_default()
 }
 
-/// Reply, Copy and the ⋯ menu (Flag for Notebook, Edit, Delete) on the header line, shown on
-/// hover or keyboard focus so a stream of posts stays quiet.
-fn post_actions(s: &State, p: &Palette, k: &Kit, u: &FeedUpdate, layer: &mut Vec<El>) -> El {
+fn post_action(p: &Palette, key: String, a11y: &str, content: El) -> El {
+    row()
+        .key(key)
+        .role("button")
+        .label(a11y.to_string())
+        .focusable(true)
+        .h(22.0)
+        .px(7.0)
+        .center_y()
+        .radius(6.0)
+        .hover(p.hover)
+        .cursor(Cursor::Pointer)
+        .child(content)
+}
+
+fn action_dot(p: &Palette) -> El {
+    el().size(2.0, 2.0).radius(1.0).fill(p.text_3)
+}
+
+fn more_action(uid: i64, p: &Palette) -> El {
+    let dots = row().gap(2.0).center_y().children((0..3).map(|_| action_dot(p))).a11y_hidden();
+    post_action(p, format!("more-u-{uid}"), "More actions", dots)
+        .on_press(move |s: &mut State| s.post_menu = if s.post_menu == Some(uid) { None } else { Some(uid) })
+}
+
+/// Reply, Copy and More actions, revealed on hover or keyboard focus.
+fn post_actions(s: &State, p: &Palette, u: &FeedUpdate, menu_trigger: Option<El>) -> El {
     let uid = u.id;
-    let action = |key: String, label: String, a11y: &str| {
-        row()
-            .key(key)
-            .role("button")
-            .label(a11y.to_string())
-            .focusable(true)
-            .h(22.0)
-            .px(7.0)
-            .center_y()
-            .radius(6.0)
-            .hover(p.hover)
-            .cursor(Cursor::Pointer)
-            .child(text(label).font(style::META).color(p.text_3))
-    };
     let reply_count = s.replies.get(&uid).map_or(0, Vec::len);
     let reply_label = if reply_count > 0 { format!("Reply · {reply_count}") } else { "Reply".to_string() };
-    let reply = action(format!("reply-u-{uid}"), reply_label, "Reply to update")
+    let reply = post_action(p, format!("reply-u-{uid}"), "Reply to update", text(reply_label).font(style::META).color(p.text_3))
         .on_press_tx(move |s: &mut State, tx: &mut Tx| s.start_reply(uid, tx));
     let body = u.body.clone();
-    let copy_label = if s.is_copied(CopyTarget::Update(uid)) { "Copied" } else { "Copy" }.to_string();
-    let copy = action(format!("copy-u-{uid}"), copy_label, "Copy update").on_press_tx(move |s: &mut State, tx: &mut Tx| {
-        tx.copy(body.clone());
-        s.mark_copied(CopyTarget::Update(uid));
-    });
-    let menu_open = s.post_menu == Some(uid);
-    let trigger = action(format!("more-u-{uid}"), "⋯".to_string(), "More actions")
-        .on_press(move |s: &mut State| s.post_menu = if s.post_menu == Some(uid) { None } else { Some(uid) });
-    let more = Menu::new(format!("post-menu-{uid}"))
-        .trigger(trigger)
-        .open(menu_open)
+    let copy_label = if s.is_copied(CopyTarget::Update(uid)) { "Copied" } else { "Copy" };
+    let copy = post_action(p, format!("copy-u-{uid}"), "Copy update", text(copy_label).font(style::META).color(p.text_3)).on_press_tx(
+        move |s: &mut State, tx: &mut Tx| {
+            tx.copy(body.clone());
+            s.mark_copied(CopyTarget::Update(uid));
+        },
+    );
+    let shown = menu_trigger.is_some() || s.replying_to == Some(uid);
+    let more = menu_trigger.unwrap_or_else(|| more_action(uid, p));
+    row().gap(2.0).center_y().group_opacity(if shown { 1.0 } else { 0.0 }, 1.0).child(reply).child(copy).child(more)
+}
+
+fn post_menu(uid: i64, p: &Palette, k: &Kit, layer: &mut Vec<El>) -> El {
+    Menu::new(format!("post-menu-{uid}"))
+        .trigger(more_action(uid, p))
+        .open(true)
         .placement(Placement::BottomEnd)
         .min_width(176.0)
         .on_close(|s: &mut State| s.post_menu = None)
@@ -390,9 +532,7 @@ fn post_actions(s: &State, p: &Palette, k: &Kit, u: &FeedUpdate, layer: &mut Vec
             s.post_menu = None;
             s.delete_confirm = Some(uid);
         }))
-        .build(k, layer);
-    let shown = menu_open || s.replying_to == Some(uid);
-    row().gap(2.0).center_y().group_opacity(if shown { 1.0 } else { 0.0 }, 1.0).child(reply).child(copy).child(more)
+        .build(k, layer)
 }
 
 /// The post's footer: diff stat and/or a quiet link to the Notebook note sourced from this update.

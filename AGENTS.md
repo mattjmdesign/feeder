@@ -141,8 +141,10 @@ target/debug/feeder-app --snap "$TMPDIR/nb.png" --scene notebook --size 1180x760
 - `--frames` gives background work, such as the Settings tool scan, time to land.
 - Check light and dark. Look at the image; a snapshot that renders isn't proof the layout is
   right.
-- Window chrome (the traffic lights, the real corner) only shows in a live window: run the app and
-  capture it with `screencapture -l <window id>`.
+- Replay navigation with `--script` on scratch data. Add `--realtime` for background loading and
+  `--trace` for frame timings. These runs open no window.
+- Use a live window for native-only checks such as title-bar controls. Keep live tests in the
+  background when the Mac is in use.
 
 ## Ship a release
 

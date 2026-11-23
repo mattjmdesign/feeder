@@ -47,6 +47,10 @@ accesskit_macos = { git = "https://github.com/anomalyco/rune", rev = "d170ff6e4a
 # 13 GB target/debug; Feeder's own crates keep full debug info for backtraces and debugging.
 [profile.dev.package."*"]
 debug = false
+# Optimize dependencies in dev builds. At opt-level 0, layout, text shaping, and PNG decoding in
+# Rune's stack ran many times slower, so switching to an image-heavy Feed lagged in debug builds.
+# Feeder's own crates stay unoptimized for fast incremental builds.
+opt-level = 3
 
 [profile.release]
 lto = "thin"

@@ -19,7 +19,7 @@ pub fn view(s: &State, p: &Palette, k: &Kit, reduced_motion: bool, layer: &mut V
         shelf(s, p, k, reduced_motion, layer)
     };
 
-    col().key("home").w_full().grow(1.0).min_h(0.0).transition(Transition::opacity()).child(body)
+    col().key("home").w_full().grow(1.0).min_h(0.0).transition(Transition::none()).child(body)
 }
 
 pub fn ordered_active(s: &State) -> Vec<&ProjectSummary> {
@@ -106,34 +106,27 @@ fn shelf(s: &State, p: &Palette, k: &Kit, reduced_motion: bool, layer: &mut Vec<
             content = content.child(text("No projects match this filter").font(style::META).color(p.text_3).py(32.0));
         } else {
             let mut grid = row().key("shelf").w_full().max_w(row_w).flex_wrap().justify_center().gap(gap);
-            for summary in active {
+            for summary in &active {
                 grid = grid.child(tile(s, summary, p, k, reduced_motion, layer, size));
             }
             content = content.child(grid);
         }
 
-        let focus_id = s.hovered.or(s.home_selected);
+        let focus_id = s.hovered.or_else(|| s.home_selected.filter(|id| active.iter().any(|p| p.project.id == *id)));
         let preview = match focus_id.and_then(|id| s.summary(id)) {
             Some(sum) => {
-                let line = if sum.needs_you {
-                    sum.last_body
-                        .as_deref()
-                        .and_then(|b| extract_block(b, &["decision needed", "decision", "blocked"]))
-                        .map(|t| format!("Needs you: {}", feed::first_line(&t, 76)))
-                } else {
-                    None
-                }
-                .or_else(|| sum.active_pulse.as_ref().map(|pu| format!("{}: {}", pu.agent, pu.status)))
-                .unwrap_or_else(|| {
-                    sum.last_body
-                        .as_deref()
-                        .map(|b| feed::first_line(b, 84))
-                        .filter(|l| !l.is_empty())
-                        .unwrap_or_else(|| "No updates yet".into())
-                });
+                let line = if sum.needs_you { needs_you_question(sum).map(|q| format!("Needs you: {q}")) } else { None }
+                    .or_else(|| sum.active_pulse.as_ref().map(|pu| format!("{}: {}", pu.agent, pu.status)))
+                    .unwrap_or_else(|| {
+                        sum.last_body
+                            .as_deref()
+                            .map(|b| feed::first_line(b, 84))
+                            .filter(|l| !l.is_empty())
+                            .unwrap_or_else(|| "No updates yet".into())
+                    });
                 text(format!("{} · {line}", sum.project.name)).font(style::META).color(p.text_2).truncate()
             }
-            None => text("⌘K to jump · j/k to select · Enter to open").font(style::META).color(p.text_3.alpha(0.7)),
+            None => el(),
         };
         content = content.child(row().key("hover-preview").h(20.0).max_w(640.0).center().child(preview));
 
@@ -257,18 +250,17 @@ fn tile(s: &State, summary: &ProjectSummary, p: &Palette, k: &Kit, reduced_motio
     }
 
     let mut words = col().items_center().gap(5.0).child(name_row).child(meta);
+    // Status in words, two lines at most: the orb is the project's face, the text says what's up.
+    let status_text =
+        |line: String, color| text(line).font(style::META).color(color).align(rune::Align::Center).max_lines(2).max_w(width - 4.0);
     if !archived && let Some(pulse) = &summary.active_pulse {
-        words = words.child(
-            row()
-                .gap(4.0)
-                .center_y()
-                .max_w(width - 4.0)
-                .child(el().size(5.0, 5.0).radius(2.5).fill(p.live))
-                .child(text(pulse.status.clone()).font(style::META).color(p.live).truncate()),
-        );
+        words = words.child(status_text(format!("Working · {}", pulse.status), p.live));
     } else if !archived && summary.needs_you {
         words = words
             .child(el().px(6.0).py(1.0).radius(5.0).fill(p.amber.alpha(0.14)).child(text("Needs you").font(style::META).color(p.text)));
+        if let Some(question) = needs_you_question(summary) {
+            words = words.child(status_text(question, p.text_2));
+        }
     }
     if s.settings.show_folders
         && summary.project.renamed()
@@ -318,6 +310,19 @@ fn tile(s: &State, summary: &ProjectSummary, p: &Palette, k: &Kit, reduced_motio
         .item(MenuItem::new(if archived { "Unarchive" } else { "Archive" }).on_select(move |s: &mut State| s.set_archived(id, !archived)))
         .on_close(|s: &mut State| s.orb_menu = None)
         .build(k, layer)
+}
+
+/// The question or blocker behind a project's "Needs you", from its latest update.
+pub fn needs_you_question(sum: &ProjectSummary) -> Option<String> {
+    sum.last_body
+        .as_deref()
+        .and_then(|b| extract_block(b, &["decision needed", "decision", "blocked"]))
+        .map(|t| feed::first_line(&t, 96))
+        .filter(|q| !q.is_empty())
+        .map(|q| {
+            let mut chars = q.chars();
+            chars.next().map(|c| c.to_uppercase().chain(chars).collect()).unwrap_or_default()
+        })
 }
 
 fn all_archived(p: &Palette, size: f32, count: usize) -> El {
