@@ -46,7 +46,7 @@ fn curator_label(flags: usize) -> String {
 }
 
 fn curator_here(s: &State) -> bool {
-    s.open.is_none() && s.tab == Tab::Notebook && s.notebook.shelf == crate::notebook::Shelf::Gardener
+    s.open.is_none() && s.tab == Tab::Curator
 }
 
 pub fn curator_button(s: &State, p: &Palette) -> El {
@@ -92,11 +92,11 @@ pub fn settings_corner(s: &State, p: &Palette, k: &Kit, layer: &mut Vec<El>) -> 
 }
 
 pub fn tabs(s: &State, k: &Kit) -> El {
-    let labels: Vec<&str> = Tab::ALL.iter().map(|t| t.label()).collect();
-    SegmentedControl::new(&labels, Tab::ALL.iter().position(|t| *t == s.tab))
+    let labels: Vec<&str> = Tab::PRIMARY.iter().map(|t| t.label()).collect();
+    SegmentedControl::new(&labels, Tab::PRIMARY.iter().position(|t| *t == s.tab))
         .label("View")
         .fit()
-        .on_pick(|s: &mut State, i: usize, tx: &mut Tx| s.select_tab(Tab::ALL.get(i).copied().unwrap_or_default(), tx))
+        .on_pick(|s: &mut State, i: usize, tx: &mut Tx| s.select_tab(Tab::PRIMARY.get(i).copied().unwrap_or_default(), tx))
         .build(k)
 }
 
@@ -643,6 +643,7 @@ pub enum PaletteAction {
     GoHome,
     GoFeed,
     GoNotebook,
+    GoCurator,
     OpenPage(i64),
     MarkAllRead,
     ToggleArchived,
@@ -696,6 +697,7 @@ pub fn palette_items(s: &State) -> Vec<PaletteItem> {
         (PaletteAction::GoHome, "Go to Home", "Project orb shelf · ⌘1"),
         (PaletteAction::GoFeed, "Go to Feed", "All active updates · ⌘2"),
         (PaletteAction::GoNotebook, "Go to Notebook", "Lessons learned across projects · ⌘3"),
+        (PaletteAction::GoCurator, "Go to Curator", "Ask questions or review flags · ⌘4"),
         (PaletteAction::MarkAllRead, "Mark All Read", "Clear unseen project dots"),
         (
             PaletteAction::ToggleArchived,
@@ -779,6 +781,7 @@ fn execute_palette_action(s: &mut State, action: PaletteAction, tx: &mut Tx) {
         PaletteAction::GoHome => s.select_tab(Tab::Home, tx),
         PaletteAction::GoFeed => s.select_tab(Tab::Feed, tx),
         PaletteAction::GoNotebook => s.select_tab(Tab::Notebook, tx),
+        PaletteAction::GoCurator => s.open_curator(tx),
         PaletteAction::OpenPage(id) => {
             s.select_tab(Tab::Notebook, tx);
             s.notebook_open_page(id);

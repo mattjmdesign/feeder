@@ -43,18 +43,35 @@ pub fn on_key(s: &mut State, e: &KeyEvent, tx: &mut Tx) -> bool {
         }
         return true;
     }
-    if e.is_command('f') && s.tab == Tab::Notebook && s.open.is_none() {
-        s.palette_open = false;
-        s.dismiss_menus();
-        s.close_settings();
-        s.notebook.pane.set_open(true);
-        s.notebook.query.focused = true;
-        tx.focus_when_shown("nb-search", false);
-        return true;
+    if e.is_command('f') && s.open.is_none() {
+        if s.tab == Tab::Notebook {
+            s.palette_open = false;
+            s.dismiss_menus();
+            s.close_settings();
+            s.notebook.pane.set_open(true);
+            s.notebook.query.focused = true;
+            tx.focus_when_shown("nb-search", false);
+            return true;
+        }
+        if s.tab == Tab::Curator {
+            s.palette_open = false;
+            s.dismiss_menus();
+            s.close_settings();
+            s.curator_pane.set_open(true);
+            s.curator_search.focused = true;
+            tx.focus_when_shown("curator-search", false);
+            return true;
+        }
     }
-    if s.tab == Tab::Notebook && s.open.is_none() && !s.palette_open && !s.settings_open && rune_kit::shell::is_sidebar_toggle(e) {
-        s.notebook.pane.toggle();
-        return true;
+    if s.open.is_none() && !s.palette_open && !s.settings_open && rune_kit::shell::is_sidebar_toggle(e) {
+        if s.tab == Tab::Notebook {
+            s.notebook.pane.toggle();
+            return true;
+        }
+        if s.tab == Tab::Curator {
+            s.curator_pane.toggle();
+            return true;
+        }
     }
     if e.is_command('f') {
         s.palette_open = false;
@@ -81,9 +98,13 @@ pub fn on_key(s: &mut State, e: &KeyEvent, tx: &mut Tx) -> bool {
         && !nb_editing
         && !s.palette_open
         && !s.settings_open
-        && let Some(tab) = ['1', '2', '3'].iter().position(|c| e.is_command(*c)).map(|i| Tab::ALL[i])
+        && let Some(tab) = ['1', '2', '3', '4'].iter().position(|c| e.is_command(*c)).map(|i| Tab::ALL[i])
     {
-        s.select_tab(tab, tx);
+        if tab == Tab::Curator {
+            s.open_curator(tx);
+        } else {
+            s.select_tab(tab, tx);
+        }
         return true;
     }
     if e.is_command(',') {
@@ -182,16 +203,15 @@ pub fn on_key(s: &mut State, e: &KeyEvent, tx: &mut Tx) -> bool {
         tx.focus_when_shown("feeder-update-button", false);
         return true;
     }
-    if matches!(e.key, Key::Escape)
-        && s.tab == Tab::Notebook
-        && s.open.is_none()
-        && s.notebook.editor.is_none()
-        && s.notebook.open.is_none()
-        && s.notebook.shelf == crate::notebook::Shelf::Gardener
-        && s.notebook.chat.phase == crate::gardener::Phase::Working
-    {
-        s.gardener_stop();
-        return true;
+    if matches!(e.key, Key::Escape) && s.tab == Tab::Curator && s.open.is_none() {
+        if s.notebook.chat.phase == crate::gardener::Phase::Working {
+            s.gardener_stop();
+            return true;
+        }
+        if !s.curator_search.text.is_empty() {
+            s.curator_search = rune::TextEdit::new("");
+            return true;
+        }
     }
     if matches!(e.key, Key::Escape) && s.tab == Tab::Notebook && s.open.is_none() && s.notebook_escape() {
         return true;

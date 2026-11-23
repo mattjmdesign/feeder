@@ -5,12 +5,17 @@ use feeder_core::gardener::{
     Backend, ChatOpening, ChatSummary, Event, OPENING, RunConfig, RunStatus, Scope, Session, SessionEnv, SessionMode, StoredEvent, ToolCall,
 };
 use feeder_core::{Change, Flag, ago};
-use rune::{Cursor, El, Icon, TextEdit, Tx, Waker, col, el, icon, row, text};
+use rune::{Cursor, El, Icon, Key, KeyEvent, ScrollSpec, TextEdit, Transition, Tx, Waker, col, el, icon, row, text};
 use rune_kit::diff::{FileDiff, LineKind};
-use rune_kit::shell::{Sidebar, SidebarRow, SidebarSection};
-use rune_kit::{Badge, BadgeVariant, Button, ButtonVariant, Card, ControlSize, IconButton, IconButtonVariant, Kit, Spinner};
+use rune_kit::search::Fold;
+use rune_kit::shell::{Sidebar, SidebarPeek, SidebarRow, SidebarSection, SidebarToggle};
+use rune_kit::{
+    Badge, BadgeVariant, Button, ButtonVariant, Card, ControlSize, IconButton, IconButtonVariant, Kit, Spinner, SplitView, TextInput,
+    Toolbar, scroll_bar,
+};
 
 use crate::State;
+use crate::chrome;
 use crate::style::{self, Palette};
 use crate::watch::NotebookOp;
 
@@ -271,7 +276,10 @@ impl State {
 
     pub fn ask_curator(&mut self, question: String) {
         self.notebook.query = TextEdit::new("");
-        self.notebook_shelf(crate::notebook::Shelf::Gardener);
+        self.notebook.apply_tree_filter();
+        self.open = None;
+        self.dismiss_menus();
+        self.tab = crate::Tab::Curator;
         if self.notebook.chat.phase == Phase::Working {
             return;
         }
@@ -283,9 +291,7 @@ impl State {
     }
 
     pub fn start_project_curator(&mut self, project_id: i64, tx: &mut Tx) {
-        self.close_project();
-        self.select_tab(crate::Tab::Notebook, tx);
-        self.notebook_shelf(crate::notebook::Shelf::Gardener);
+        self.select_tab(crate::Tab::Curator, tx);
         if self.notebook.chat.phase == Phase::Working {
             return;
         }
@@ -384,9 +390,11 @@ impl State {
     }
 
     pub fn open_curator(&mut self, tx: &mut Tx) {
-        self.close_project();
-        self.select_tab(crate::Tab::Notebook, tx);
-        self.notebook_shelf(crate::notebook::Shelf::Gardener);
+        let already_here = self.open.is_none() && self.tab == crate::Tab::Curator;
+        self.select_tab(crate::Tab::Curator, tx);
+        if already_here && self.notebook.chat.viewing.is_some() && self.notebook.chat.phase != Phase::Working {
+            self.gardener_close();
+        }
     }
 
     fn gardener_review_flags(&mut self) {
@@ -459,7 +467,7 @@ fn intro(s: &State, p: &Palette) -> El {
         .items_center()
         .gap(14.0)
         .pb(28.0)
-        .child(col().items_center().gap(10.0).child(crate::orb::orb(&crate::chrome::CURATOR_ORB, ORB)).child(shadow))
+        .child(col().items_center().gap(10.0).child(crate::orb::orb(&chrome::CURATOR_ORB, ORB)).child(shadow))
         .child(words)
 }
 
@@ -1030,12 +1038,121 @@ fn bucket(started_at: i64, now: i64) -> &'static str {
     }
 }
 
-pub fn thread_list(s: &State, k: &Kit) -> El {
+pub fn shell_view(s: &State, p: &Palette, k: &Kit, inset: f32, reduced_motion: bool, layer: &mut Vec<El>) -> El {
+    let max_w = crate::notebook::INDEX_MAX_W;
+    let following = !s.notebook.chat.items.is_empty();
+    let main_inner = if is_empty_idle(s) {
+        empty_view(s, p, k, max_w, layer).transition(Transition::none())
+    } else {
+        let body = view(s, p, k, max_w, reduced_motion);
+        let viewport = col()
+            .w_full()
+            .grow(1.0)
+            .min_h(0.0)
+            .child(col().w_full().items_center().px(crate::notebook::INDEX_PAD).pt(24.0).pb(24.0).child(body))
+            .scroll(ScrollSpec { stick_bottom: following })
+            .scroll_edge_fade(16.0);
+        let scroll_area =
+            scroll_bar(k, "curator-scroll-area", "curator-scroll", viewport).w_full().grow(1.0).min_h(0.0).transition(Transition::none());
+        col().w_full().grow(1.0).min_h(0.0).transition(Transition::none()).child(scroll_area).child(composer(s, p, k, max_w, layer))
+    };
+    let main_area = col().key("curator-main-area").w_full().grow(1.0).min_h(0.0).instant_changes().child(main_inner);
+    let toolbar = Toolbar::new().leading(toolbar_breadcrumb(s, p, k)).trailing(chrome::tabs(s, k)).trailing(chrome::curator_button(s, p));
+
+    SplitView::new(main_area)
+        .sidebar(&s.curator_pane, |s: &mut State| &mut s.curator_pane, sidebar_view(s, p, k))
+        .toolbar(toolbar)
+        .titlebar_inset(inset)
+        .frame_inset(style::PANE_INSET)
+        .sidebar_toggle(SidebarToggle::new().in_header().past_lights(10.0))
+        .sidebar_peek(SidebarPeek::new())
+        .reduced_motion(reduced_motion)
+        .build(&style::open_pane_kit(k))
+}
+
+fn toolbar_breadcrumb(s: &State, p: &Palette, k: &Kit) -> El {
+    let pad = crate::notebook::CRUMB_PAD;
+    let mut row_el = row().key("curator-breadcrumb").gap(2.0).center_y().shrink().min_w(0.0).instant_changes();
+    if let Some(run_id) = s.notebook.chat.viewing
+        && let Some(chat) = s.notebook.gardener.chats.iter().find(|c| c.run_id == run_id)
+    {
+        let root_btn = Button::new("Curator")
+            .variant(ButtonVariant::GhostMuted)
+            .control_size(ControlSize::Small)
+            .on_press(|s: &mut State| {
+                if s.notebook.chat.phase != Phase::Working {
+                    s.gardener_close();
+                }
+            })
+            .build(k)
+            .key("curator-bc-root");
+        row_el = row_el
+            .child(root_btn)
+            .child(text("/").font(style::META).color(p.text_3).px(2.0))
+            .child(text(chat.title.clone()).font(k.ty.ui_compact).color(p.text).truncate().max_w(260.0).shrink().min_w(0.0).pl(pad));
+        return row_el;
+    }
+    row_el.child(text("Curator").key("curator-bc-root").font(k.ty.ui_compact).color(p.text).pl(pad))
+}
+
+fn sidebar_view(s: &State, p: &Palette, k: &Kit) -> El {
+    let mut search_input = TextInput::new(&s.curator_search)
+        .placeholder("Search chats")
+        .label("Search Curator chats")
+        .leading_icon(k.glyph.search)
+        .width(None)
+        .on_edit(|s: &mut State| &mut s.curator_search)
+        .on_action(|s: &mut State, _| s.curator_search = TextEdit::new(""))
+        .on_key(|s: &mut State, e: &KeyEvent, _| {
+            if matches!(e.key, Key::Escape) && !s.curator_search.text.is_empty() {
+                s.curator_search = TextEdit::new("");
+                return true;
+            }
+            false
+        });
+    if !s.curator_search.text.is_empty() {
+        search_input = search_input.clear_button();
+    }
+    let search = search_input.build(k).key("curator-search");
+
+    let header = col()
+        .key("curator-sidebar-header")
+        .w_full()
+        .px(10.0)
+        .pt(4.0)
+        .pb(8.0)
+        .gap(8.0)
+        .child(search)
+        .child(col().w_full().gap(2.0).role("list").label("Curator").child(new_chat_row(k)));
+
+    col()
+        .key("curator-sidebar")
+        .w_full()
+        .h_full()
+        .min_h(0.0)
+        .pb(crate::notebook::SETTINGS_CORNER_H)
+        .instant_changes()
+        .child(header)
+        .child(col().w_full().grow(1.0).min_h(0.0).child(thread_list(s, p, k)))
+}
+
+pub fn thread_list(s: &State, p: &Palette, k: &Kit) -> El {
     let scope = s.notebook.chat.scope;
     let selected = current_run(&s.notebook.chat);
+    let query = s.curator_search.text.trim();
+    let fold = Fold::default();
     let mut sidebar = Sidebar::new().label("Curator chats");
     let mut section: Option<(&str, Vec<El>)> = None;
-    for c in s.notebook.gardener.chats.iter().filter(|c| scope == Scope::Notebook || c.scope == scope) {
+    let mut matched = 0usize;
+    for c in s
+        .notebook
+        .gardener
+        .chats
+        .iter()
+        .filter(|c| scope == Scope::Notebook || c.scope == scope)
+        .filter(|c| query.is_empty() || fold.contains(&c.title, query))
+    {
+        matched += 1;
         let label = bucket(c.started_at, s.now);
         if section.as_ref().is_some_and(|(l, _)| *l != label)
             && let Some((l, rows)) = section.take()
@@ -1050,6 +1167,10 @@ pub fn thread_list(s: &State, k: &Kit) -> El {
             .key(format!("gardener-thread-{}", c.run_id));
         section.get_or_insert_with(|| (label, Vec::new())).1.push(row_el);
     }
+    if matched == 0 {
+        let msg = if query.is_empty() { "Past chats appear here." } else { "No matching chats." };
+        return col().w_full().grow(1.0).px(16.0).py(12.0).child(text(msg).font(style::META).color(p.text_3).wrap());
+    }
     if let Some((l, rows)) = section {
         sidebar = sidebar.section(SidebarSection::new(l).key(format!("threads-{l}")).rows(rows));
     }
@@ -1057,7 +1178,7 @@ pub fn thread_list(s: &State, k: &Kit) -> El {
 }
 
 pub fn new_chat_row(k: &Kit) -> El {
-    SidebarRow::new("New chat")
+    SidebarRow::new("New Chat")
         .icon(&crate::notebook::PLUS_ICON)
         .on_select(|s: &mut State, _: &mut Tx| {
             if s.notebook.chat.phase != Phase::Working {

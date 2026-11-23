@@ -39,6 +39,7 @@ pub fn bar_chrome(s: &State, id: i64, p: &Palette, k: &Kit) -> (El, Option<El>) 
         Tab::Home => ("‹  Home", "Back to Home"),
         Tab::Feed => ("‹  Feed", "Back to Feed"),
         Tab::Notebook => ("‹  Notebook", "Back to Notebook"),
+        Tab::Curator => ("‹  Curator", "Back to Curator"),
     };
     let back = chrome::bar_button("back", back_text, p).label(back_a11y).on_press(|s: &mut State| s.close_project());
 

@@ -37,7 +37,7 @@ use rune::{
 };
 use rune_kit::search::Fold;
 use rune_kit::shell::TOOLBAR_HEIGHT;
-use rune_kit::{ImageZoom, ToastEvent, ToastStack};
+use rune_kit::{ImageZoom, PaneState, ToastEvent, ToastStack};
 
 pub use media::{MediaSlide, media_slides};
 use watch::{Want, Watcher};
@@ -56,16 +56,19 @@ pub enum Tab {
     Home,
     Feed,
     Notebook,
+    Curator,
 }
 
 impl Tab {
-    pub const ALL: [Tab; 3] = [Tab::Home, Tab::Feed, Tab::Notebook];
+    pub const PRIMARY: [Tab; 3] = [Tab::Home, Tab::Feed, Tab::Notebook];
+    pub const ALL: [Tab; 4] = [Tab::Home, Tab::Feed, Tab::Notebook, Tab::Curator];
 
     pub fn label(self) -> &'static str {
         match self {
             Tab::Home => "Home",
             Tab::Feed => "Feed",
             Tab::Notebook => "Notebook",
+            Tab::Curator => "Curator",
         }
     }
 }
@@ -107,6 +110,8 @@ pub enum CopyTarget {
 pub struct State {
     pub tab: Tab,
     pub notebook: notebook::Notebook,
+    pub curator_pane: PaneState,
+    pub curator_search: TextEdit,
     pub files: files::FilesState,
     curator_sign_in: curator_sign_in::SignIn,
     pub curator: curator_settings::Curator,
@@ -197,6 +202,8 @@ impl State {
         State {
             tab: Tab::Home,
             notebook: notebook::Notebook::default(),
+            curator_pane: PaneState::new(252.0).range(200.0, 360.0),
+            curator_search: TextEdit::new(""),
             files: files::FilesState::default(),
             curator_sign_in: curator_sign_in::SignIn::default(),
             curator: curator_settings::Curator::load(),
@@ -287,6 +294,7 @@ impl State {
             || self.project_search.focused
             || self.notebook.is_typing()
             || self.curator.is_typing()
+            || self.curator_search.focused
     }
 
     pub fn close_settings(&mut self) {
@@ -794,9 +802,15 @@ impl State {
     }
 
     pub fn select_tab(&mut self, tab: Tab, tx: &mut Tx) {
-        if self.tab != tab || self.open.is_some() {
+        if self.select_tab_state(tab) {
             tx.instant();
         }
+    }
+
+    fn select_tab_state(&mut self, tab: Tab) -> bool {
+        let leaving_notebook_subview = tab == Tab::Notebook
+            && (self.notebook.open.is_some() || self.notebook.editor.is_some() || self.notebook.shelf != notebook::Shelf::All);
+        let instant = self.tab != tab || self.open.is_some() || leaving_notebook_subview;
         if self.open.is_some() {
             self.close_project();
         } else {
@@ -807,7 +821,24 @@ impl State {
             self.close_lightbox();
         }
         self.tab = tab;
+        match tab {
+            Tab::Home => {
+                self.home_filter = HomeFilter::All;
+                self.home_selected = None;
+            }
+            Tab::Feed => {
+                self.branch_filter = None;
+                self.timeline_selected = None;
+            }
+            Tab::Notebook => {
+                self.notebook_shelf(notebook::Shelf::All);
+            }
+            Tab::Curator => {
+                self.curator.close_picker();
+            }
+        }
         self.sync_search();
+        instant
     }
 
     pub fn sync_search(&mut self) {
@@ -854,6 +885,12 @@ impl State {
             self.settings_open = true;
             return true;
         }
+        if rest == "curator" || rest == "gardener" {
+            self.close_project();
+            self.close_settings();
+            self.tab = Tab::Curator;
+            return true;
+        }
         if let Some(page) = rest.strip_prefix("notebook") {
             self.close_project();
             self.close_settings();
@@ -861,8 +898,7 @@ impl State {
             if let Ok(id) = page.trim_start_matches('/').parse() {
                 self.notebook_open_page(id);
             } else {
-                self.notebook.open = None;
-                self.notebook.sync_tree_selection();
+                self.notebook_shelf(notebook::Shelf::All);
             }
             return true;
         }
@@ -1028,6 +1064,8 @@ fn view(s: &State, cx: &mut Cx<State>) -> El {
     let mut layer = Vec::new();
     let shell = if s.open.is_none() && s.tab == Tab::Notebook {
         notebook::view(s, &p, &k, inset, reduced_motion, &mut layer)
+    } else if s.open.is_none() && s.tab == Tab::Curator {
+        gardener::shell_view(s, &p, &k, inset, reduced_motion, &mut layer)
     } else {
         let (leading, trailing) = if let Some(id) = s.open { feed::bar_chrome(s, id, &p, &k) } else { (el(), Some(chrome::tabs(s, &k))) };
         let header = chrome::bar(s, &p, &k, inset, leading, trailing);
@@ -1123,8 +1161,7 @@ fn poll(s: &mut State, clock: f64, tx: &mut Tx) -> bool {
             s.curator.want_models(b, wake.as_ref());
         }
     } else if s.open.is_none()
-        && s.tab == Tab::Notebook
-        && s.notebook.shelf == notebook::Shelf::Gardener
+        && s.tab == Tab::Curator
         && let Some(b) = curator_settings::selected(s)
     {
         let wake = s.wake.clone();
@@ -1382,18 +1419,14 @@ fn main() {
                 s.tab = Tab::Notebook;
                 s.notebook.auto_open_first = true;
             }),
-            ("notebook-gardener", |s| {
-                s.tab = Tab::Notebook;
-                s.notebook.shelf = notebook::Shelf::Gardener;
-            }),
+            ("curator", |s| s.tab = Tab::Curator),
+            ("notebook-gardener", |s| s.tab = Tab::Curator),
             ("notebook-gardener-session", |s| {
-                s.tab = Tab::Notebook;
-                s.notebook.shelf = notebook::Shelf::Gardener;
+                s.tab = Tab::Curator;
                 gardener::replay(&mut s.notebook.chat, feeder_core::gardener::Backend::ClaudeCode, feeder_core::gardener::demo_events());
             }),
             ("notebook-gardener-working", |s| {
-                s.tab = Tab::Notebook;
-                s.notebook.shelf = notebook::Shelf::Gardener;
+                s.tab = Tab::Curator;
                 let mut events = feeder_core::gardener::demo_events();
                 events.truncate(11);
                 events.push(feeder_core::gardener::Event::ToolStarted(feeder_core::gardener::ToolCall {
@@ -1405,8 +1438,7 @@ fn main() {
             }),
             ("notebook-curator-history", |s| {
                 use feeder_core::gardener::{ChatSummary, Scope, SessionMode};
-                s.tab = Tab::Notebook;
-                s.notebook.shelf = notebook::Shelf::Gardener;
+                s.tab = Tab::Curator;
                 s.notebook.preview_chats = Some(vec![
                     ChatSummary {
                         run_id: 2,
@@ -1430,8 +1462,7 @@ fn main() {
             }),
             ("notebook-curator-revision", |s| {
                 use feeder_core::gardener::{Event, ToolCall};
-                s.tab = Tab::Notebook;
-                s.notebook.shelf = notebook::Shelf::Gardener;
+                s.tab = Tab::Curator;
                 let events = vec![
                     Event::Started,
                     Event::Text("Flag 2 says the busy timeout and writer rule are missing, so I'm adding them to the SQLite page.".into()),
@@ -1469,8 +1500,7 @@ fn main() {
             }),
             ("notebook-curator-diagram", |s| {
                 use feeder_core::gardener::Event;
-                s.tab = Tab::Notebook;
-                s.notebook.shelf = notebook::Shelf::Gardener;
+                s.tab = Tab::Curator;
                 let answer = "Releases go through one script:\n\n```mermaid\nflowchart LR\n  A[Bump version] --> B[Write release notes]\n  B --> C[scripts/changelog.sh]\n  C --> D[scripts/release.sh]\n  D --> E[Sign + notarize]\n  E --> F[Publish appcast]\n```\n\nThe signing key for the appcast isn't in the Notebook yet.";
                 let events = vec![Event::Started, Event::Text(answer.into()), Event::TurnFinished];
                 gardener::replay(&mut s.notebook.chat, feeder_core::gardener::Backend::ClaudeCode, events);
@@ -1478,8 +1508,7 @@ fn main() {
             }),
             ("notebook-curator-streaming", |s| {
                 use feeder_core::gardener::Event;
-                s.tab = Tab::Notebook;
-                s.notebook.shelf = notebook::Shelf::Gardener;
+                s.tab = Tab::Curator;
                 let partial = "Open every connection in **WAL mode** and set a busy timeout. See [SQLite returns SQLITE_BUSY](feeder://noteb";
                 let events = vec![Event::Started, Event::Text(partial.into())];
                 gardener::replay(&mut s.notebook.chat, feeder_core::gardener::Backend::ClaudeCode, events);
@@ -1487,14 +1516,12 @@ fn main() {
             }),
             ("notebook-curator-signin", |s| {
                 use feeder_core::gardener::{Backend, Event};
-                s.tab = Tab::Notebook;
-                s.notebook.shelf = notebook::Shelf::Gardener;
+                s.tab = Tab::Curator;
                 gardener::replay(&mut s.notebook.chat, Backend::Codex, vec![Event::Started, Event::NeedsSignIn, Event::Ended]);
                 s.notebook.chat.items.insert(0, gardener::Item::You("How do we sign releases?".into()));
             }),
             ("notebook-curator-saved", |s| {
-                s.tab = Tab::Notebook;
-                s.notebook.shelf = notebook::Shelf::Gardener;
+                s.tab = Tab::Curator;
                 let mut events = feeder_core::gardener::demo_events();
                 events.retain(|e| !matches!(e, feeder_core::gardener::Event::Ended));
                 {
@@ -1560,15 +1587,13 @@ fn main() {
             ("curator-off", |s| {
                 s.notebook.gardener.backends = feeder_core::gardener::Backend::ALL.to_vec();
                 s.curator.prefs = feeder_core::gardener::CuratorPrefs::default();
-                s.tab = Tab::Notebook;
-                s.notebook.shelf = notebook::Shelf::Gardener;
+                s.tab = Tab::Curator;
             }),
             ("curator-picker", |s| {
                 s.notebook.gardener.backends = feeder_core::gardener::Backend::ALL.to_vec();
                 s.curator_sign_in.demo();
                 s.curator.demo();
-                s.tab = Tab::Notebook;
-                s.notebook.shelf = notebook::Shelf::Gardener;
+                s.tab = Tab::Curator;
                 s.curator.picker_open = true;
             }),
             ("curator-picker-opencode", |s| {
@@ -1577,8 +1602,7 @@ fn main() {
                 s.curator_sign_in.demo();
                 s.curator.demo_opencode();
                 s.notebook.curator_backend = Some(Backend::OpenCode);
-                s.tab = Tab::Notebook;
-                s.notebook.shelf = notebook::Shelf::Gardener;
+                s.tab = Tab::Curator;
                 s.curator.picker_open = true;
             }),
         ],
@@ -1687,9 +1711,19 @@ mod tests {
         assert!(s.open_feeder_url("feeder://settings"));
         assert!(s.settings_open);
 
+        assert!(s.open_feeder_url("feeder://curator"));
+        assert_eq!(s.tab, Tab::Curator);
+        assert_eq!(s.open, None);
+        assert_eq!(Tab::PRIMARY.iter().position(|t| *t == s.tab), None);
+
         assert!(s.open_feeder_url("feeder://notebook/3"));
         assert_eq!(s.tab, Tab::Notebook);
         assert_eq!(s.notebook.open, Some(3));
+
+        assert!(s.open_feeder_url("feeder://notebook"));
+        assert_eq!(s.tab, Tab::Notebook);
+        assert_eq!(s.notebook.open, None);
+        assert_eq!(s.notebook.shelf, notebook::Shelf::All);
 
         assert!(s.open_feeder_url("feeder://project/alpha/update/42"));
         assert_eq!(s.open, Some(7));
@@ -1702,6 +1736,40 @@ mod tests {
 
         assert!(s.open_feeder_url("feeder://project/missing"));
         assert_eq!(s.toasts.entries().len(), 1);
+    }
+
+    #[test]
+    fn top_level_tabs_always_reset_to_home_and_keep_curator_independent() {
+        let mut s = State::new();
+        s.projects.push(sample_summary(1, "alpha", "Alpha"));
+
+        s.select_tab_state(Tab::Curator);
+        assert_eq!(s.tab, Tab::Curator);
+        assert_eq!(Tab::PRIMARY.iter().position(|t| *t == s.tab), None);
+
+        s.select_tab_state(Tab::Notebook);
+        assert_eq!(s.tab, Tab::Notebook);
+        assert_eq!(s.notebook.shelf, notebook::Shelf::All);
+        assert_eq!(s.notebook.open, None);
+        assert!(s.notebook.editor.is_none());
+
+        s.notebook.shelf = notebook::Shelf::Topic("rust".into());
+        s.notebook.open = Some(42);
+        assert!(s.select_tab_state(Tab::Notebook));
+        assert_eq!(s.notebook.shelf, notebook::Shelf::All);
+        assert_eq!(s.notebook.open, None);
+
+        s.open_project(1);
+        s.home_filter = HomeFilter::Working;
+        assert!(s.select_tab_state(Tab::Home));
+        assert_eq!(s.tab, Tab::Home);
+        assert_eq!(s.open, None);
+        assert_eq!(s.home_filter, HomeFilter::All);
+
+        s.branch_filter = Some("feat/x".into());
+        s.select_tab_state(Tab::Feed);
+        assert_eq!(s.tab, Tab::Feed);
+        assert_eq!(s.branch_filter, None);
     }
 
     #[test]

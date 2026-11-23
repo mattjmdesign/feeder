@@ -3,6 +3,12 @@
 What changed in each version of Feeder, newest first. Each section is copied from
 `release-notes/<version>.md` by `scripts/changelog.sh`; edit those files, not this one.
 
+## 0.5.7
+
+- **Curator as its own top-level view.** Clicking the Curator orb now opens Curator on its own screen instead of inside Notebook. `Home`, `Feed`, and `Notebook` clear their active highlight while Curator is open, and Curator gets its own breadcrumb (`Curator`), chat search, `+ New Chat` action, and date-grouped chat history.
+- **Predictable top-bar navigation.** Clicking **Home**, **Feed**, or **Notebook** now always takes you to that section's home screen (closing any open project, note, editor, or category filter), and clicking Notebook never lands in Curator.
+- **Curator shortcuts and quick jump.** Added `⌘4` to open Curator, **Go to Curator** in Quick Jump (`⌘K`), `⌘F` to search chats inside Curator, `⌘\` to toggle Curator's sidebar, and `feeder://curator` deep links.
+
 ## 0.5.6
 
 - **Faster launch and smoother scrolling.** Updated Rune UI for parallel macOS startup work and persistent icon mask caching across launches. Project update feeds now virtualize rows lazily like the main Feed, and layout callbacks skip unnecessary redraws when the window size hasn't changed.

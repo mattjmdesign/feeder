@@ -19,12 +19,12 @@ use crate::style::{self, Palette};
 use crate::watch::NotebookOp;
 use crate::{CopyTarget, State, ToastItem, ToastKind, agents, chrome, feed};
 
-const INDEX_MAX_W: f32 = 720.0;
+pub(crate) const INDEX_MAX_W: f32 = 720.0;
 const CARD_MIN_W: f32 = 340.0;
 const CARD_H: f32 = 112.0;
 const TILE: f32 = CARD_H - 2.0 * CARD_PAD;
 const CARD_PAD: f32 = 8.0;
-const INDEX_PAD: f32 = 32.0;
+pub(crate) const INDEX_PAD: f32 = 32.0;
 const CARD_GAP: f32 = 12.0;
 const DOC_MAX_W: f32 = 720.0;
 
@@ -46,7 +46,7 @@ static MORE_ICON: Icon = Icon {
     body: r#"<circle cx="3.5" cy="8" r="1.2" fill="currentColor"/><circle cx="8" cy="8" r="1.2" fill="currentColor"/><circle cx="12.5" cy="8" r="1.2" fill="currentColor"/>"#,
 };
 
-const SETTINGS_CORNER_H: f32 = 44.0;
+pub(crate) const SETTINGS_CORNER_H: f32 = 44.0;
 
 #[derive(Clone, Debug, PartialEq, Eq, Default)]
 pub enum Shelf {
@@ -54,7 +54,6 @@ pub enum Shelf {
     All,
     Topic(String),
     Archived,
-    Gardener,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -283,7 +282,6 @@ impl Notebook {
                 Shelf::All => !p.is_archived(),
                 Shelf::Topic(t) => !p.is_archived() && p.topic == *t,
                 Shelf::Archived => p.is_archived(),
-                Shelf::Gardener => false,
             }
         };
         let words: Vec<String> = self.query.text.split_whitespace().map(str::to_lowercase).collect();
@@ -379,11 +377,7 @@ impl State {
     pub fn open_flag_review(&mut self, project_id: Option<i64>, tx: &mut Tx) {
         match project_id {
             Some(id) => self.start_project_curator(id, tx),
-            None => {
-                self.close_project();
-                self.select_tab(crate::Tab::Notebook, tx);
-                self.notebook_shelf(Shelf::Gardener);
-            }
+            None => self.open_curator(tx),
         }
     }
 
@@ -440,7 +434,7 @@ impl State {
                 self.notebook.sync_tree();
             }
             None => {
-                if matches!(self.notebook.shelf, Shelf::Archived | Shelf::Gardener) {
+                if self.notebook.shelf == Shelf::Archived {
                     self.notebook.shelf = Shelf::All;
                 }
                 self.notebook_send(NotebookOp::Create(draft));
@@ -510,41 +504,25 @@ pub fn view(s: &State, p: &Palette, k: &Kit, inset: f32, reduced_motion: bool, l
     } else if let Some(page) = nb.open.and_then(|id| nb.page(id)) {
         page_view(s, page, p, k, layer)
     } else {
-        index_view(s, p, k, reduced_motion)
+        index_view(s, p, k)
     };
 
-    let gardener = nb.editor.is_none() && nb.open.is_none() && nb.shelf == Shelf::Gardener;
-    let following = gardener && !nb.chat.items.is_empty();
     let scroll_key = match (&nb.editor, nb.open, &nb.shelf) {
         (Some(_), _, _) => "notebook-scroll-editor".to_string(),
         (None, Some(id), _) => format!("notebook-scroll-page-{id}"),
         (None, None, Shelf::All) => "notebook-scroll-all".to_string(),
         (None, None, Shelf::Topic(t)) => format!("notebook-scroll-topic-{t}"),
         (None, None, Shelf::Archived) => "notebook-scroll-archived".to_string(),
-        (None, None, Shelf::Gardener) => "notebook-scroll-gardener".to_string(),
     };
     let viewport = col()
         .w_full()
         .grow(1.0)
         .min_h(0.0)
-        .child(col().w_full().items_center().px(INDEX_PAD).pt(24.0).pb(if gardener { 24.0 } else { 80.0 }).child(body))
-        .scroll(ScrollSpec { stick_bottom: following })
+        .child(col().w_full().items_center().px(INDEX_PAD).pt(24.0).pb(80.0).child(body))
+        .scroll(ScrollSpec { stick_bottom: false })
         .scroll_edge_fade(16.0);
     let scroll_area =
         scroll_bar(k, "notebook-scroll-area", &scroll_key, viewport).w_full().grow(1.0).min_h(0.0).transition(Transition::none());
-    let main_inner = if gardener && crate::gardener::is_empty_idle(s) {
-        crate::gardener::empty_view(s, p, k, INDEX_MAX_W, layer).transition(Transition::none())
-    } else if gardener {
-        col().w_full().grow(1.0).min_h(0.0).transition(Transition::none()).child(scroll_area).child(crate::gardener::composer(
-            s,
-            p,
-            k,
-            INDEX_MAX_W,
-            layer,
-        ))
-    } else {
-        scroll_area
-    };
     let reading = nb.open.is_some() || nb.editor.is_some();
     let main_area = col()
         .key("nb-main-area")
@@ -559,7 +537,7 @@ pub fn view(s: &State, p: &Palette, k: &Kit, inset: f32, reduced_motion: bool, l
         .grow(1.0)
         .min_h(0.0)
         .instant_changes()
-        .child(main_inner);
+        .child(scroll_area);
 
     let toolbar = Toolbar::new().leading(toolbar_breadcrumb(nb, p, k)).trailing(chrome::tabs(s, k)).trailing(chrome::curator_button(s, p));
 
@@ -574,7 +552,7 @@ pub fn view(s: &State, p: &Palette, k: &Kit, inset: f32, reduced_motion: bool, l
         .build(&if reading { style::pane_kit(k) } else { style::open_pane_kit(k) })
 }
 
-const CRUMB_PAD: f32 = 10.0;
+pub(crate) const CRUMB_PAD: f32 = 10.0;
 
 fn toolbar_breadcrumb(nb: &Notebook, p: &Palette, k: &Kit) -> El {
     let sep = || text("/").font(style::META).color(p.text_3).px(2.0);
@@ -625,10 +603,6 @@ fn toolbar_breadcrumb(nb: &Notebook, p: &Palette, k: &Kit) -> El {
             .child(crumb_btn("nb-bc-root", "Notebook", false).on_press(|s: &mut State| s.notebook_shelf(Shelf::All)))
             .child(sep())
             .child(text("Archived").font(k.ty.ui_compact).color(p.text).pl(CRUMB_PAD)),
-        Shelf::Gardener => row_el
-            .child(crumb_btn("nb-bc-root", "Notebook", false).on_press(|s: &mut State| s.notebook_shelf(Shelf::All)))
-            .child(sep())
-            .child(text("Curator").font(k.ty.ui_compact).color(p.text).pl(CRUMB_PAD)),
     }
 }
 
@@ -656,12 +630,7 @@ fn sidebar_view(s: &State, p: &Palette, k: &Kit) -> El {
     }
     let search = search_input.build(k).key("nb-search");
 
-    let gardener_selected = nb.editor.is_none() && nb.open.is_none() && nb.shelf == Shelf::Gardener;
-    let new_row = if gardener_selected {
-        crate::gardener::new_chat_row(k)
-    } else {
-        SidebarRow::new("New note").icon(&PLUS_ICON).on_select(|s: &mut State, _| s.notebook_new_page()).build(k).key("nb-new")
-    };
+    let new_row = SidebarRow::new("New Note").icon(&PLUS_ICON).on_select(|s: &mut State, _| s.notebook_new_page()).build(k).key("nb-new");
 
     let all_selected = nb.editor.is_none() && nb.open.is_none() && nb.shelf == Shelf::All;
     let all_row = SidebarRow::new("All notes")
@@ -681,18 +650,6 @@ fn sidebar_view(s: &State, p: &Palette, k: &Kit) -> El {
         .gap(8.0)
         .child(search)
         .child(col().w_full().gap(2.0).role("list").label("Notebook").child(new_row).child(all_row));
-
-    if gardener_selected {
-        return col()
-            .key("nb-sidebar")
-            .w_full()
-            .h_full()
-            .min_h(0.0)
-            .pb(SETTINGS_CORNER_H)
-            .instant_changes()
-            .child(header)
-            .child(col().w_full().grow(1.0).min_h(0.0).child(crate::gardener::thread_list(s, k)));
-    }
 
     let mut topics_head = SidebarHeader::new("Categories");
     if !topics.is_empty() {
@@ -765,11 +722,8 @@ fn sidebar_view(s: &State, p: &Palette, k: &Kit) -> El {
     sb
 }
 
-fn index_view(s: &State, p: &Palette, k: &Kit, reduced_motion: bool) -> El {
+fn index_view(s: &State, p: &Palette, k: &Kit) -> El {
     let nb = &s.notebook;
-    if nb.shelf == Shelf::Gardener {
-        return crate::gardener::view(s, p, k, INDEX_MAX_W, reduced_motion);
-    }
     if nb.pages.is_empty() && s.loaded {
         return col().w_full().max_w(INDEX_MAX_W).child(empty_notebook(p, k));
     }
@@ -778,7 +732,6 @@ fn index_view(s: &State, p: &Palette, k: &Kit, reduced_motion: bool) -> El {
         Shelf::All => "Notebook".to_string(),
         Shelf::Topic(slug) => topic_label(slug).to_string(),
         Shelf::Archived => "Archived".to_string(),
-        Shelf::Gardener => "Curator".to_string(),
     };
 
     let pages = nb.visible();
