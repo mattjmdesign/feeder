@@ -3,6 +3,12 @@
 What changed in each version of Feeder, newest first. Each section is copied from
 `release-notes/<version>.md` by `scripts/changelog.sh`; edit those files, not this one.
 
+## 0.5.9
+
+- **OpenCode can use Feeder tools in Curator.** Review flagged lessons, read Feed updates, and propose Library notes from the installed Mac app.
+- **Update checks show a fresh result.** If Sparkle is already checking in the background, Feeder no longer repeats an earlier “up to date” message.
+- **Removed the macOS menu bar companion.** Open Feeder from the Dock or Applications.
+
 ## 0.5.8
 
 - **Propose & Approve cards in Curator chat.** Every Curator chat can now inspect your entire Library, open flagged lessons, and recent Feed updates, replies, and project briefs, and propose creating, updating, or archiving Library notes right inside chat. Each proposal renders as an inline card with the reason, a unified diff preview, and **Apply** / **Dismiss** buttons (switching to **Open** and **Revert** once applied).

@@ -60,10 +60,6 @@ pub enum Order {
     Name,
 }
 
-fn default_true() -> bool {
-    true
-}
-
 #[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq)]
 #[serde(default)]
 pub struct Settings {
@@ -72,20 +68,11 @@ pub struct Settings {
     pub order: Order,
     pub show_folders: bool,
     pub notify_updates: bool,
-    #[serde(default = "default_true")]
-    pub menubar: bool,
 }
 
 impl Default for Settings {
     fn default() -> Self {
-        Settings {
-            theme: Theme::System,
-            orb_size: OrbSize::Medium,
-            order: Order::Recent,
-            show_folders: true,
-            notify_updates: false,
-            menubar: true,
-        }
+        Settings { theme: Theme::System, orb_size: OrbSize::Medium, order: Order::Recent, show_folders: true, notify_updates: false }
     }
 }
 
@@ -130,17 +117,10 @@ mod tests {
     fn settings_round_trip_and_missing_fields_take_defaults() {
         let dir = std::env::temp_dir().join(format!("feeder-settings-{}", std::process::id()));
         assert_eq!(Settings::load(&dir), Settings::default());
-        let s = Settings {
-            theme: Theme::Light,
-            orb_size: OrbSize::Large,
-            order: Order::Name,
-            show_folders: false,
-            notify_updates: true,
-            menubar: false,
-        };
+        let s = Settings { theme: Theme::Light, orb_size: OrbSize::Large, order: Order::Name, show_folders: false, notify_updates: true };
         s.save(&dir).unwrap();
         assert_eq!(Settings::load(&dir), s);
-        std::fs::write(dir.join("settings.json"), r#"{"theme":"dark"}"#).unwrap();
+        std::fs::write(dir.join("settings.json"), r#"{"theme":"dark","menubar":true}"#).unwrap();
         assert_eq!(Settings::load(&dir), Settings { theme: Theme::Dark, ..Settings::default() });
         std::fs::remove_dir_all(dir).ok();
     }

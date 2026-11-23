@@ -1064,16 +1064,6 @@ pub fn settings(s: &State, p: &Palette, k: &Kit, layer: &mut Vec<El>) {
             s.save_settings();
         })
         .build(k);
-    let menubar = Switch::new(st.menubar)
-        .label("Menu bar item")
-        .hide_label()
-        .on_toggle(|s: &mut State| {
-            s.settings.menubar = !s.settings.menubar;
-            s.save_settings();
-            s.sync_menubar();
-        })
-        .build(k);
-
     let store = style::home_relative(&feeder_core::data_dir());
 
     let storage = row()
@@ -1103,7 +1093,6 @@ pub fn settings(s: &State, p: &Palette, k: &Kit, layer: &mut Vec<El>) {
                 curator_settings::labeled(p, "Theme", None, theme),
                 curator_settings::labeled(p, "Orb size", None, size),
                 curator_settings::labeled(p, "New update banners", Some("A macOS notification when an agent posts"), notify),
-                curator_settings::labeled(p, "Menu bar item", Some("Shows working agents and projects that need you"), menubar),
             ],
         )),
         SettingsPage::Projects => col()

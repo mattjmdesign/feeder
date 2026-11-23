@@ -3,7 +3,6 @@ import { Check, Copy, Download, Lock, Moon, Sun } from 'lucide-react';
 import ConnectDemo from '../demo/ConnectDemo';
 import FeedDemo from '../demo/FeedDemo';
 import HomeDemo from '../demo/HomeDemo';
-import MenuTile from '../demo/MenuTile';
 import McpDemo from '../demo/McpDemo';
 import CuratorDemo from '../demo/CuratorDemo';
 import ReplyDemo from '../demo/ReplyDemo';
@@ -135,11 +134,7 @@ const ballStyle = `background:${orbBackground(hero)}`;
               </span>
             </div>
           </div>
-          <div class="tile">
-            <p class="tile__copy"><strong>Glance from the menu bar.</strong> See what’s waiting on you without opening the app.</p>
-            <div class="tile__pic tile__pic--menu"><MenuTile client:only="react" /></div>
-          </div>
-          <div class="tile tile--tools tile--wide">
+          <div class="tile tile--tools">
             <p class="tile__copy">
               <strong>Plug and play.</strong> Connect the tools you use in one click.
             </p>
@@ -725,10 +720,6 @@ const ballStyle = `background:${orbBackground(hero)}`;
     }
   }
 
-  .tile__pic--menu {
-    aspect-ratio: 320 / 260;
-  }
-
   .bento {
     display: grid;
     grid-template-columns: repeat(3, minmax(0, 1fr));
@@ -746,6 +737,10 @@ const ballStyle = `background:${orbBackground(hero)}`;
 
   .tile--wide {
     grid-column: span 2;
+  }
+
+  .tile--tools {
+    grid-column: 1 / -1;
   }
 
   .tile .tile__copy {
@@ -1013,6 +1008,10 @@ const ballStyle = `background:${orbBackground(hero)}`;
   @media (max-width: 860px) {
     .bento {
       grid-template-columns: repeat(2, minmax(0, 1fr));
+    }
+
+    .tile--tools {
+      grid-column: auto;
     }
 
     .tile--statement {

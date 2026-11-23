@@ -15,7 +15,6 @@ cargo clippy --locked --workspace --all-targets -- -D warnings
 FEEDER_SPARKLE_DIR="$(scripts/fetch-sparkle.sh)" cargo clippy --locked -p feeder-app --all-targets -- -D warnings
 cargo test --locked --workspace
 scripts/no-comments.sh
-xcrun swiftc -typecheck crates/feeder-menubar/FeederMenuBar.swift   # if you touched the menu bar item
 pnpm --dir site build                                               # if you touched site/
 scripts/changelog.sh --check                                        # if you touched release-notes/
 ```
@@ -42,7 +41,6 @@ pnpm --dir site dev
 | `crates/feeder-app` | The window, in [Rune](https://github.com/anomalyco/rune). Includes Home, Feed, Project Updates/Files, Notebook, Curator (`gardener.rs`, `curator_settings.rs`, `curator_sign_in.rs`), scoped media loading (`media.rs`), `updater.m` (Sparkle), and `notify.m` (UserNotifications) |
 | `crates/feeder-app/src/style.rs` | Colours, type roles and corner radii. Use these; don't write sizes or weights inline |
 | `crates/feeder-app/src/main.rs` | App state, the poll loop and the snapshot scenes |
-| `crates/feeder-menubar` | The menu bar item: one Swift file, compiled by `scripts/mac-app.sh` |
 | `site/` | The Astro website. Pushing `site/**` to `main` deploys it to GitHub Pages (`.github/workflows/pages.yml`) |
 | `site/src/demo` | The animated product demos on the site, built on the Stageshow kit in `site/src/stageshow/kit` |
 | `release-notes/<version>.md` | What's new in each version. `CHANGELOG.md` is generated from these |

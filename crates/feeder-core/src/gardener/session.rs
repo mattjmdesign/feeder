@@ -80,9 +80,17 @@ pub struct SessionEnv {
 
 impl SessionEnv {
     pub fn detect() -> SessionEnv {
-        let sibling = std::env::current_exe().ok().and_then(|exe| Some(exe.parent()?.join("feeder"))).filter(|p| p.is_file());
-        SessionEnv { feeder: sibling.unwrap_or_else(setup::feeder_binary), data_dir: data_dir(), run: RunConfig::default() }
+        let feeder = std::env::current_exe().ok().and_then(|exe| curator_helper(&exe)).unwrap_or_else(setup::feeder_binary);
+        SessionEnv { feeder, data_dir: data_dir(), run: RunConfig::default() }
     }
+}
+
+fn curator_helper(executable: &Path) -> Option<PathBuf> {
+    if let Some(helper) = setup::bundled_feeder(executable) {
+        return Some(helper);
+    }
+    let sibling = executable.parent()?.join("feeder");
+    sibling.is_file().then_some(sibling)
 }
 
 const CODEX_DISABLED_FEATURES: &[&str] = &[
@@ -173,6 +181,9 @@ impl Session {
         sink: impl Fn(Event) + Send + Sync + 'static,
     ) -> Result<Session> {
         env.run.validate()?;
+        if !env.feeder.is_file() {
+            return Err(Error::NotFound("Curator couldn't find the Feeder CLI. Reinstall Feeder and try again.".into()));
+        }
         let bin = backend.binary().ok_or_else(|| Error::NotFound(format!("{} isn't installed", backend.label())))?;
         let scratch = Scratch::new()?;
         let store = Store::open(&env.data_dir)?;
@@ -757,6 +768,35 @@ const _: () = {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn curator_uses_the_bundled_cli_even_when_the_app_matches_the_sibling_name() {
+        let scratch = Scratch::new().unwrap();
+        let contents = scratch.path().join("Feeder.app/Contents");
+        let macos = contents.join("MacOS");
+        let helpers = contents.join("Helpers");
+        std::fs::create_dir_all(&macos).unwrap();
+        std::fs::create_dir(&helpers).unwrap();
+        let app = macos.join("Feeder");
+        let cli = helpers.join("feeder");
+        std::fs::write(&app, b"App").unwrap();
+        if !macos.join("feeder").exists() {
+            std::os::unix::fs::symlink(&app, macos.join("feeder")).unwrap();
+        }
+        std::fs::write(&cli, b"CLI").unwrap();
+        assert_eq!(curator_helper(&app), Some(cli.clone()));
+        std::fs::remove_file(&cli).unwrap();
+        assert_eq!(curator_helper(&app), Some(cli));
+    }
+
+    #[test]
+    fn curator_uses_the_debug_cli_beside_an_unbundled_app() {
+        let scratch = Scratch::new().unwrap();
+        let app = scratch.path().join("feeder-app");
+        let cli = scratch.path().join("feeder");
+        std::fs::write(&cli, b"CLI").unwrap();
+        assert_eq!(curator_helper(&app), Some(cli));
+    }
 
     #[test]
     fn toml_strings_escape_quotes_and_backslashes() {

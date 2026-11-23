@@ -152,10 +152,7 @@ fn find_executable(cmd: &str, dirs: impl IntoIterator<Item = PathBuf>) -> Option
 pub fn feeder_binary() -> PathBuf {
     let installed = home().join(".cargo/bin/feeder");
     let exe = std::env::current_exe().and_then(|p| p.canonicalize());
-    let bundled = exe.as_ref().ok().and_then(|e| {
-        let macos = e.parent().filter(|d| d.ends_with("Contents/MacOS"))?;
-        Some(macos.parent()?.join("Helpers/feeder")).filter(|cli| cli.is_file())
-    });
+    let bundled = exe.as_deref().ok().and_then(bundled_feeder).filter(|cli| cli.is_file());
     match (bundled, exe) {
         (Some(cli), _) => cli,
         (None, Ok(exe)) if !exe.components().any(|c| c.as_os_str() == "target") => exe,
@@ -163,6 +160,11 @@ pub fn feeder_binary() -> PathBuf {
         (None, Ok(exe)) => exe,
         (None, Err(_)) => installed,
     }
+}
+
+pub(crate) fn bundled_feeder(executable: &Path) -> Option<PathBuf> {
+    let macos = executable.parent().filter(|dir| dir.ends_with("Contents/MacOS"))?;
+    Some(macos.parent()?.join("Helpers/feeder"))
 }
 
 fn entry(bin: &Path, opencode: bool) -> Value {

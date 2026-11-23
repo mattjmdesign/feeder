@@ -23,8 +23,6 @@ mod updater;
 mod watch;
 
 use std::collections::HashMap;
-use std::path::PathBuf;
-use std::process::{Child, Command};
 use std::sync::atomic::AtomicUsize;
 use std::sync::mpsc::{Receiver, TryRecvError};
 use std::sync::{Arc, Mutex, OnceLock};
@@ -187,14 +185,7 @@ pub struct State {
     seen_max_update_id: i64,
     last_pulse_tick: f64,
     last_video_tick: f64,
-    menubar_child: Option<Child>,
     pub(crate) clipboard_image_rx: Option<Receiver<Result<ClipboardImage, String>>>,
-}
-
-impl Drop for State {
-    fn drop(&mut self) {
-        self.stop_menubar();
-    }
 }
 
 impl State {
@@ -279,7 +270,6 @@ impl State {
             seen_max_update_id: 0,
             last_pulse_tick: 0.0,
             last_video_tick: 0.0,
-            menubar_child: None,
             clipboard_image_rx: None,
         }
     }
@@ -747,34 +737,6 @@ impl State {
         }
     }
 
-    pub fn sync_menubar(&mut self) {
-        if self.icon || rune::tooling::headless_run().is_some() {
-            return;
-        }
-        if !self.settings.menubar {
-            self.stop_menubar();
-            return;
-        }
-        if let Some(child) = self.menubar_child.as_mut() {
-            if child.try_wait().ok().flatten().is_none() {
-                return;
-            }
-            self.menubar_child = None;
-        }
-        if let Some(bin) = find_menubar_binary()
-            && let Ok(child) = Command::new(bin).arg("--parent-pid").arg(std::process::id().to_string()).spawn()
-        {
-            self.menubar_child = Some(child);
-        }
-    }
-
-    fn stop_menubar(&mut self) {
-        if let Some(mut child) = self.menubar_child.take() {
-            let _ = child.kill();
-            let _ = child.wait();
-        }
-    }
-
     pub fn push_toast(&mut self, key: impl Into<String>, item: ToastItem, secs: Option<f64>) {
         self.toasts.step(ToastEvent::Shown { key: key.into(), options: item, secs, now: self.clock });
     }
@@ -1038,20 +1000,6 @@ impl State {
     }
 }
 
-fn find_menubar_binary() -> Option<PathBuf> {
-    if let Ok(exe) = std::env::current_exe() {
-        let helpers = exe.parent()?.parent()?.join("Helpers/FeederMenuBar");
-        if helpers.exists() {
-            return Some(helpers);
-        }
-        let sibling = exe.parent()?.join("FeederMenuBar");
-        if sibling.exists() {
-            return Some(sibling);
-        }
-    }
-    None
-}
-
 fn view(s: &State, cx: &mut Cx<State>) -> El {
     if s.icon {
         return icon::view();
@@ -1110,7 +1058,6 @@ fn setup(s: &mut State, wake: Waker) {
     s.wake = Some(wake.clone());
     s.images = Some(ImageCache::new(wake.clone()));
     s.watcher = Some(Watcher::start(wake));
-    s.sync_menubar();
     s.ask();
 }
 

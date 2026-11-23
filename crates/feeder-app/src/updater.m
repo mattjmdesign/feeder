@@ -23,7 +23,7 @@ typedef struct {
     bool reveal;
 } UpdateSnapshot;
 
-@interface FeederUpdateDriver : NSObject <SPUUserDriver>
+@interface FeederUpdateDriver : NSObject <SPUUserDriver, NSMenuItemValidation>
 @property (nonatomic) Phase phase;
 @property (nonatomic) uint64_t received;
 @property (nonatomic) uint64_t expected;
@@ -46,12 +46,36 @@ static void (*wakeFeeder)(void);
     wakeFeeder();
 }
 
-- (void)checkForUpdates:(id)sender {
-    self.reveal = YES;
-    wakeFeeder();
-    if (updater.canCheckForUpdates) {
-        [updater checkForUpdates];
+- (BOOL)hasUpdateDetails {
+    switch (self.phase) {
+        case Available:
+        case Downloading:
+        case Preparing:
+        case Ready:
+        case Installing:
+            return YES;
+        default:
+            return NO;
     }
+}
+
+- (BOOL)validateMenuItem:(NSMenuItem *)item {
+    return [self hasUpdateDetails] || updater.canCheckForUpdates;
+}
+
+- (void)checkForUpdates:(id)sender {
+    if ([self hasUpdateDetails]) {
+        self.reveal = YES;
+        wakeFeeder();
+        return;
+    }
+    if (!updater.canCheckForUpdates) {
+        return;
+    }
+    self.reveal = YES;
+    self.message = nil;
+    [self show:Checking];
+    [updater checkForUpdates];
 }
 
 - (void)showUpdatePermissionRequest:(SPUUpdatePermissionRequest *)request reply:(void (^)(SUUpdatePermissionResponse *))reply {

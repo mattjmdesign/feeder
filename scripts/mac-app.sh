@@ -98,9 +98,6 @@ cp "$RELEASE_DIR/feeder" "$STAGE/Contents/Helpers/feeder"
 cp "$ICONSET/../AppIcon.icns" "$STAGE/Contents/Resources/AppIcon.icns"
 cp assets/Credits.html "$STAGE/Contents/Resources/Credits.html"
 cp assets/ThirdPartyLicenses.html "$STAGE/Contents/Resources/ThirdPartyLicenses.html"
-echo "› building menu bar companion"
-xcrun swiftc -target "$ARCH-apple-macosx$MACOS_MIN" -O -framework Cocoa -lsqlite3 \
-  crates/feeder-menubar/FeederMenuBar.swift -o "$STAGE/Contents/Helpers/FeederMenuBar"
 cat > "$STAGE/Contents/Info.plist" <<PLIST
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -159,7 +156,6 @@ if [[ -n "$SPARKLE_DIR" ]]; then
   codesign "${SIGN_ARGS[@]}" "$FRAMEWORK"
 fi
 codesign "${SIGN_ARGS[@]}" "$STAGE/Contents/Helpers/feeder"
-codesign "${SIGN_ARGS[@]}" "$STAGE/Contents/Helpers/FeederMenuBar"
 codesign "${SIGN_ARGS[@]}" "$STAGE"
 codesign --verify --deep --strict "$STAGE"
 
@@ -204,7 +200,6 @@ fi
 
 echo "› installing to $DEST"
 osascript -e "tell application id \"$BUNDLE_ID\" to quit" >/dev/null 2>&1 || true
-pkill -x FeederMenuBar >/dev/null 2>&1 || true
 mkdir -p "$HOME/Applications"
 rm -rf "$DEST"
 mv "$STAGE" "$DEST"
