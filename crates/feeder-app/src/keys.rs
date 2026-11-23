@@ -347,12 +347,6 @@ pub fn on_key(s: &mut State, e: &KeyEvent, tx: &mut Tx) -> bool {
                         return true;
                     }
                 }
-                (_, Some('r')) => {
-                    if let Some(uid) = current.or_else(|| ids.first().copied()) {
-                        s.start_reply(uid, tx);
-                        return true;
-                    }
-                }
                 (_, Some('m')) => {
                     if let Some(uid) = current
                         && let Some((_, sum)) = visible.iter().find(|(u, _)| u.id == uid)

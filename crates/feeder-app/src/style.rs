@@ -86,6 +86,14 @@ pub fn pane_kit(k: &Kit) -> Kit {
     k
 }
 
+/// The main pane with no sheet: the same window colour, no border, for browsing views.
+pub fn open_pane_kit(k: &Kit) -> Kit {
+    let mut k = pane_kit(k);
+    k.c.bg_base = k.c.bg_deep;
+    k.c.border_muted = Color::TRANSPARENT;
+    k
+}
+
 // Type scale. One family, the macOS system font (SF Pro, behind the sans slot in `main`), five
 // sizes (24, 16, 14, 13, 12) and nothing heavier than medium (500): hierarchy comes from size
 // and colour, not weight. Each role fixes size, line height and weight together so a role is

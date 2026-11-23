@@ -228,6 +228,11 @@ impl Session {
         let bin = backend.binary().ok_or_else(|| Error::NotFound(format!("{} isn't installed", backend.label())))?;
         let scratch = Scratch::new()?;
         let store = Store::open(&env.data_dir)?;
+        // A continued chat's session starts fresh, so it reads the saved conversation first.
+        let prompt = match opening {
+            ChatOpening::Continue { from, message } => super::chat::continuation_prompt(&store.curator_chat_events(from)?, message),
+            _ => opening.prompt().to_string(),
+        };
         let run_id = store.claim_curator_run(backend, scope, mode, Some(opening))?;
         let inner = Arc::new(Inner {
             backend,
@@ -246,7 +251,6 @@ impl Session {
             stopping: AtomicBool::new(false),
             ended: AtomicBool::new(false),
         });
-        let prompt = opening.prompt().to_string();
         let worker = Arc::clone(&inner);
         if let Err(e) = std::thread::Builder::new().name("feeder-curator-start".into()).spawn(move || {
             let started = match backend {

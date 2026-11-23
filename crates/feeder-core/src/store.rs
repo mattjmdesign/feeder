@@ -226,6 +226,8 @@ pub struct ProjectSummary {
     pub last_update_id: Option<i64>,
     pub last_at: Option<i64>,
     pub last_agent: Option<String>,
+    /// The host app the latest update came from, when the agent has its own name.
+    pub last_via: Option<String>,
     pub last_body: Option<String>,
     pub needs_you: bool,
     pub unread_replies: i64,
@@ -259,6 +261,9 @@ pub struct FeedUpdate {
     pub commit_sha: Option<String>,
     /// When the user explicitly dismissed a `Needs you` flag on this update.
     pub attention_dismissed_at: Option<i64>,
+    /// The app the agent posted from (OpenBot, T3 Code…), when it isn't the agent's own name.
+    /// Lets a custom-named agent wear its host's icon.
+    pub via: Option<String>,
 }
 
 impl FeedUpdate {
@@ -295,8 +300,8 @@ pub struct NewUpdate {
 
 const PROJECT_COLS: &str = "id, slug, name, path, orb, created_at, archived, seen_at, pinned, brief";
 const UPDATE_COLS: &str =
-    "id, project_id, agent, body, screenshot, media_w, media_h, branch, created_at, diff_stat, commit_sha, attention_dismissed_at";
-const UPDATE_U_COLS: &str = "u.id, u.project_id, u.agent, u.body, u.screenshot, u.media_w, u.media_h, u.branch, u.created_at, u.diff_stat, u.commit_sha, u.attention_dismissed_at";
+    "id, project_id, agent, body, screenshot, media_w, media_h, branch, created_at, diff_stat, commit_sha, attention_dismissed_at, via";
+const UPDATE_U_COLS: &str = "u.id, u.project_id, u.agent, u.body, u.screenshot, u.media_w, u.media_h, u.branch, u.created_at, u.diff_stat, u.commit_sha, u.attention_dismissed_at, u.via";
 
 pub struct Store {
     pub(crate) conn: Connection,
@@ -346,7 +351,8 @@ impl Store {
                 created_at INTEGER NOT NULL,
                 diff_stat TEXT,
                 commit_sha TEXT,
-                attention_dismissed_at INTEGER
+                attention_dismissed_at INTEGER,
+                via TEXT
             );
             CREATE INDEX IF NOT EXISTS updates_by_project ON updates(project_id, created_at DESC, id DESC);
             CREATE TABLE IF NOT EXISTS update_media (
@@ -432,7 +438,8 @@ impl Store {
                         SELECT 1 FROM replies r WHERE r.update_id = l.id AND r.from_human = 1
                     ) THEN 1 ELSE 0 END,
                     (SELECT COUNT(*) FROM replies r WHERE r.project_id = p.id AND r.from_human = 1 AND r.read_at IS NULL),
-                    (SELECT COUNT(*) FROM todos t WHERE t.project_id = p.id AND t.done = 0)
+                    (SELECT COUNT(*) FROM todos t WHERE t.project_id = p.id AND t.done = 0),
+                    l.via
              FROM projects p
              LEFT JOIN updates l ON l.id = (
                 SELECT id FROM updates WHERE project_id = p.id ORDER BY created_at DESC, id DESC LIMIT 1)
@@ -449,6 +456,7 @@ impl Store {
             let last_answered: i64 = r.get(16)?;
             let unread_replies: i64 = r.get(17)?;
             let open_todos: i64 = r.get(18)?;
+            let last_via: Option<String> = r.get(19)?;
             let needs_you = !project.archived
                 && last_answered == 0
                 && last_dismissed_at.is_none()
@@ -460,6 +468,7 @@ impl Store {
                 last_update_id,
                 last_at,
                 last_agent,
+                last_via,
                 last_body,
                 needs_you,
                 unread_replies,
@@ -785,11 +794,14 @@ impl Store {
         let primary_rel = stored_items.first().map(|(rel, _, _)| rel.clone());
         let (media_w, media_h) = stored_items.first().map(|(_, w, h)| (*w, *h)).unwrap_or((None, None));
 
+        // The host app the post came from, when the agent goes by its own name (an OpenBot agent
+        // called "Rust Dev"), so the Feed can show the host's icon.
+        let via = crate::agent::host_from_env().filter(|host| !host.eq_ignore_ascii_case(agent));
         let tx_res: rusqlite::Result<(i64, Vec<MediaAttachment>)> = (|| {
             let tx = self.conn.unchecked_transaction()?;
             tx.execute(
-                "INSERT INTO updates (project_id, agent, body, screenshot, media_w, media_h, branch, created_at, diff_stat, commit_sha)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+                "INSERT INTO updates (project_id, agent, body, screenshot, media_w, media_h, branch, created_at, diff_stat, commit_sha, via)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
                 params![
                     project_id,
                     agent,
@@ -800,7 +812,8 @@ impl Store {
                     branch,
                     created_at,
                     diff_stat,
-                    commit_sha
+                    commit_sha,
+                    via
                 ],
             )?;
             let update_id = tx.last_insert_rowid();
@@ -850,6 +863,7 @@ impl Store {
             diff_stat,
             commit_sha,
             attention_dismissed_at: None,
+            via: via.map(str::to_owned),
         })
     }
 
@@ -1231,6 +1245,7 @@ impl Store {
             diff_stat: r.get(9)?,
             commit_sha: r.get(10)?,
             attention_dismissed_at: r.get(11)?,
+            via: r.get(12)?,
         })
     }
 
@@ -1380,6 +1395,9 @@ fn migrate_projects(conn: &Connection) -> Result<()> {
 fn migrate_updates(conn: &Connection, dir: &Path) -> Result<()> {
     let mut stmt = conn.prepare("PRAGMA table_info(updates)")?;
     let cols: Vec<String> = stmt.query_map([], |r| r.get(1))?.collect::<rusqlite::Result<_>>()?;
+    if !cols.iter().any(|c| c == "via") {
+        conn.execute("ALTER TABLE updates ADD COLUMN via TEXT", [])?;
+    }
     if !cols.iter().any(|c| c == "branch") {
         conn.execute("ALTER TABLE updates ADD COLUMN branch TEXT", [])?;
     }

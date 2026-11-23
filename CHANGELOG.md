@@ -3,6 +3,14 @@
 What changed in each version of Feeder, newest first. Each section is copied from
 `release-notes/<version>.md` by `scripts/changelog.sh`; edit those files, not this one.
 
+## 0.5.5
+
+- **Curator for your Notebook.** Ask about anything in your Notebook or review flagged updates into durable notes with reviewable, revertible diffs. Pick your connected provider (Claude Code, Codex, OpenCode, or Antigravity), switch models or thinking levels mid-chat without losing the thread, and sign in directly from the app when a provider needs auth. Every model in the picker shows its service's logo on the left.
+- **Notebook card grid with per-category duotones.** The Notebook index and category views now sit directly on the window background as a full-width responsive card grid (the white sheet appears when reading or editing a note). Each parent category generates its own unique monochromatic duotone dot pattern on the left of its cards so topics are scannable at a glance.
+- **Simpler Notes & sidebar.** Removed per-row tags, kind chips, dividers, and the Helped button from the Notebook UI. Notes group cleanly under their parent category, and Curator chats group by date (Today, Yesterday, Previous 7 days) with a floating orb intro and a top-right orb toggle.
+- **Cleaner Feed & consistent carousels.** Feed post headers now read `Project · icon · Agent · time` without branch pills or inline reply threads. Multi-image carousels lock to a consistent 16:10 frame with centered chevron controls, reliable slide loading, and click handling that doesn't accidentally open the lightbox.
+- **OpenBot icon & Rune UI update.** Updates posted by OpenBot agents now show OpenBot's app icon instead of a generic initial, and the app is updated to the latest Rune UI.
+
 ## 0.5.1
 
 - **Quieter callouts in the Notebook.** Notes, tips and warnings now sit in a plain outlined box with a small icon, instead of a thick coloured stripe down the side.

@@ -309,6 +309,12 @@ impl Store {
                 crate::ago(running.started_at, now_ms())
             )));
         }
+        if let Some(ChatOpening::Continue { from, .. }) = opening {
+            let previous = self.gardener_run(from)?.ok_or_else(|| Error::NotFound(format!("no saved Curator chat {from}")))?;
+            if previous.scope != scope || previous.mode != mode {
+                return Err(Error::Invalid("continue the Curator chat with its original scope and mode".into()));
+            }
+        }
         if let Scope::Project(id) = scope
             && self.project(id)?.is_none()
         {
@@ -505,6 +511,44 @@ mod tests {
     }
 
     #[test]
+    fn a_saved_chat_continues_as_one_thread_with_its_history() {
+        let t = temp_store("chat-continue");
+        let s = &t.store;
+        let first = s
+            .claim_curator_run(Backend::OpenCode, Scope::Notebook, SessionMode::Ask, Some(ChatOpening::Message("How do we ship?")))
+            .expect("start chat");
+        let mut recorder = chat::Recorder::new(Store::open(&t.dir).expect("writer connection"), first);
+        for event in [Event::Text("Run the release script.".into()), Event::TurnFinished] {
+            recorder.record(StoredEvent::Event(event)).expect("save event");
+        }
+        recorder.finish(None, None).expect("finish chat");
+        drop(recorder);
+
+        let earlier = s.curator_chat_events(first).expect("replay");
+        let prompt = chat::continuation_prompt(&earlier, "And the appcast?");
+        assert!(prompt.contains("Person: How do we ship?"));
+        assert!(prompt.contains("Curator: Run the release script."));
+        assert!(prompt.ends_with("And the appcast?"));
+
+        let follow_up = Some(ChatOpening::Continue { from: first, message: "And the appcast?" });
+        let project = s.project_named("Other project", None).expect("create project");
+        assert!(matches!(
+            s.claim_curator_run(Backend::OpenCode, Scope::Project(project.id), SessionMode::Ask, follow_up),
+            Err(Error::Invalid(_))
+        ));
+        assert!(matches!(s.claim_curator_run(Backend::OpenCode, Scope::Notebook, SessionMode::Review, follow_up), Err(Error::Invalid(_))));
+        assert_eq!(s.curator_chat_events(first).expect("original chat is intact"), earlier);
+        let next = s.claim_curator_run(Backend::OpenCode, Scope::Notebook, SessionMode::Ask, follow_up).expect("continue chat");
+        let list = s.curator_chats(10).expect("list chats");
+        assert_eq!(list.iter().map(|c| c.run_id).collect::<Vec<_>>(), vec![next], "one thread, not two");
+        assert_eq!(list[0].title, "How do we ship?");
+        let events = s.curator_chat_events(next).expect("carried transcript");
+        assert_eq!(events.first(), Some(&StoredEvent::You("How do we ship?".into())));
+        assert_eq!(events.last(), Some(&StoredEvent::You("And the appcast?".into())));
+        assert!(s.curator_chat_events(first).is_err(), "the old row moved to the new run");
+    }
+
+    #[test]
     fn conversations_reopen_in_order_with_their_original_scope_and_title() {
         let t = temp_store("chat-replay");
         let s = &t.store;
@@ -610,6 +654,63 @@ mod tests {
         assert!(replay.len() < 34);
         assert!(serde_json::to_vec(&replay).expect("encode").len() <= 512 * 1024);
         assert!(s.curator_chats(1).expect("list")[0].truncated);
+    }
+
+    #[test]
+    fn continuing_a_capped_chat_preserves_history_and_saves_new_turns() {
+        let t = temp_store("chat-continue-capped");
+        let s = &t.store;
+        let first = s
+            .claim_curator_run(Backend::Codex, Scope::Notebook, SessionMode::Ask, Some(ChatOpening::Message("Original question")))
+            .expect("start chat");
+        let mut recorder = chat::Recorder::new(Store::open(&t.dir).expect("writer connection"), first);
+        recorder.record(StoredEvent::Event(Event::Text("Original reply".into()))).expect("save reply");
+        let large = "a".repeat(30 * 1024);
+        for _ in 0..18 {
+            recorder.record(StoredEvent::Event(Event::Thinking(large.clone()))).expect("fill history");
+            recorder.record(StoredEvent::Event(Event::TurnFinished)).expect("flush thinking");
+        }
+        recorder.finish(None, None).expect("finish capped run");
+        assert!(s.curator_chats(1).expect("list chats")[0].truncated);
+        let mut expected = s.curator_chat_events(first).expect("read original history");
+        let mut previous = first;
+
+        for (question, reply) in [("First follow-up", "First answer"), ("Second follow-up", "Second answer")] {
+            let run_id = s
+                .claim_curator_run(
+                    Backend::Codex,
+                    Scope::Notebook,
+                    SessionMode::Ask,
+                    Some(ChatOpening::Continue { from: previous, message: question }),
+                )
+                .expect("continue chat");
+            let mut recorder = chat::Recorder::new(Store::open(&t.dir).expect("writer connection"), run_id);
+            recorder.record(StoredEvent::Event(Event::Text(reply.into()))).expect("save follow-up reply");
+            recorder.record(StoredEvent::Event(Event::TurnFinished)).expect("finish follow-up turn");
+            recorder.finish(None, None).expect("finish continued run");
+            let new_events = [
+                StoredEvent::You(question.into()),
+                StoredEvent::Event(Event::Text(reply.into())),
+                StoredEvent::Event(Event::TurnFinished),
+                StoredEvent::Event(Event::Ended),
+            ];
+            let reopened = Store::open(&t.dir).expect("reopen database");
+            let replay = reopened.curator_chat_events(run_id).expect("replay continued chat");
+            assert!(replay.starts_with(&expected), "all earlier events remain intact");
+            assert_eq!(&replay[expected.len()..], &new_events);
+            expected.extend(new_events);
+            assert!(matches!(reopened.curator_chat_events(previous), Err(Error::NotFound(_))));
+            let chats = reopened.curator_chats(10).expect("list chats");
+            assert_eq!(chats.len(), 1);
+            assert_eq!(chats[0].run_id, run_id);
+            assert!(chats[0].truncated);
+            previous = run_id;
+        }
+
+        s.delete_curator_chat(previous).expect("delete thread");
+        let remaining_events: i64 =
+            s.conn.query_row("SELECT COUNT(*) FROM curator_chat_events", [], |row| row.get(0)).expect("count remaining events");
+        assert_eq!(remaining_events, 0);
     }
 
     #[test]

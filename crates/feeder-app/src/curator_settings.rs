@@ -120,6 +120,16 @@ impl Curator {
         self.models.insert(Backend::Codex, Models::Loading);
     }
 
+    /// Like [`Self::demo`] with OpenCode on, listing the models its own cache knows, which come
+    /// from several services. Nothing is saved.
+    pub fn demo_opencode(&mut self) {
+        self.demo();
+        self.prefs.set_enabled(Backend::OpenCode, true);
+        if let Ok(list) = Backend::OpenCode.models(&feeder_core::data_dir()) {
+            self.models.insert(Backend::OpenCode, Models::Ready(list));
+        }
+    }
+
     pub fn poll(&mut self) -> bool {
         let mut changed = false;
         while let Ok((backend, result)) = self.rx.try_recv() {
@@ -436,12 +446,17 @@ fn model_select(s: &State, backend: Backend, p: &Palette, k: &Kit, layer: &mut V
             let mut rows = col().w_full().gap(2.0).instant_changes();
             if show_default {
                 let back = anchor_key.clone();
-                rows =
-                    rows.child(option_row_tx(p, MODEL_DEFAULT.to_string(), chosen.is_none(), None, move |s: &mut State, tx: &mut Tx| {
+                rows = rows.child(option_row_tx(
+                    p,
+                    MODEL_DEFAULT.to_string(),
+                    chosen.is_none(),
+                    Some(sub_mark(s, backend, p)),
+                    move |s: &mut State, tx: &mut Tx| {
                         s.curator.choose_model(backend, None);
                         s.curator.close_select();
                         tx.focus_when_shown(back.clone(), false);
-                    }));
+                    },
+                ));
             }
             for m in &filtered {
                 let id = m.id.clone();
@@ -450,7 +465,7 @@ fn model_select(s: &State, backend: Backend, p: &Palette, k: &Kit, layer: &mut V
                     p,
                     m.label.clone(),
                     chosen.as_deref() == Some(m.id.as_str()),
-                    None,
+                    Some(model_mark(s, &m.id, backend, p)),
                     move |s: &mut State, tx: &mut Tx| {
                         s.curator.choose_model(backend, Some(id.clone()));
                         s.curator.close_select();
@@ -547,8 +562,8 @@ fn effort_control(s: &State, backend: Backend, efforts: &[String], field_w: Opti
 // ---------- Composer picker ----------
 
 /// The chip beside Send: the subscription's mark, then its model and thinking level. Opens a
-/// popover to switch subscription, model, and thinking. Shows the running chat's choice mid-chat.
-pub fn picker(s: &State, current: Backend, locked: bool, p: &Palette, k: &Kit, layer: &mut Vec<El>) -> El {
+/// popover to switch subscription, model, and thinking. Changes apply to the next message.
+pub fn picker(s: &State, current: Backend, p: &Palette, k: &Kit, layer: &mut Vec<El>) -> El {
     let c = &s.curator;
     let prefs = &c.prefs;
     // Which subscription first, so work and personal read apart at a glance.
@@ -568,19 +583,14 @@ pub fn picker(s: &State, current: Backend, locked: bool, p: &Palette, k: &Kit, l
         .radius(7.0)
         .role("button")
         .expanded(c.picker_open)
-        .label(format!("Curator runs on {summary}"))
+        .label(format!("Curator model: {summary}"))
+        .help("Changes apply to the next message")
+        .focusable(true)
+        .focus_ring(2.0, 1.0, k.c.border_focus)
+        .hover(p.hover)
+        .on_press_tx(toggle_picker)
         .child(agents::mark(current.label(), p, 14.0, s.agent_icon(current.label())))
         .child(text(summary).font(style::AGENT).color(p.text).truncate().max_w(320.0));
-    let chip = if locked {
-        chip.help("Start a new chat to switch")
-    } else {
-        chip.focusable(true).focus_ring(2.0, 1.0, k.c.border_focus).hover(p.hover).on_press_tx(|s: &mut State, tx: &mut Tx| {
-            toggle_picker(s, tx);
-        })
-    };
-    if locked {
-        return chip;
-    }
 
     let anchor_key = "curator-picker-trigger";
     let trigger = row().key(anchor_key).child(chip);
@@ -659,16 +669,27 @@ pub fn picker(s: &State, current: Backend, locked: bool, p: &Palette, k: &Kit, l
 
             let mut models = col().w_full().gap(2.0).instant_changes();
             if show_default {
-                models = models.child(option_row(p, MODEL_DEFAULT.to_string(), chosen.is_none(), None, move |s: &mut State| {
-                    s.curator.choose_model(current, None);
-                }));
+                models = models.child(option_row(
+                    p,
+                    MODEL_DEFAULT.to_string(),
+                    chosen.is_none(),
+                    Some(sub_mark(s, current, p)),
+                    move |s: &mut State| {
+                        s.curator.choose_model(current, None);
+                    },
+                ));
             }
             for m in &filtered {
                 let id = m.id.clone();
-                models =
-                    models.child(option_row(p, m.label.clone(), chosen.as_deref() == Some(m.id.as_str()), None, move |s: &mut State| {
+                models = models.child(option_row(
+                    p,
+                    m.label.clone(),
+                    chosen.as_deref() == Some(m.id.as_str()),
+                    Some(model_mark(s, &m.id, current, p)),
+                    move |s: &mut State| {
                         s.curator.choose_model(current, Some(id.clone()));
-                    }));
+                    },
+                ));
             }
             if !show_default && filtered.is_empty() {
                 models = models.child(text(format!("No models match “{query}”")).font(style::META).color(p.text_3).wrap().px(8.0).py(10.0));
@@ -764,6 +785,19 @@ fn option_row_base(p: &Palette, label: String, checked: bool, mark: Option<El>) 
         r = r.child(m);
     }
     r.child(text(label.clone()).font(if checked { style::CONTROL } else { style::BODY }).color(p.text).truncate().grow(1.0)).label(label)
+}
+
+/// The model picker's leading mark size, matching the 14 pt check column.
+const MODEL_MARK: f32 = 14.0;
+
+/// A model row's logo: the service the model comes from, else its subscription's.
+fn model_mark(s: &State, model: &str, backend: Backend, p: &Palette) -> El {
+    agents::model_mark(model, backend.label(), p, MODEL_MARK, s.agent_icon(backend.label()))
+}
+
+/// "Account default" runs whatever the subscription picks, so it wears the subscription's logo.
+fn sub_mark(s: &State, backend: Backend, p: &Palette) -> El {
+    agents::mark(backend.label(), p, MODEL_MARK, s.agent_icon(backend.label()))
 }
 
 fn divider(p: &Palette) -> El {

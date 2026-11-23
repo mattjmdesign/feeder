@@ -1,10 +1,10 @@
 //! One project's feed: the orb & brief up top, then every update newest first along a
-//! timeline (optionally only updates with media), plus inline edit, two-way replies, and video playback.
+//! timeline, plus inline edit, two-way replies, and video playback.
 
 use feeder_core::{AttentionKind, FeedUpdate, Orb, ProjectSummary, ago, day_key, day_label, parse_attention};
 use rune::{
-    Cursor, DragItem, El, GrowthSpec, Key, KeyEvent, ScrollSpec, Spring, SurfaceFit, Transition, Tx, auto_grow, col, el, memo, oklch, row,
-    text, text_input,
+    Cursor, DragItem, El, GrowthSpec, Icon, Key, KeyEvent, ScrollSpec, Spring, SurfaceFit, Transition, Tx, auto_grow, col, el, icon, memo,
+    oklch, row, text, text_input,
 };
 use rune_kit::search::Fold;
 use rune_kit::{Button, ButtonVariant, Kit, Markdown, MarkdownStyle, Menu, MenuItem, SegmentedControl, scroll_bar};
@@ -26,7 +26,6 @@ pub fn visible_feed(s: &State) -> Vec<&FeedUpdate> {
             Some(b) => u.branch.as_deref() == Some(b.as_str()),
             None => true,
         })
-        .filter(|u| !s.project_media_only || u.has_media())
         .filter(|u| {
             query.is_empty()
                 || fold.contains(&u.body, query)
@@ -157,7 +156,7 @@ pub fn view(s: &State, id: i64, p: &Palette, k: &Kit, reduced_motion: bool) -> E
         meta = meta
             .child(text("·").font(style::META).color(p.text_3))
             .child(text(format!("last {}", ago(at, s.now))).font(style::META).color(p.text_3))
-            .child(agents::mark(agent, p, 13.0, s.agent_icon(agent)));
+            .child(agents::post_mark(s, agent, summary.last_via.as_deref(), p, 13.0));
     }
     if summary.needs_you && !archived {
         meta = meta.child(text("·").font(style::META).color(p.text_3)).child(attention_badge(p, None));
@@ -206,10 +205,9 @@ pub fn view(s: &State, id: i64, p: &Palette, k: &Kit, reduced_motion: bool) -> E
     let md = markdown_style(p, k);
     let mut timeline = col().key("timeline").w_full();
     if s.feed_for == Some(id) {
-        let has_media = s.feed.iter().any(FeedUpdate::has_media);
         let search_active = s.project_search_open || !s.project_search.text.is_empty();
-        if has_media || s.branch_filter.is_some() || search_active {
-            timeline = timeline.child(project_toolbar(s, p, has_media));
+        if s.branch_filter.is_some() || search_active {
+            timeline = timeline.child(project_toolbar(s, p));
         }
 
         let visible = visible_feed(s);
@@ -238,8 +236,6 @@ pub fn view(s: &State, id: i64, p: &Palette, k: &Kit, reduced_motion: bool) -> E
             } else {
                 let empty_msg = if !s.project_search.text.trim().is_empty() {
                     "No updates match this filter."
-                } else if s.project_media_only {
-                    "No updates with media yet."
                 } else if s.branch_filter.is_some() {
                     "No updates on this branch."
                 } else {
@@ -248,7 +244,6 @@ pub fn view(s: &State, id: i64, p: &Palette, k: &Kit, reduced_motion: bool) -> E
                 timeline = timeline.child(text(empty_msg).font(style::META).color(p.text_3).self_center().py(16.0));
             }
             if s.branch_filter.is_none()
-                && !s.project_media_only
                 && s.project_search.text.trim().is_empty()
                 && s.feed.len() >= s.limit
                 && (s.feed.len() as i64) < summary.updates
@@ -386,7 +381,7 @@ fn brief_card(s: &State, p: &Palette, k: &Kit, summary: &ProjectSummary) -> El {
     }
 }
 
-fn project_toolbar(s: &State, p: &Palette, has_media: bool) -> El {
+fn project_toolbar(s: &State, p: &Palette) -> El {
     let chip = |key: &str, label: &str, active: bool| {
         row()
             .key(key.to_string())
@@ -457,26 +452,20 @@ fn project_toolbar(s: &State, p: &Palette, has_media: bool) -> El {
             .child(clear);
         bar = bar.child(search_box);
     }
-    if has_media {
-        bar = bar
-            .child(chip("pv-all", "All", !s.project_media_only).on_press(|s: &mut State| s.project_media_only = false))
-            .child(chip("pv-media", "With media", s.project_media_only).on_press(|s: &mut State| s.project_media_only = true));
-    }
     if let Some(branch) = &s.branch_filter {
         bar = bar.child(chip("pv-branch-clear", &format!("Branch: {branch} ×"), true).on_press(|s: &mut State| s.branch_filter = None));
     }
     bar
 }
 
+/// The day a run of updates was posted: the date alone, no rule.
 pub fn day_divider(label: String, p: &Palette, spaced: bool) -> El {
     row()
         .w_full()
         .pt(if spaced { 10.0 } else { 0.0 })
         .pb(12.0)
         .center_y()
-        .gap(12.0)
         .child(text(label.to_uppercase()).font(style::LABEL).color(p.text_3))
-        .child(rune::rule(1.0, p.hairline).grow(1.0))
 }
 
 fn handoff_markdown(summary: &ProjectSummary, feed: &[FeedUpdate], now: i64) -> String {
@@ -704,16 +693,10 @@ pub fn notebook_link(s: &State, p: &Palette, update_id: i64) -> Option<El> {
             .label(format!("Open Notebook note {title}"))
             .help(format!("Open \"{title}\""))
             .focusable(true)
-            .px(7.0)
-            .py(1.5)
-            .radius(5.0)
-            .gap(5.0)
             .center_y()
-            .border(1.0, p.hairline)
-            .hover(p.hover)
             .cursor(Cursor::Pointer)
             .on_press(move |s: &mut State| s.open_notebook_page_from_anywhere(page_id))
-            .child(text("In Notebook · Open").font(style::META).color(p.text_2)),
+            .child(text("Open in Notebook ›").font(style::META).color(p.text_2)),
     )
 }
 
@@ -732,7 +715,7 @@ fn entry(s: &State, (p, k, md): (&Palette, &Kit, &MarkdownStyle), u: &FeedUpdate
         .w_full()
         .gap(8.0)
         .center_y()
-        .child(agents::mark(&u.agent, p, 16.0, s.agent_icon(&u.agent)))
+        .child(agents::post_mark(s, &u.agent, u.via.as_deref(), p, 16.0))
         .child(text(u.agent.clone()).font(style::AGENT).color(p.text))
         .child(rune::spacer())
         .child(card_actions(s, p, u))
@@ -967,14 +950,16 @@ pub fn media_view(s: &State, p: &Palette, u: &FeedUpdate, width: f32) -> Option<
     let total = slides.len();
     let idx = s.card_slide_index(uid, total);
     let slide = &slides[idx];
-    let (slide_el, frame_h) = render_slide(s, p, slide, width)?;
-
     if total == 1 {
-        return Some(slide_el);
+        return render_slide(s, p, slide, width, None).map(|(el, _)| el);
     }
+    // Every slide of a carousel shares one 16:10 frame, so stepping through never changes the
+    // card's height; each image fits inside it.
+    let frame_h = (width * CAROUSEL_RATIO).min(SHOT_MAX_H);
+    let (slide_el, frame_h) = render_slide(s, p, slide, width, Some(frame_h))?;
 
     let btn_y = ((frame_h - 30.0) * 0.5).max(8.0);
-    let arrow_btn = |key: String, glyph: &'static str, label: &'static str, delta: isize| {
+    let arrow_btn = |key: String, glyph: &'static Icon, label: &'static str, delta: isize| {
         el().key(key)
             .role("button")
             .label(label)
@@ -988,7 +973,7 @@ pub fn media_view(s: &State, p: &Palette, u: &FeedUpdate, width: f32) -> Option<
             .cursor(Cursor::Pointer)
             .press_scale(0.93)
             .on_press(move |s: &mut State| s.step_card_slide(uid, delta, total))
-            .child(text(glyph).font(style::NAME).color(oklch(0.98, 0.0, 0.0)))
+            .child(icon(glyph, 14.0).color(oklch(0.98, 0.0, 0.0)))
     };
 
     let counter = el()
@@ -1001,14 +986,12 @@ pub fn media_view(s: &State, p: &Palette, u: &FeedUpdate, width: f32) -> Option<
         .border(1.0, oklch(1.0, 0.0, 0.0).alpha(0.18))
         .child(text(format!("{} / {total}", idx + 1)).font(style::META).color(oklch(0.96, 0.0, 0.0)));
 
-    let frame = el()
-        .key(format!("car-frame-{uid}"))
-        .w_full()
-        .h(frame_h)
-        .child(slide_el)
+    // The controls ride on the slide itself, so a press on an arrow is the arrow's, never the
+    // image's (which opens the lightbox).
+    let frame = slide_el
         .child(counter)
-        .child(arrow_btn(format!("car-prev-{uid}"), "‹", "Previous slide", -1).absolute(10.0, btn_y))
-        .child(arrow_btn(format!("car-next-{uid}"), "›", "Next slide", 1).pin(None, Some(btn_y), Some(10.0), None));
+        .child(arrow_btn(format!("car-prev-{uid}"), &CHEVRON_LEFT, "Previous slide", -1).absolute(10.0, btn_y))
+        .child(arrow_btn(format!("car-next-{uid}"), &CHEVRON_RIGHT, "Next slide", 1).pin(None, Some(btn_y), Some(10.0), None));
 
     // Each dot's hit area is at least 24 x 24 pt (WCAG 2.5.8); the visible dot stays small.
     let mut dots = row().key(format!("car-dots-{uid}")).w_full().center().pt(2.0);
@@ -1038,12 +1021,28 @@ pub fn media_view(s: &State, p: &Palette, u: &FeedUpdate, width: f32) -> Option<
     Some(col().key(format!("car-{uid}")).w_full().child(frame).child(dots))
 }
 
-fn render_slide(s: &State, p: &Palette, slide: &crate::MediaSlide, width: f32) -> Option<(El, f32)> {
+/// A carousel frame's height as a share of its width (16:10).
+const CAROUSEL_RATIO: f32 = 10.0 / 16.0;
+
+static CHEVRON_LEFT: Icon = Icon {
+    name: "car-prev",
+    view: 16.0,
+    body: r#"<path d="M10 3.5L5.5 8L10 12.5" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" fill="none"/>"#,
+};
+
+static CHEVRON_RIGHT: Icon = Icon {
+    name: "car-next",
+    view: 16.0,
+    body: r#"<path d="M6 3.5L10.5 8L6 12.5" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" fill="none"/>"#,
+};
+
+/// One slide at its natural height, or fitted inside a fixed `frame` height for a carousel.
+fn render_slide(s: &State, p: &Palette, slide: &crate::MediaSlide, width: f32, frame: Option<f32>) -> Option<(El, f32)> {
     let mid = slide.id;
     if let Some(player) = s.videos.get(&mid) {
         let (vw, vh) = player.natural_size().unwrap_or((16, 9));
         let ratio = vw.max(1) as f32 / vh.max(1) as f32;
-        let natural_h = (width / ratio).clamp(180.0, SHOT_MAX_H);
+        let natural_h = frame.unwrap_or_else(|| (width / ratio).clamp(180.0, SHOT_MAX_H));
         let playing = player.is_playing();
         let node = el()
             .key(format!("vid-{mid}"))
@@ -1084,13 +1083,21 @@ fn render_slide(s: &State, p: &Palette, slide: &crate::MediaSlide, width: f32) -
         .border(1.0, p.hairline)
         .cursor(Cursor::Pointer)
         .press_scale(0.99)
-        .on_press_tx(move |s: &mut State, tx: &mut Tx| s.open_lightbox(mid, tx))
-        .drag_out(move |_: &State| Some(DragItem::new().file(&path)));
+        .on_press_tx(move |s: &mut State, tx: &mut Tx| s.open_lightbox(mid, tx));
+    let button = button.drag_out(move |_: &State| Some(DragItem::new().file(&path)));
 
     if let Some(img) = s.shots.get(&mid)
         && let Some([w, h]) = img.size()
     {
         let ratio = w.max(1) as f32 / h.max(1) as f32;
+        if let Some(frame_h) = frame {
+            let fit = (width / w.max(1) as f32).min(frame_h / h.max(1) as f32);
+            let (shot_w, shot_h) = (w as f32 * fit, h as f32 * fit);
+            return Some((
+                button.h(frame_h).fill(p.bg.alpha(0.5)).center().child(el().w(shot_w).h(shot_h).pixels_fit(img.pixels(), SurfaceFit::Fit)),
+                frame_h,
+            ));
+        }
         let natural_h = width / ratio;
         if natural_h <= SHOT_MAX_H {
             Some((button.h(natural_h).pixels_fit(img.pixels(), SurfaceFit::Fit), natural_h))
@@ -1111,7 +1118,7 @@ fn render_slide(s: &State, p: &Palette, slide: &crate::MediaSlide, width: f32) -
         && h > 0
     {
         let ratio = w as f32 / h as f32;
-        let box_h = (width / ratio).min(SHOT_MAX_H);
+        let box_h = frame.unwrap_or_else(|| (width / ratio).min(SHOT_MAX_H));
         Some((button.h(box_h).fill(p.hover).center().child(text("Loading…").font(style::META).color(p.text_3)), box_h))
     } else {
         None

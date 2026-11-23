@@ -80,15 +80,6 @@ pub enum HomeFilter {
     Working,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
-pub enum FeedFilter {
-    #[default]
-    All,
-    NeedsYou,
-    Unread,
-    Shots,
-}
-
 #[derive(Clone, Debug, PartialEq)]
 pub enum ToastKind {
     Info,
@@ -155,7 +146,6 @@ pub struct State {
     pub branch_filter: Option<String>,
     pub project_search_open: bool,
     pub project_search: TextEdit,
-    pub project_media_only: bool,
     pub now: i64,
     pub clock: f64,
     pub window_size: [f32; 2],
@@ -202,8 +192,6 @@ pub struct State {
     pub palette_query: TextEdit,
     pub palette_index: usize,
     /// Feed filter bar state.
-    pub feed_filter: FeedFilter,
-    pub feed_agent: Option<String>,
     pub feed_search: TextEdit,
     /// Full-history DB search state driven by `feed_search` or `palette_query`.
     pub search_query: String,
@@ -272,7 +260,6 @@ impl State {
             branch_filter: None,
             project_search_open: false,
             project_search: TextEdit::new(""),
-            project_media_only: false,
             now: now_ms(),
             clock: 0.0,
             window_size: [1180.0, 760.0],
@@ -303,8 +290,6 @@ impl State {
             palette_open: false,
             palette_query: TextEdit::new(""),
             palette_index: 0,
-            feed_filter: FeedFilter::All,
-            feed_agent: None,
             feed_search: TextEdit::new(""),
             search_query: String::new(),
             search_snapshot_query: String::new(),
@@ -373,7 +358,6 @@ impl State {
         self.branch_filter = None;
         self.project_search_open = false;
         self.project_search = TextEdit::new("");
-        self.project_media_only = false;
         self.brief_editing = None;
         self.editing_update = None;
         self.replying_to = None;
@@ -411,7 +395,6 @@ impl State {
         self.branch_filter = None;
         self.project_search_open = false;
         self.project_search = TextEdit::new("");
-        self.project_media_only = false;
         self.feed_selected = None;
         self.pending_scroll = None;
         self.project_visible_rows = None;
@@ -433,11 +416,13 @@ impl State {
         }
         let cur = self.card_slide_index(update_id, len);
         let next = (cur as isize + delta).rem_euclid(len as isize) as usize;
-        self.card_slide.insert(update_id, next);
+        self.set_card_slide(update_id, next);
     }
 
+    /// Shows slide `idx` and loads its image, which wasn't decoded while hidden.
     pub fn set_card_slide(&mut self, update_id: i64, idx: usize) {
         self.card_slide.insert(update_id, idx);
+        media::sync(self);
     }
 
     pub fn open_lightbox(&mut self, media_id: i64, tx: &mut Tx) {
@@ -974,20 +959,6 @@ impl State {
             .iter()
             .filter_map(|u| {
                 let sum = self.summary(u.project_id).filter(|sum| !sum.project.archived)?;
-                match self.feed_filter {
-                    FeedFilter::All => {}
-                    FeedFilter::NeedsYou if !self.is_open_attention(u) => return None,
-                    FeedFilter::NeedsYou => {}
-                    FeedFilter::Unread if !sum.unseen() || !sum.project.seen_at.is_none_or(|seen| u.created_at > seen) => return None,
-                    FeedFilter::Unread => {}
-                    FeedFilter::Shots if !u.has_media() => return None,
-                    FeedFilter::Shots => {}
-                }
-                if let Some(agent) = &self.feed_agent
-                    && &u.agent != agent
-                {
-                    return None;
-                }
                 if let Some(branch) = &self.branch_filter
                     && u.branch.as_deref() != Some(branch.as_str())
                 {
@@ -1109,7 +1080,7 @@ fn view(s: &State, cx: &mut Cx<State>) -> El {
         notebook::view(s, &p, &k, inset, reduced_motion, &mut layer)
     } else {
         let (leading, trailing) = if let Some(id) = s.open { feed::bar_chrome(s, id, &p, &k) } else { (el(), Some(chrome::tabs(s, &k))) };
-        let header = chrome::bar(s, &p, &k, &mut layer, inset, leading, trailing);
+        let header = chrome::bar(s, &p, &k, inset, leading, trailing);
         let page = match s.open {
             Some(id) if s.files.view == files::ProjectView::Files => {
                 // The space under the bar, from the last frame's window size.
@@ -1139,7 +1110,8 @@ fn view(s: &State, cx: &mut Cx<State>) -> El {
                 s.window_size = [r[2], r[3]];
             }
         })
-        .child(shell);
+        .child(shell)
+        .child(chrome::settings_corner(s, &p, &k, &mut layer));
     rune_kit::root(base, layer)
 }
 
@@ -1633,6 +1605,16 @@ fn main() {
                 s.notebook.shelf = notebook::Shelf::Gardener;
                 s.curator.picker_open = true;
             }),
+            ("curator-picker-opencode", |s| {
+                use feeder_core::gardener::Backend;
+                s.notebook.gardener.backends = Backend::ALL.to_vec();
+                s.curator_sign_in.demo();
+                s.curator.demo_opencode();
+                s.notebook.curator_backend = Some(Backend::OpenCode);
+                s.tab = Tab::Notebook;
+                s.notebook.shelf = notebook::Shelf::Gardener;
+                s.curator.picker_open = true;
+            }),
         ],
         setup: Some(setup),
         poll: Some(poll),
@@ -1698,6 +1680,7 @@ mod tests {
             last_update_id: Some(99),
             last_at: Some(2_000),
             last_agent: Some("Codex".into()),
+            last_via: None,
             last_body: Some("Changed: hello".into()),
             needs_you: false,
             unread_replies: 0,
@@ -1721,6 +1704,7 @@ mod tests {
             commit_sha: Some("abc1234".into()),
             created_at: 1_500,
             attention_dismissed_at: None,
+            via: None,
         }
     }
 
@@ -1794,46 +1778,24 @@ mod tests {
         s.search_hits.push(sample_update(50, 1, "Done: earlier.\n\nDecision needed: old question?"));
         let visible = s.filtered_timeline();
         assert_eq!(visible.len(), 2);
-
-        s.feed_filter = FeedFilter::NeedsYou;
-        let needs = s.filtered_timeline();
-        assert_eq!(needs.len(), 1);
-        assert_eq!(needs[0].0.id, 99);
+        // Only the latest decision is open; the older card no longer needs you.
+        let open: Vec<i64> = visible.iter().filter(|(u, _)| s.is_open_attention(u)).map(|(u, _)| u.id).collect();
+        assert_eq!(open, vec![99]);
 
         s.toggle_branch_filter("feat/other");
         assert!(s.filtered_timeline().is_empty());
-        s.toggle_branch_filter("feat/search");
-        assert_eq!(s.filtered_timeline().len(), 1);
+        s.toggle_branch_filter("feat/other");
 
         // Dismissing clears NeedsYou optimistically and pushes an Undo toast.
         s.dismiss_attention(99);
         assert!(!s.projects[0].needs_you);
-        assert!(s.filtered_timeline().is_empty());
+        assert!(!s.is_open_attention(&s.search_hits[0]));
         assert_eq!(s.toasts.front().unwrap().options.kind, ToastKind::UndoDismiss { update_id: 99 });
 
         // Undoing restores NeedsYou cleanly.
         s.undismiss_attention(99);
         assert!(s.projects[0].needs_you);
-        assert_eq!(s.filtered_timeline().len(), 1);
-    }
-
-    #[test]
-    fn unread_filter_hides_updates_at_or_before_seen_at() {
-        let mut s = State::new();
-        let mut sum = sample_summary(1, "alpha", "Alpha");
-        sum.project.seen_at = Some(1_500);
-        sum.last_at = Some(2_000);
-        s.projects.push(sum);
-        let mut newer = sample_update(10, 1, "Done: new.");
-        newer.created_at = 2_000;
-        let mut older = sample_update(9, 1, "Done: already read.");
-        older.created_at = 1_500;
-        s.timeline = vec![newer, older];
-
-        s.feed_filter = FeedFilter::Unread;
-        let unread = s.filtered_timeline();
-        assert_eq!(unread.len(), 1);
-        assert_eq!(unread[0].0.id, 10);
+        assert!(s.is_open_attention(&s.search_hits[0]));
     }
 
     #[test]
@@ -1943,18 +1905,5 @@ mod tests {
         assert_eq!(home::needs_you_question(&sum).as_deref(), Some("Should EU prices include tax?"));
         sum.last_body = Some("Done: nothing to ask.".into());
         assert_eq!(home::needs_you_question(&sum), None);
-    }
-
-    #[test]
-    fn media_filter_keeps_only_updates_with_media() {
-        let mut s = State::new();
-        s.feed.push(sample_update(1, 1, "Done: text only."));
-        let mut shot = sample_update(2, 1, "Done: with a screenshot.");
-        shot.screenshot = Some(PathBuf::from("/tmp/x.png"));
-        s.feed.push(shot);
-        assert_eq!(feed::visible_feed(&s).len(), 2);
-        s.project_media_only = true;
-        let ids: Vec<i64> = feed::visible_feed(&s).iter().map(|u| u.id).collect();
-        assert_eq!(ids, vec![2]);
     }
 }

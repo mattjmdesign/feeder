@@ -1,0 +1,270 @@
+/* Curator: a flagged Feed update reviewed into a cited, revertible Notebook note */
+.cd2 {
+  .ss-stage {
+    overflow: hidden;
+    background: transparent;
+  }
+
+  .cd2-win {
+    position: absolute;
+    top: 22px;
+    left: 40px;
+    width: 880px;
+    height: 540px;
+    box-shadow: var(--ss-shadow-hero);
+  }
+
+  .ss-stage[data-layout='compact'] .cd2-win {
+    top: 16px;
+    left: 16px;
+    width: 400px;
+    height: 360px;
+  }
+
+  .cd2-tools {
+    display: inline-flex;
+    align-items: center;
+    gap: 8px;
+  }
+
+  .cd2-seg {
+    font-size: 12px;
+  }
+
+  /* Curator's entry in the app's top right: its own orb, a pill that stands apart from the tabs */
+  .cd2-pill {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    height: 26px;
+    padding: 0 10px 0 5px;
+    border: 1px solid var(--ss-line);
+    border-radius: 13px;
+    background: var(--ss-ink-1);
+    color: var(--ss-text-strong);
+    font-size: 12px;
+    font-weight: 500;
+  }
+
+  .cd2-orb {
+    width: 16px;
+    height: 16px;
+    border-radius: 50%;
+    background:
+      radial-gradient(circle at 34% 28%, rgb(255 255 255 / 0.85) 0 9%, transparent 24%),
+      radial-gradient(circle at 70% 72%, oklch(0.72 0.16 330) 0, transparent 60%),
+      radial-gradient(circle at 30% 70%, oklch(0.72 0.14 220) 0, transparent 62%),
+      oklch(0.66 0.16 285);
+    box-shadow: inset 0 0 0 1px rgb(255 255 255 / 0.18);
+  }
+
+  .cd2-side {
+    display: grid;
+    align-content: start;
+    gap: 3px;
+    padding: 12px 10px;
+  }
+
+  .cd2-new {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    height: 30px;
+    margin-bottom: 6px;
+    border: 1px solid var(--ss-line);
+    border-radius: 8px;
+    color: var(--ss-text-strong);
+    font-size: 12px;
+    font-weight: 500;
+  }
+
+  .cd2-row {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    height: 26px;
+    padding: 0 10px;
+    color: var(--ss-text-strong);
+    font-size: 12px;
+  }
+
+  .cd2-count {
+    color: var(--ss-text);
+    font-size: 11px;
+    font-variant-numeric: tabular-nums;
+  }
+
+  .cd2-label {
+    margin: 10px 0 2px;
+    padding: 0 10px;
+    color: var(--ss-text);
+    font-size: 11px;
+    font-weight: 500;
+  }
+
+  .cd2-day {
+    padding: 4px 10px 2px;
+    color: var(--ss-text);
+    font-size: 11px;
+  }
+
+  .cd2-thread {
+    height: 26px;
+    padding: 0 10px;
+    border-radius: var(--ss-radius-sm);
+    color: var(--ss-text);
+    font-size: 12px;
+    line-height: 26px;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }
+
+  .cd2-thread[data-on] {
+    background: var(--ss-ink-1);
+    color: var(--ss-text-strong);
+    font-weight: 500;
+  }
+
+  .cd2-main {
+    display: flex;
+    flex-direction: column;
+    height: 100%;
+    padding: 28px 56px 72px;
+    background: var(--ss-surface);
+  }
+
+  /* The window bleeds off the right edge; content stays inside the visible 342px */
+  .ss-stage[data-layout='compact'] .cd2-main {
+    padding: 16px 74px 36px 16px;
+  }
+
+  /* Older lines scroll up under a soft fade, the way a chat does */
+  .ss-stage[data-layout='compact'] .cd2-thread-col {
+    overflow: hidden;
+    mask-image: linear-gradient(to bottom, transparent 0, #000 56px);
+  }
+
+  /* Inset to the flag card's content, so step icons and the flag's dot share one column */
+  .cd2-thread-col {
+    padding-left: 15px;
+    padding-bottom: 18px;
+    display: grid;
+    align-content: end;
+    gap: 10px;
+    flex: 1;
+    min-height: 0;
+  }
+
+  .cd2-step {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    color: var(--ss-text);
+    font-size: 12.5px;
+  }
+
+  .cd2-answer {
+    margin: 4px 0 0;
+    max-width: 520px;
+    color: var(--ss-text-strong);
+    font-size: 14px;
+    line-height: 1.55;
+  }
+
+  .cd2-note {
+    display: flex;
+    align-items: center;
+    gap: 14px;
+    max-width: 520px;
+    margin-top: 4px;
+    padding: 12px 14px;
+    border: 1px solid var(--ss-line);
+    border-radius: 10px;
+    background: var(--ss-surface);
+  }
+
+  .cd2-note__text {
+    display: grid;
+    gap: 3px;
+    flex: 1;
+    min-width: 0;
+  }
+
+  .cd2-note__kind,
+  .cd2-note__src {
+    color: var(--ss-text);
+    font-size: 11.5px;
+  }
+
+  .cd2-note__title {
+    color: var(--ss-text-strong);
+    font-size: 13.5px;
+    font-weight: 600;
+  }
+
+  .cd2-revert {
+    flex: none;
+    font-size: 12px;
+  }
+
+  .cd2-foot {
+    display: grid;
+    gap: 8px;
+  }
+
+  .cd2-flag {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    padding: 8px 8px 8px 14px;
+    border: 1px solid var(--ss-line);
+    border-radius: 10px;
+    color: var(--ss-text-strong);
+    font-size: 12.5px;
+  }
+
+  .cd2-flag__mark {
+    display: grid;
+    place-items: center;
+    flex: none;
+    width: 13px;
+  }
+
+  .cd2-flag__dot {
+    width: 6px;
+    height: 6px;
+    border-radius: 50%;
+    background: var(--ss-warning);
+  }
+
+  .cd2-flag__btn {
+    margin-left: auto;
+    padding: 4px 10px;
+    border: 1px solid var(--ss-line);
+    border-radius: 7px;
+    color: var(--ss-text-strong);
+    font-size: 12px;
+    font-weight: 500;
+  }
+
+  .cd2-composer {
+    height: 56px;
+    padding: 12px 14px;
+    border: 1px solid var(--ss-line);
+    border-radius: 12px;
+    color: var(--ss-text);
+    font-size: 13.5px;
+  }
+}
+
+.cd2 .cd2-past {
+  display: grid;
+  gap: 9px;
+  margin-bottom: 18px;
+}
+
+.cd2 .cd2-past-q {
+  justify-self: end;
+  margin-right: 40px;
+}

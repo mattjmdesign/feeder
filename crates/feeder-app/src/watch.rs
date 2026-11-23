@@ -58,7 +58,6 @@ pub enum NotebookOp {
     Revise(i64, PageDraft),
     ToggleTask(i64, usize, bool),
     SetStanding(i64, Standing),
-    Helped(i64),
     Delete(i64),
     /// Undo a logged change (see the Curator page).
     Revert(i64),
@@ -335,7 +334,6 @@ impl Watcher {
                             NotebookOp::Revise(id, draft) => s.revise_page(id, draft, "You").map(|_| ()),
                             NotebookOp::ToggleTask(id, task_index, checked) => s.toggle_page_task(id, task_index, checked).map(|_| ()),
                             NotebookOp::SetStanding(id, standing) => s.set_page_standing(id, standing),
-                            NotebookOp::Helped(id) => s.mark_page_helped(id).map(|_| ()),
                             NotebookOp::Delete(id) => s.delete_page(id),
                             NotebookOp::Revert(id) => s.revert_change(id, HUMAN_AUTHOR).map(|_| ()),
                             NotebookOp::FlagUpdate(update_id) => s.flag_update_for_notebook(update_id, HUMAN_AUTHOR).map(|_| ()),
@@ -388,7 +386,9 @@ impl Watcher {
                             let agents = projects
                                 .iter()
                                 .filter_map(|p| p.last_agent.clone())
+                                .chain(projects.iter().filter_map(|p| p.last_via.clone()))
                                 .chain(feed.iter().chain(&timeline).chain(&search_hits).map(|u| u.agent.clone()))
+                                .chain(feed.iter().chain(&timeline).chain(&search_hits).filter_map(|u| u.via.clone()))
                                 .chain(pages.iter().flatten().map(|pg| pg.agent.clone()))
                                 .chain(backends.iter().map(|b| b.label().to_string()));
                             for agent in agents {

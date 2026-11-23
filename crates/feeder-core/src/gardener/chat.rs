@@ -1,4 +1,4 @@
-//! Local, bounded transcripts for Curator sessions.
+//! Local Curator transcripts with a separate recording budget per run.
 
 use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior, params};
 use serde::{Deserialize, Serialize};
@@ -21,6 +21,9 @@ pub enum ChatOpening<'a> {
     Message(&'a str),
     /// A built-in action. Only the title is saved in the transcript's metadata.
     Job { title: &'a str, prompt: &'a str },
+    /// The person's next message in a saved chat whose session has ended. The new run takes over
+    /// the saved transcript and title, so the history keeps one thread.
+    Continue { from: i64, message: &'a str },
 }
 
 impl<'a> ChatOpening<'a> {
@@ -28,8 +31,49 @@ impl<'a> ChatOpening<'a> {
         match self {
             Self::Message(message) => message,
             Self::Job { prompt, .. } => prompt,
+            Self::Continue { message, .. } => message,
         }
     }
+}
+
+/// Most of an earlier chat a continuation hands to the new session, in characters.
+const RECAP_CHARS: usize = 12_000;
+
+/// The opening prompt for a continued chat: the conversation so far, newest kept when it's long,
+/// then the new message. The provider's own session has ended, so this is its only memory.
+pub fn continuation_prompt(earlier: &[StoredEvent], message: &str) -> String {
+    let mut turns: Vec<String> = Vec::new();
+    let mut reply = String::new();
+    let flush = |reply: &mut String, turns: &mut Vec<String>| {
+        let text = reply.trim();
+        if !text.is_empty() {
+            turns.push(format!("Curator: {text}"));
+        }
+        reply.clear();
+    };
+    for entry in earlier {
+        match entry {
+            StoredEvent::You(text) => {
+                flush(&mut reply, &mut turns);
+                turns.push(format!("Person: {}", text.trim()));
+            }
+            StoredEvent::Event(Event::Text(piece)) => reply.push_str(piece),
+            StoredEvent::Event(Event::TurnFinished) => flush(&mut reply, &mut turns),
+            StoredEvent::Event(_) => {}
+        }
+    }
+    flush(&mut reply, &mut turns);
+    let mut recap = turns.join("\n\n");
+    if recap.chars().count() > RECAP_CHARS {
+        let skip = recap.chars().count() - RECAP_CHARS;
+        recap = format!("…{}", recap.chars().skip(skip).collect::<String>());
+    }
+    if recap.is_empty() {
+        return message.to_string();
+    }
+    format!(
+        "This continues an earlier Curator chat with the same person. The conversation so far:\n\n{recap}\n\nTheir new message:\n{message}"
+    )
 }
 
 /// A saved chat's entry in the history list.
@@ -68,8 +112,12 @@ impl Store {
     pub fn curator_chats(&self, limit: usize) -> Result<Vec<ChatSummary>> {
         let limit = i64::try_from(limit).unwrap_or(i64::MAX);
         let mut stmt = self.conn.prepare(
-            "SELECT r.id, r.started_at, r.read_only, r.project_id, c.title, r.edits, c.truncated
+            "SELECT r.id, r.started_at, r.read_only, r.project_id, c.title, r.edits,
+                    c.truncated OR EXISTS (
+                        SELECT 1 FROM curator_chats past WHERE past.archived_under = c.run_id AND past.truncated
+                    )
              FROM curator_chats c JOIN gardener_runs r ON r.id = c.run_id
+             WHERE c.archived_under IS NULL
              ORDER BY r.id DESC LIMIT ?1",
         )?;
         let rows = stmt.query_map([limit], |row| {
@@ -92,9 +140,11 @@ impl Store {
     /// Returns an error if the chat is missing, deleted, or could not be read.
     pub fn curator_chat_events(&self, run_id: i64) -> Result<Vec<StoredEvent>> {
         let mut stmt = self.conn.prepare(
-            "SELECT e.payload FROM curator_chats c
-             LEFT JOIN curator_chat_events e ON e.run_id = c.run_id
-             WHERE c.run_id = ?1 ORDER BY e.position",
+            "SELECT e.payload FROM curator_chats current
+             JOIN curator_chats segment ON segment.run_id = current.run_id OR segment.archived_under = current.run_id
+             LEFT JOIN curator_chat_events e ON e.run_id = segment.run_id
+             WHERE current.run_id = ?1 AND current.archived_under IS NULL
+             ORDER BY segment.run_id, e.position",
         )?;
         let mut rows = stmt.query([run_id])?;
         let Some(mut row) = rows.next()? else { return Err(Error::NotFound(format!("no saved Curator chat {run_id}"))) };
@@ -125,7 +175,7 @@ impl Store {
         if tx.execute("UPDATE gardener_runs SET summary = NULL, error = NULL WHERE id = ?1", [run_id])? == 0 {
             return Err(Error::NotFound(format!("no Curator run {run_id}")));
         }
-        tx.execute("DELETE FROM curator_chats WHERE run_id = ?1", [run_id])?;
+        tx.execute("DELETE FROM curator_chats WHERE run_id = ?1 AND archived_under IS NULL", [run_id])?;
         tx.commit()?;
         Ok(())
     }
@@ -147,13 +197,28 @@ pub(super) fn migrate(conn: &Connection) -> Result<()> {
             PRIMARY KEY (run_id, position)
         ) WITHOUT ROWID;",
     )?;
+    let has_archive_column: bool =
+        conn.query_row("SELECT EXISTS(SELECT 1 FROM pragma_table_info('curator_chats') WHERE name = 'archived_under')", [], |row| {
+            row.get(0)
+        })?;
+    if !has_archive_column {
+        conn.execute("ALTER TABLE curator_chats ADD COLUMN archived_under INTEGER REFERENCES curator_chats(run_id) ON DELETE CASCADE", [])?;
+    }
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS curator_chats_archives ON curator_chats(archived_under) WHERE archived_under IS NOT NULL",
+        [],
+    )?;
     Ok(())
 }
 
 pub(super) fn create(conn: &Connection, run_id: i64, opening: ChatOpening<'_>) -> Result<()> {
+    if let ChatOpening::Continue { from, message } = opening {
+        return carry_over(conn, from, run_id, message);
+    }
     let title = match opening {
         ChatOpening::Message(text) => text,
         ChatOpening::Job { title, .. } => title,
+        ChatOpening::Continue { .. } => unreachable!("handled above"),
     };
     let title = if title.trim().is_empty() {
         "Curator chat".to_string()
@@ -164,6 +229,22 @@ pub(super) fn create(conn: &Connection, run_id: i64, opening: ChatOpening<'_>) -
     if let ChatOpening::Message(text) = opening {
         append(conn, run_id, &[StoredEvent::You(bounded_private_text(text.to_string()))])?;
     }
+    Ok(())
+}
+
+/// Archives earlier transcript segments under the new run. Each run gets its own save budget,
+/// and the latest run is the only thread shown in history.
+fn carry_over(conn: &Connection, from: i64, run_id: i64, message: &str) -> Result<()> {
+    let moved = conn.execute(
+        "INSERT INTO curator_chats (run_id, title)
+         SELECT ?2, title FROM curator_chats WHERE run_id = ?1 AND archived_under IS NULL",
+        params![from, run_id],
+    )?;
+    if moved == 0 {
+        return Err(Error::NotFound(format!("no saved Curator chat {from}")));
+    }
+    conn.execute("UPDATE curator_chats SET archived_under = ?2 WHERE run_id = ?1 OR archived_under = ?1", params![from, run_id])?;
+    append(conn, run_id, &[StoredEvent::You(bounded_private_text(message.to_string()))])?;
     Ok(())
 }
 
@@ -178,7 +259,8 @@ fn append(conn: &Connection, run_id: i64, events: &[StoredEvent]) -> Result<bool
         .query_row(
             "UPDATE curator_chats
              SET event_count = event_count + ?6, payload_bytes = payload_bytes + ?2
-             WHERE run_id = ?1 AND event_count + ?6 <= ?3 AND payload_bytes + ?2 <= ?4 AND (truncated = 0 OR ?5)
+             WHERE run_id = ?1 AND archived_under IS NULL
+               AND event_count + ?6 <= ?3 AND payload_bytes + ?2 <= ?4 AND (truncated = 0 OR ?5)
              RETURNING event_count",
             params![run_id, payload_bytes, event_limit, byte_limit, ended, event_count],
             |row| row.get(0),
@@ -190,7 +272,7 @@ fn append(conn: &Connection, run_id: i64, events: &[StoredEvent]) -> Result<bool
             params![run_id, position, payload],
         )?;
     } else {
-        conn.execute("UPDATE curator_chats SET truncated = 1 WHERE run_id = ?1", [run_id])?;
+        conn.execute("UPDATE curator_chats SET truncated = 1 WHERE run_id = ?1 AND archived_under IS NULL", [run_id])?;
     }
     Ok(position.is_some())
 }

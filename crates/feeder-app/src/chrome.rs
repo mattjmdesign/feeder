@@ -24,15 +24,83 @@ static PLUS_ICON: Icon = Icon {
     body: r#"<rect x="5" y="9.4" width="10" height="1.2" rx="0.6" fill="currentColor"/><rect x="9.4" y="5" width="1.2" height="10" rx="0.6" fill="currentColor"/>"#,
 };
 
+static GEAR_ICON: Icon = Icon {
+    name: "feeder-gear",
+    view: 24.0,
+    body: r#"<path d="M12.22 2h-.44a2 2 0 0 0-2 2v.18a2 2 0 0 1-1 1.73l-.43.25a2 2 0 0 1-2 0l-.15-.08a2 2 0 0 0-2.73.73l-.22.38a2 2 0 0 0 .73 2.73l.15.1a2 2 0 0 1 1 1.72v.51a2 2 0 0 1-1 1.74l-.15.09a2 2 0 0 0-.73 2.73l.22.38a2 2 0 0 0 2.73.73l.15-.08a2 2 0 0 1 2 0l.43.25a2 2 0 0 1 1 1.73V20a2 2 0 0 0 2 2h.44a2 2 0 0 0 2-2v-.18a2 2 0 0 1 1-1.73l.43-.25a2 2 0 0 1 2 0l.15.08a2 2 0 0 0 2.73-.73l.22-.39a2 2 0 0 0-.73-2.73l-.15-.08a2 2 0 0 1-1-1.74v-.5a2 2 0 0 1 1-1.74l.15-.09a2 2 0 0 0 .73-2.73l-.22-.38a2 2 0 0 0-2.73-.73l-.15.08a2 2 0 0 1-2 0l-.43-.25a2 2 0 0 1-1-1.73V4a2 2 0 0 0-2-2z" stroke="currentColor" stroke-width="1.6" fill="none" stroke-linejoin="round"/><circle cx="12" cy="12" r="3" stroke="currentColor" stroke-width="1.6" fill="none"/>"#,
+};
+
 /// The bar over Home and a project's feed: rune-kit's toolbar band, as the Notebook's
 /// `SplitView` draws it, so the view tabs and the menu hold their place across every view.
-/// `leading` starts past the traffic lights; `trailing` sits before the menu.
-pub fn bar(s: &State, p: &Palette, k: &Kit, layer: &mut Vec<El>, inset: f32, leading: El, trailing: Option<El>) -> El {
+/// `leading` starts past the traffic lights; `trailing` sits before the Curator button.
+pub fn bar(s: &State, p: &Palette, k: &Kit, inset: f32, leading: El, trailing: Option<El>) -> El {
     let mut toolbar = Toolbar::new().leading(row().pl(inset.max(0.0)).center_y().child(leading));
     if let Some(t) = trailing {
         toolbar = toolbar.trailing(t);
     }
-    toolbar.trailing(menu(s, p, k, layer)).build(k).key("bar")
+    toolbar.trailing(curator_button(s, p)).build(k).key("bar")
+}
+
+/// Curator's own orb: pale and iridescent, so the button reads as Feeder's, not a project's.
+pub(crate) const CURATOR_ORB: feeder_core::Orb =
+    feeder_core::Orb { seed: 7, hues: [285.0, 220.0, 330.0], chroma: 0.16, angle: 0.8, pattern: feeder_core::Pattern::Pearl };
+
+fn curator_label(flags: usize) -> String {
+    match flags {
+        0 => "Open Curator".to_string(),
+        1 => "Open Curator, 1 flagged update to review".to_string(),
+        n => format!("Open Curator, {n} flagged updates to review"),
+    }
+}
+
+fn curator_here(s: &State) -> bool {
+    s.open.is_none() && s.tab == Tab::Notebook && s.notebook.shelf == crate::notebook::Shelf::Gardener
+}
+
+/// Top right, past the view tabs: the way into Curator from anywhere. The orb is the button: an
+/// iridescent sphere, a ring when Curator is open, a halo while it works, and a small amber count
+/// of flagged updates on its shoulder.
+pub fn curator_button(s: &State, p: &Palette) -> El {
+    let size = 26.0;
+    let flags = s.notebook.gardener.open_flags.len();
+    let mut b = el()
+        .key("curator-button")
+        .role("button")
+        .label(curator_label(flags))
+        .help("Curator")
+        .focusable(true)
+        .size(size, size)
+        .ml(8.0)
+        .cursor(Cursor::Pointer)
+        .press_scale(0.94)
+        .on_press_tx(|s: &mut State, tx: &mut Tx| s.open_curator(tx));
+    if crate::gardener::is_busy(s) {
+        b = b.child(orb::pulse_halo(&CURATOR_ORB, size, 0.65));
+    }
+    if curator_here(s) {
+        b = b.child(el().size(size + 6.0, size + 6.0).absolute(-3.0, -3.0).radius((size + 6.0) / 2.0).border(1.5, p.text_3.alpha(0.6)));
+    }
+    b = b.child(orb::orb(&CURATOR_ORB, size));
+    if flags > 0 {
+        b = b.child(
+            row()
+                .pin(None, Some(-4.0), Some(-6.0), None)
+                .h(15.0)
+                .min_w(15.0)
+                .px(4.0)
+                .center()
+                .radius(7.5)
+                .fill(p.amber)
+                .border(1.5, p.bg)
+                .child(text(flags.to_string()).font(style::META).color(oklch(0.2, 0.02, 70.0))),
+        );
+    }
+    b
+}
+
+/// Bottom left of the window: the app menu (Settings, Quick Jump, Quit…) behind a gear.
+pub fn settings_corner(s: &State, p: &Palette, k: &Kit, layer: &mut Vec<El>) -> El {
+    el().key("settings-corner").pin(Some(12.0), None, None, Some(10.0)).child(menu(s, p, k, layer))
 }
 
 /// Home | Feed | Notebook, top right.
@@ -111,29 +179,26 @@ fn copy_image_to_clipboard(path: &Path, tx: &mut Tx) -> Result<(), String> {
 }
 
 pub fn menu(s: &State, p: &Palette, k: &Kit, layer: &mut Vec<El>) -> El {
-    let dot = || el().size(3.5, 3.5).radius(1.75).fill(p.text_2);
     let trigger = row()
         .key("menu-button")
         .role("button")
-        .label("Menu")
+        .label("Settings and more")
+        .help("Settings and more")
         .focusable(true)
         .size(30.0, 28.0)
-        .gap(3.0)
         .center()
         .radius(8.0)
         .hover(p.hover)
         .fill(if s.menu_open { p.hover } else { p.hover.alpha(0.0) })
         .cursor(Cursor::Pointer)
         .on_press(|s: &mut State| s.menu_open = !s.menu_open)
-        .child(dot())
-        .child(dot())
-        .child(dot());
+        .child(rune::icon(&GEAR_ICON, 16.0).color(p.text_2));
     let archived_count = s.projects.iter().filter(|p| p.project.archived).count();
     let unseen_count = s.unseen_count();
     let mut m = Menu::new("main-menu")
         .trigger(trigger)
         .open(s.menu_open)
-        .placement(Placement::BottomEnd)
+        .placement(Placement::TopStart)
         .min_width(236.0)
         .on_close(|s: &mut State| s.menu_open = false);
     m = feed::project_menu(s, m)

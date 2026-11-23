@@ -212,7 +212,7 @@ fn tile(s: &State, summary: &ProjectSummary, p: &Palette, k: &Kit, reduced_motio
         (Some(at), Some(agent)) => row()
             .gap(6.0)
             .center_y()
-            .child(agents::mark(agent, p, 13.0, s.agent_icon(agent)))
+            .child(agents::post_mark(s, agent, summary.last_via.as_deref(), p, 13.0))
             .child(text(ago(at, s.now)).font(style::META).color(if hovered || selected { p.text_2 } else { p.text_3 })),
         _ => row().child(text("No updates yet").font(style::META).color(p.text_3)),
     };

@@ -6,24 +6,18 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 use feeder_core::gardener::{
-    Backend, ChatOpening, ChatSummary, Event, OPENING, RunStatus, Scope, Session, SessionEnv, SessionMode, StoredEvent, ToolCall,
+    Backend, ChatOpening, ChatSummary, Event, OPENING, RunConfig, RunStatus, Scope, Session, SessionEnv, SessionMode, StoredEvent, ToolCall,
 };
 use feeder_core::{Change, Flag, ago};
 use rune::{Cursor, El, Icon, TextEdit, Tx, Waker, col, el, icon, row, text};
 use rune_kit::diff::{FileDiff, LineKind};
 use rune_kit::shell::{Sidebar, SidebarRow, SidebarSection};
-use rune_kit::{Badge, BadgeVariant, Button, ButtonVariant, Card, ControlSize, Divider, IconButton, IconButtonVariant, Kit, Spinner};
+use rune_kit::{Badge, BadgeVariant, Button, ButtonVariant, Card, ControlSize, IconButton, IconButtonVariant, Kit, Spinner};
 
 use crate::State;
 use crate::style::{self, Palette};
 use crate::watch::NotebookOp;
 
-/// How far a list row's hover surface reaches past the text column, matching the Notebook index.
-const ROW_BLEED: f32 = 10.0;
-/// The trailing action column, so Revert, Reverted, and Dismiss align down the page.
-const ACTION_W: f32 = 84.0;
-/// Small ghost button inline padding.
-const BUTTON_PAD: f32 = 10.0;
 /// Maximum lines of tool output shown inside an expanded step.
 const TOOL_OUTPUT_LINES: usize = 24;
 /// Fold consecutive finished read/search steps once there are more than this many.
@@ -82,16 +76,19 @@ pub struct Chat {
     pub input: TextEdit,
     pub phase: Phase,
     pub backend: Option<Backend>,
+    run_config: RunConfig,
     pub scope: Scope,
     /// Ask answers from the Notebook without editing; Review may make cited edits.
     pub mode: SessionMode,
-    /// The saved chat on screen, read-only; typing starts a new chat.
+    /// The saved chat on screen; typing continues it.
     pub viewing: Option<i64>,
     /// A saved transcript loaded off the UI thread, waiting to be shown.
     saved: Arc<Mutex<Option<SavedChat>>>,
     /// Folded groups of finished reads that the user expanded, keyed by first item index.
     pub expanded: Vec<usize>,
     session: Arc<Mutex<Option<Session>>>,
+    /// The run behind this chat, kept after its session ends so a follow-up can continue it.
+    last_run: Arc<Mutex<Option<i64>>>,
     inbox: Arc<Mutex<Vec<Event>>>,
     stop_requested: Arc<AtomicBool>,
 }
@@ -103,12 +100,14 @@ impl Default for Chat {
             input: TextEdit::default(),
             phase: Phase::default(),
             backend: None,
+            run_config: RunConfig::default(),
             scope: Scope::Notebook,
             mode: SessionMode::Ask,
             viewing: None,
             saved: Arc::new(Mutex::new(None)),
             expanded: Vec::new(),
             session: Arc::new(Mutex::new(None)),
+            last_run: Arc::new(Mutex::new(None)),
             inbox: Arc::new(Mutex::new(Vec::new())),
             stop_requested: Arc::new(AtomicBool::new(false)),
         }
@@ -119,6 +118,10 @@ impl Chat {
     fn draft(&self) -> Option<(SessionMode, &str)> {
         let text = self.input.text.trim();
         (!text.is_empty()).then_some((SessionMode::Ask, text))
+    }
+
+    fn can_reuse_session(&self, backend: Backend, run_config: &RunConfig) -> bool {
+        self.phase == Phase::Ready && self.backend == Some(backend) && self.run_config == *run_config
     }
 
     /// Moves events from the background CLI thread into the transcript.
@@ -151,7 +154,7 @@ impl Chat {
             let err = match sent {
                 Some(Ok(())) => None,
                 Some(Err(e)) => Some(e.to_string()),
-                None => Some("This Curator session has already ended. Start a new chat to continue.".into()),
+                None => Some("This Curator session has ended. Send your message again to continue.".into()),
             };
             if let Some(why) = err {
                 let mut pending = inbox.lock().unwrap_or_else(|e| e.into_inner());
@@ -166,7 +169,7 @@ impl Chat {
     }
 }
 
-/// Lays a saved transcript out as a finished, read-only chat.
+/// Lays out the saved turns while the next message is still unsent.
 fn show_saved(chat: &mut Chat, stored: Vec<StoredEvent>) {
     chat.items.clear();
     chat.expanded.clear();
@@ -178,7 +181,7 @@ fn show_saved(chat: &mut Chat, stored: Vec<StoredEvent>) {
             StoredEvent::Event(event) => apply(&mut chat.items, &mut chat.phase, chat.backend, event),
         }
     }
-    // A saved chat can't take follow-ups, so it always reads as finished.
+    // Its session is over; the next message continues it in a new one.
     chat.phase = Phase::Ended;
 }
 
@@ -233,17 +236,27 @@ impl State {
     fn gardener_submit(&mut self) {
         let Some((mode, typed)) = self.notebook.chat.draft() else { return };
         let typed = typed.to_string();
-        match self.notebook.chat.phase {
-            Phase::Working => {}
-            Phase::Ready => {
-                let wake = self.wake.clone();
-                let chat = &mut self.notebook.chat;
-                chat.input = TextEdit::new("");
-                chat.items.push(Item::You(typed.clone()));
-                chat.phase = Phase::Working;
-                chat.session_send(typed, wake);
-            }
-            Phase::Idle | Phase::Ended => self.gardener_start(self.notebook.chat.scope, mode, typed, None),
+        let chat = &self.notebook.chat;
+        if chat.phase == Phase::Working {
+            return;
+        }
+        let Some(backend) = selected_backend(self) else { return };
+        if chat.can_reuse_session(backend, &self.curator.prefs.run(backend)) {
+            let wake = self.wake.clone();
+            let chat = &mut self.notebook.chat;
+            chat.input = TextEdit::new("");
+            chat.items.push(Item::You(typed.clone()));
+            chat.phase = Phase::Working;
+            chat.session_send(typed, wake);
+            return;
+        }
+
+        // A new model or subscription needs a fresh provider run. Reuse the same continuation
+        // path as a reopened chat so the conversation, mode, and scope carry forward.
+        match current_run(chat) {
+            Some(from) => self.gardener_launch(chat.scope, chat.mode, typed, None, Some(from)),
+            None if chat.phase != Phase::Ready => self.gardener_start(chat.scope, mode, typed, None),
+            None => {} // The first reply arrived before its session handle was published.
         }
     }
 
@@ -266,7 +279,7 @@ impl State {
         }
     }
 
-    /// Shows a saved chat read-only, loading its transcript off the UI thread.
+    /// Opens a saved chat, loading its transcript off the UI thread.
     fn gardener_open_chat(&mut self, summary: &ChatSummary) {
         if self.notebook.chat.phase == Phase::Working {
             return;
@@ -326,26 +339,49 @@ impl State {
 
     /// Starts a chat. `job` is a preset's label: its prompt stays out of the transcript.
     fn gardener_start(&mut self, scope: Scope, mode: SessionMode, message: String, job: Option<&'static str>) {
+        self.gardener_launch(scope, mode, message, job, None);
+    }
+
+    /// Starts a session: a new chat, or with `from` the next turn of a saved one, whose
+    /// transcript stays on screen.
+    fn gardener_launch(&mut self, scope: Scope, mode: SessionMode, message: String, job: Option<&'static str>, from: Option<i64>) {
         let Some(backend) = selected_backend(self) else { return };
         let Some(wake) = self.wake.clone() else { return };
         let mut env = SessionEnv::detect();
         env.run = self.curator.prefs.run(backend);
-        if self.notebook.gardener.running.is_some() {
+        let chat = &self.notebook.chat;
+        let previous_session =
+            from.filter(|id| chat.viewing.is_none() && current_run(chat) == Some(*id)).map(|_| Arc::clone(&chat.session));
+        if self.notebook.gardener.running.as_ref().is_some_and(|run| previous_session.is_none() || Some(run.id) != from) {
             return;
         }
         self.curator_sign_in.begin_run();
         let chat = &mut self.notebook.chat;
+        let mut earlier = if from.is_some() { std::mem::take(&mut chat.items) } else { Vec::new() };
+        // The old session's end marker would sit mid-conversation.
+        while matches!(earlier.last(), Some(Item::Ended)) {
+            earlier.pop();
+        }
         *chat = Chat::default();
+        chat.items = earlier;
         if job.is_none() {
             chat.items.push(Item::You(message.clone()));
         }
         chat.phase = Phase::Working;
         chat.backend = Some(backend);
+        chat.run_config = env.run.clone();
+        chat.last_run = Arc::new(Mutex::new(from));
         chat.scope = scope;
         chat.mode = mode;
-        let (slot, inbox) = (Arc::clone(&chat.session), Arc::clone(&chat.inbox));
+        let (slot, inbox, last_run) = (Arc::clone(&chat.session), Arc::clone(&chat.inbox), Arc::clone(&chat.last_run));
         let stop_requested = Arc::clone(&chat.stop_requested);
         std::thread::spawn(move || {
+            // Finish saving the previous run before the replacement reads its transcript or
+            // claims the store. Its late events still go to its old inbox.
+            if let Some(previous) = previous_session {
+                let session = previous.lock().unwrap_or_else(|e| e.into_inner()).take();
+                drop(session);
+            }
             let sink = {
                 let (inbox, wake) = (Arc::clone(&inbox), wake.clone());
                 move |event: Event| {
@@ -353,12 +389,14 @@ impl State {
                     wake();
                 }
             };
-            let opening = match job {
-                Some(title) => ChatOpening::Job { title, prompt: &message },
-                None => ChatOpening::Message(&message),
+            let opening = match (job, from) {
+                (Some(title), _) => ChatOpening::Job { title, prompt: &message },
+                (None, Some(from)) => ChatOpening::Continue { from, message: &message },
+                (None, None) => ChatOpening::Message(&message),
             };
             match Session::start_curator_chat(backend, env, scope, mode, opening, sink) {
                 Ok(session) => {
+                    *last_run.lock().unwrap_or_else(|e| e.into_inner()) = Some(session.run_id());
                     let mut slot = slot.lock().unwrap_or_else(|e| e.into_inner());
                     if stop_requested.load(Ordering::Acquire) {
                         session.stop();
@@ -394,6 +432,13 @@ impl State {
         self.notebook.chat = Chat::default();
     }
 
+    /// Opens Curator from anywhere, keeping the chat that's on screen.
+    pub fn open_curator(&mut self, tx: &mut Tx) {
+        self.close_project();
+        self.select_tab(crate::Tab::Notebook, tx);
+        self.notebook_shelf(crate::notebook::Shelf::Gardener);
+    }
+
     /// Starts a Review run over the open flags in the chat's scope.
     fn gardener_review_flags(&mut self) {
         if matches!(self.notebook.chat.phase, Phase::Idle | Phase::Ended) && self.notebook.chat.viewing.is_none() {
@@ -404,7 +449,7 @@ impl State {
 }
 
 /// The saved-chat title for a Review run started from the flag card.
-const REVIEW_JOB: &str = "Review Flagged Updates";
+const REVIEW_JOB: &str = "Review flagged updates";
 
 /// Open flags inside the chat's scope.
 pub fn scoped_flags(s: &State) -> Vec<&Flag> {
@@ -421,45 +466,56 @@ pub fn scoped_flags(s: &State) -> Vec<&Flag> {
         .collect()
 }
 
-/// Above a fresh composer when flags are waiting: how many, and one button to review them.
-/// Nothing at zero, so the empty composer stays clean.
-fn review_card(s: &State, p: &Palette, k: &Kit) -> Option<El> {
-    let chat = &s.notebook.chat;
-    if chat.viewing.is_some() || !matches!(chat.phase, Phase::Idle | Phase::Ended) {
-        return None;
-    }
+/// A fresh chat: Curator's orb floating over its shadow, and a line or two of what it's for.
+/// Waiting flags turn the second line into a quiet way to review them.
+fn intro(s: &State, p: &Palette) -> El {
+    const ORB: f32 = 64.0;
+    let shadow = el().w(ORB * 0.7).h(8.0).radius(4.0).radial_gradient(
+        [0.5, 0.5],
+        ORB * 0.35,
+        [(0.0, rune::oklch(0.0, 0.0, 0.0).alpha(if p.dark { 0.55 } else { 0.18 })), (1.0, rune::oklch(0.0, 0.0, 0.0).alpha(0.0))],
+    );
+    let mut words = col()
+        .items_center()
+        .gap(2.0)
+        .max_w(420.0)
+        .child(text("Ask about anything in your Notebook.").font(style::BODY).color(p.text_3).align(rune::Align::Center));
     let n = scoped_flags(s).len();
-    if n == 0 {
-        return None;
-    }
-    let g = &s.notebook.gardener;
-    let ready = selected_backend(s).is_some() && g.running.is_none();
-    let title = if n == 1 { "1 flagged update to review".to_string() } else { format!("{n} flagged updates to review") };
-    Some(
-        row()
-            .key("gardener-review-card")
-            .role("group")
-            .label(title.clone())
-            .w_full()
-            .gap(10.0)
-            .px(14.0)
-            .py(10.0)
-            .radius(10.0)
-            .border(1.0, p.hairline)
-            .center_y()
-            .child(el().size(6.0, 6.0).radius(3.0).fill(p.amber))
-            .child(text(title).font(style::META).color(p.text).truncate().shrink().min_w(0.0))
-            .child(rune::spacer())
-            .child(
-                Button::new("Review Now")
-                    .variant(ButtonVariant::Outline)
-                    .control_size(ControlSize::Small)
-                    .disabled(!ready)
-                    .on_press(|s: &mut State| s.gardener_review_flags())
-                    .build(k)
-                    .key("gardener-review-flags"),
+    let ready = selected_backend(s).is_some() && s.notebook.gardener.running.is_none();
+    words = if n > 0 {
+        let what = if n == 1 { "1 flagged update is waiting.".to_string() } else { format!("{n} flagged updates are waiting.") };
+        words.child(
+            row().gap(6.0).center_y().child(text(what).font(style::BODY).color(p.text_3)).child(
+                row()
+                    .key("gardener-review-flags")
+                    .role("button")
+                    .label("Review flagged updates")
+                    .focusable(true)
+                    .cursor(if ready { Cursor::Pointer } else { Cursor::Default })
+                    .opacity(if ready { 1.0 } else { 0.5 })
+                    .on_press(move |s: &mut State| {
+                        if ready {
+                            s.gardener_review_flags();
+                        }
+                    })
+                    .child(text("Review").font(style::BODY).color(p.text_2)),
             ),
-    )
+        )
+    } else {
+        words.child(
+            text("It turns flagged updates into notes your agents read next time.")
+                .font(style::BODY)
+                .color(p.text_3)
+                .align(rune::Align::Center),
+        )
+    };
+    col()
+        .key("gardener-intro")
+        .items_center()
+        .gap(14.0)
+        .pb(28.0)
+        .child(col().items_center().gap(10.0).child(crate::orb::orb(&crate::chrome::CURATOR_ORB, ORB)).child(shadow))
+        .child(words)
 }
 
 /// The subscription a new chat runs on. `None` until one is turned on in Settings → Curator.
@@ -467,12 +523,10 @@ pub fn selected_backend(s: &State) -> Option<Backend> {
     crate::curator_settings::selected(s)
 }
 
-/// The model picker beside the send button. Shows the running chat's subscription mid-chat.
+/// The model picker beside the send button selects what the next message will use.
 fn provider_picker(s: &State, p: &Palette, k: &Kit, layer: &mut Vec<El>) -> Option<El> {
-    let chat = &s.notebook.chat;
-    let locked = matches!(chat.phase, Phase::Working | Phase::Ready);
-    let current = if locked { chat.backend } else { selected_backend(s) }?;
-    Some(crate::curator_settings::picker(s, current, locked, p, k, layer))
+    let current = selected_backend(s)?;
+    Some(crate::curator_settings::picker(s, current, p, k, layer))
 }
 
 /// Current live status text while Curator is working.
@@ -490,7 +544,7 @@ pub fn view(s: &State, p: &Palette, k: &Kit, max_w: f32, reduced_motion: bool) -
     if let Some(bar) = top_bar(s, p, k) {
         page = page.child(bar);
     }
-    if is_fresh(s) { page.child(idle_view(s, p, k)) } else { page.child(transcript(s, p, k, reduced_motion)) }
+    if is_fresh(s) { page } else { page.child(transcript(s, p, k, reduced_motion)) }
 }
 
 /// No conversation on screen yet.
@@ -502,11 +556,7 @@ fn is_fresh(s: &State) -> bool {
 /// True when Curator has no messages, is idle, isn't viewing a saved thread, and has no recent
 /// changes to list — so the composer sits centred instead of pinned to the bottom of a blank page.
 pub fn is_empty_idle(s: &State) -> bool {
-    if !is_fresh(s) || s.notebook.chat.viewing.is_some() {
-        return false;
-    }
-    let scope = s.notebook.chat.scope;
-    !s.notebook.gardener.changes.iter().any(|c| scope.includes(s.notebook.page(c.page_id).and_then(|pg| pg.project_id)))
+    is_fresh(s) && s.notebook.chat.viewing.is_none()
 }
 
 /// Centred composer for an empty Curator chat, with any active scope/status bar directly above it.
@@ -515,11 +565,7 @@ pub fn empty_view(s: &State, p: &Palette, k: &Kit, max_w: f32, layer: &mut Vec<E
     if let Some(bar) = top_bar(s, p, k) {
         stack = stack.child(col().w_full().max_w(max_w.min(CHAT_MAX_W)).px(40.0).child(bar));
     }
-    if let Some(card) = review_card(s, p, k) {
-        // Same edges as the composer box below it.
-        stack = stack.child(col().w_full().items_center().px(40.0).pb(4.0).child(card.max_w(max_w.min(CHAT_MAX_W))));
-    }
-    stack = stack.child(composer(s, p, k, max_w, layer));
+    stack = stack.child(intro(s, p)).child(composer(s, p, k, max_w, layer));
     col().w_full().grow(1.0).min_h(0.0).justify_center().items_center().pb(48.0).child(stack)
 }
 
@@ -598,36 +644,11 @@ fn status_line(s: &State, p: &Palette) -> Option<El> {
 /// Pinned composer using native `rune_kit::TextInput` and `Button`.
 pub fn composer(s: &State, p: &Palette, k: &Kit, max_w: f32, layer: &mut Vec<El>) -> El {
     let chat = &s.notebook.chat;
-    // A saved thread is a record: say so where the composer would be, with the way forward.
-    if chat.viewing.is_some() {
-        let bar = row()
-            .key("gardener-saved-bar")
-            .w_full()
-            .max_w(max_w.min(CHAT_MAX_W))
-            .gap(8.0)
-            .px(14.0)
-            .py(8.0)
-            .radius(COMPOSER_RADIUS)
-            .border(1.0, p.hairline)
-            .center_y()
-            .child(text("Saved chat · Read-only").font(style::META).color(p.text_3))
-            .child(rune::spacer())
-            .child(
-                Button::new("New Chat")
-                    .variant(ButtonVariant::Outline)
-                    .control_size(ControlSize::Small)
-                    .on_press(|s: &mut State| s.gardener_close())
-                    .build(k)
-                    .key("gardener-saved-new-chat"),
-            );
-        return col().w_full().items_center().px(40.0).pt(8.0).pb(14.0).child(bar);
-    }
-    let locked = matches!(chat.phase, Phase::Working | Phase::Ready);
-    let backend = if locked { chat.backend } else { selected_backend(s) };
+    let backend = selected_backend(s);
     let placeholder = match chat.phase {
         Phase::Working => "Working…",
-        Phase::Ready => "Ask a follow-up…",
-        Phase::Idle | Phase::Ended => "Ask Curator…",
+        Phase::Ready | Phase::Ended => "Ask a follow-up…",
+        Phase::Idle => "Ask Curator…",
     };
     let disabled = backend.is_none() || chat.phase == Phase::Working;
     // The field sits borderless inside the composer box, as in T3 Code and Claude: Return sends,
@@ -659,7 +680,7 @@ pub fn composer(s: &State, p: &Palette, k: &Kit, max_w: f32, layer: &mut Vec<El>
             .label(if matches!(chat.phase, Phase::Idle | Phase::Ended) { "Ask" } else { "Send" })
             .disabled(
                 backend.is_none()
-                    || s.notebook.gardener.running.is_some() && matches!(chat.phase, Phase::Idle | Phase::Ended)
+                    || s.notebook.gardener.running.as_ref().is_some_and(|run| Some(run.id) != current_run(chat))
                     || draft.is_none(),
             )
             .on_press(|s: &mut State| s.gardener_submit())
@@ -1079,28 +1100,17 @@ fn disclosed(body: El) -> El {
     col().w_full().pl(18.0).pb(4.0).child(body)
 }
 
-fn action_slot(child: El) -> El {
-    row().w(ACTION_W).justify_end().center_y().child(child)
-}
-
-/// Between runs: recent Curator edits, each revertible. Nothing when there are none.
-fn idle_view(s: &State, p: &Palette, k: &Kit) -> El {
-    let scope = s.notebook.chat.scope;
-    let changes: Vec<&Change> =
-        s.notebook.gardener.changes.iter().filter(|c| scope.includes(s.notebook.page(c.page_id).and_then(|pg| pg.project_id))).collect();
-    let mut page = col().w_full();
-    if let Some(card) = review_card(s, p, k) {
-        page = page.child(card.mb(16.0));
-    }
-    if !changes.is_empty() {
-        page = page.child(section_title("Recent changes", p)).child(change_list(s, &changes, p, k));
-    }
-    page
+/// Curator is doing something right now: this window's chat is mid-turn, or another run (the CLI,
+/// another window) holds the Notebook. A chat waiting for a follow-up keeps its run open, so an
+/// open run alone isn't work.
+pub fn is_busy(s: &State) -> bool {
+    let chat = &s.notebook.chat;
+    chat.phase == Phase::Working || s.notebook.gardener.running.as_ref().is_some_and(|run| Some(run.id) != current_run(chat))
 }
 
 /// The run id of the chat on screen, live or saved, so its thread row reads as selected.
 fn current_run(chat: &Chat) -> Option<i64> {
-    chat.viewing.or_else(|| chat.session.lock().ok().and_then(|g| g.as_ref().map(Session::run_id)))
+    chat.viewing.or_else(|| chat.last_run.lock().ok().and_then(|g| *g))
 }
 
 /// Recency bucket for a thread, like Claude and ChatGPT group their history.
@@ -1142,75 +1152,17 @@ pub fn thread_list(s: &State, k: &Kit) -> El {
 }
 
 /// The sidebar's primary button while Curator is open.
-pub fn new_chat_button(s: &State, k: &Kit) -> El {
-    Button::new("New Chat")
+/// The sidebar's first row while Curator is open, a plain row as AI apps list it.
+pub fn new_chat_row(k: &Kit) -> El {
+    SidebarRow::new("New chat")
         .icon(&crate::notebook::PLUS_ICON)
-        .variant(ButtonVariant::Outline)
-        .control_size(ControlSize::Regular)
-        .disabled(s.notebook.chat.phase == Phase::Working)
-        .on_press(|s: &mut State| s.gardener_close())
+        .on_select(|s: &mut State, _: &mut Tx| {
+            if s.notebook.chat.phase != Phase::Working {
+                s.gardener_close();
+            }
+        })
         .build(k)
-        .w_full()
         .key("gardener-new-chat")
-}
-
-fn section_title(label: &str, p: &Palette) -> El {
-    text(label.to_string()).font(style::NAME).color(p.text).pb(4.0)
-}
-
-fn change_list(s: &State, changes: &[&Change], p: &Palette, k: &Kit) -> El {
-    let mut list = col().w_full();
-    for (i, change) in changes.iter().enumerate() {
-        if i > 0 {
-            list = list.child(Divider::horizontal().build(k));
-        }
-        list = list.child(change_row(s, change, p, k));
-    }
-    list
-}
-
-fn change_row(s: &State, c: &Change, p: &Palette, k: &Kit) -> El {
-    let (id, page_id) = (c.id, c.page_id);
-    let verb = c.action.label();
-    let title = row()
-        .w_full()
-        .gap(6.0)
-        .center_y()
-        .child(text(verb).font(style::META).color(p.text_3))
-        .child(text(c.page_title.clone()).font(style::NAME).color(p.text).truncate().shrink().min_w(0.0))
-        .child(rune::spacer())
-        .child(text(ago(c.created_at, s.now)).font(style::META).color(p.text_3));
-    let mut words = col().grow(1.0).min_w(0.0).gap(4.0).child(title);
-    if let Some(reason) = &c.reason {
-        words = words.child(text(reason.clone()).font(style::META).color(p.text_2).wrap().max_lines(3));
-    }
-    let trailing = if c.is_revertible() {
-        Button::new("Revert")
-            .variant(ButtonVariant::GhostMuted)
-            .control_size(ControlSize::Small)
-            .on_press(move |s: &mut State| s.gardener_send_op(NotebookOp::Revert(id)))
-            .build(k)
-            .key(format!("gardener-revert-{id}"))
-    } else {
-        text("Reverted").font(style::META).color(p.text_3).pr(BUTTON_PAD)
-    };
-    row()
-        .key(format!("gardener-change-{id}"))
-        .w_full()
-        .gap(12.0)
-        .center_y()
-        .mx(-ROW_BLEED)
-        .px(ROW_BLEED)
-        .py(12.0)
-        .radius(8.0)
-        .hover(p.hover)
-        .role("button")
-        .label(format!("{verb} {}", c.page_title))
-        .focusable(true)
-        .cursor(Cursor::Pointer)
-        .on_press(move |s: &mut State| s.notebook_open_page(page_id))
-        .child(words)
-        .child(action_slot(trailing))
 }
 
 /// Shows a saved chat read-only from recorded events, for snapshot scenes.
@@ -1275,7 +1227,7 @@ mod tests {
     }
 
     #[test]
-    fn saved_chats_reopen_finished_and_read_only() {
+    fn saved_chats_reopen_finished_and_ready_to_continue() {
         let mut chat = Chat { viewing: Some(7), ..Chat::default() };
         let stored = vec![
             StoredEvent::You("How do we sign the appcast?".into()),
@@ -1333,6 +1285,22 @@ mod tests {
         assert_eq!(change_id(r#"{"change_id":12,"action":"created"}"#), Some(12));
         assert_eq!(change_id("Revised page #1: x. Change #7 can be reverted by the person."), Some(7));
         assert_eq!(change_id("No change"), None);
+    }
+
+    #[test]
+    fn follow_ups_reuse_only_the_same_ready_provider_configuration() {
+        let run = RunConfig { model: Some("provider/first".into()), effort: Some("high".into()) };
+        let mut chat = Chat { phase: Phase::Ready, backend: Some(Backend::OpenCode), run_config: run.clone(), ..Chat::default() };
+        assert!(chat.can_reuse_session(Backend::OpenCode, &run));
+        assert!(!chat.can_reuse_session(Backend::Codex, &run));
+        let other_model = RunConfig { model: Some("provider/second".into()), ..run.clone() };
+        assert!(!chat.can_reuse_session(Backend::OpenCode, &other_model));
+        let other_effort = RunConfig { effort: None, ..run.clone() };
+        assert!(!chat.can_reuse_session(Backend::OpenCode, &other_effort));
+        chat.phase = Phase::Working;
+        assert!(!chat.can_reuse_session(Backend::OpenCode, &run));
+        chat.phase = Phase::Ended;
+        assert!(!chat.can_reuse_session(Backend::OpenCode, &run));
     }
 
     #[test]

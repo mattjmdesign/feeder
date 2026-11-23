@@ -11,8 +11,8 @@ use feeder_core::{
     CANONICAL_TOPICS, Kind, Page, PageDraft, Standing, ago, infer_topic, normalize_topic, toggle_markdown_task, topic_counts, topic_label,
 };
 use rune::{
-    Color, Cursor, El, Icon, Key, KeyEvent, Link, LinkPaint, ScrollSpec, Span, TextEdit, Transition, Tx, col, el, icon, oklch, row, text,
-    text_input,
+    Color, Cursor, El, Icon, Key, KeyEvent, Link, LinkPaint, ScrollSpec, Span, TextEdit, Transition, Tx, col, el, icon, memo, oklch, row,
+    text, text_input,
 };
 use rune_kit::shell::{SidebarPeek, SidebarToggle};
 use rune_kit::syntax::{self, SyntaxTheme};
@@ -24,11 +24,18 @@ use rune_kit::{
 
 use crate::style::{self, Palette};
 use crate::watch::NotebookOp;
-use crate::{CopyTarget, State, ToastItem, ToastKind, agents, chrome, feed, orb};
+use crate::{CopyTarget, State, ToastItem, ToastKind, agents, chrome, feed};
 
-/// How far a list row's hover surface reaches past the text column on each side.
-const ROW_BLEED: f32 = 10.0;
 const INDEX_MAX_W: f32 = 720.0;
+/// The narrowest a card gets before the grid drops a column, and every card's height.
+const CARD_MIN_W: f32 = 340.0;
+const CARD_H: f32 = 112.0;
+/// The pattern tile at a card's left, square, inset by the card's padding.
+const TILE: f32 = CARD_H - 2.0 * CARD_PAD;
+const CARD_PAD: f32 = 8.0;
+/// The scroll column's side padding around the index.
+const INDEX_PAD: f32 = 32.0;
+const CARD_GAP: f32 = 12.0;
 const DOC_MAX_W: f32 = 720.0;
 
 pub(crate) static PLUS_ICON: Icon = Icon {
@@ -37,11 +44,20 @@ pub(crate) static PLUS_ICON: Icon = Icon {
     body: r#"<path d="M8 3.25V12.75M3.25 8H12.75" stroke="currentColor" stroke-width="1.35" stroke-linecap="round"/>"#,
 };
 
+static NOTES_ICON: Icon = Icon {
+    name: "nb-notes",
+    view: 16.0,
+    body: r#"<rect x="3" y="2.25" width="10" height="11.5" rx="2" stroke="currentColor" stroke-width="1.3" fill="none"/><path d="M5.75 5.5h4.5M5.75 8h4.5M5.75 10.5h2.5" stroke="currentColor" stroke-width="1.3" stroke-linecap="round"/>"#,
+};
+
 static MORE_ICON: Icon = Icon {
     name: "nb-more",
     view: 16.0,
     body: r#"<circle cx="3.5" cy="8" r="1.2" fill="currentColor"/><circle cx="8" cy="8" r="1.2" fill="currentColor"/><circle cx="12.5" cy="8" r="1.2" fill="currentColor"/>"#,
 };
+
+/// Height kept clear at the bottom of the sidebar for the settings gear.
+const SETTINGS_CORNER_H: f32 = 44.0;
 
 /// What the index view is currently showing.
 #[derive(Clone, Debug, PartialEq, Eq, Default)]
@@ -74,10 +90,11 @@ pub struct Notebook {
     /// Every page (current + archived), newest revision first.
     pub pages: Vec<Page>,
     pub pane: PaneState,
+    /// The main pane's width from the last layout, so the index grid can fill its rows.
+    pub main_w: f32,
     pub tree: TreeModel<NavNode>,
     pub query: TextEdit,
     pub shelf: Shelf,
-    pub kind_filter: Option<Kind>,
     /// The page being read.
     pub open: Option<i64>,
     pub editor: Option<Editor>,
@@ -103,10 +120,10 @@ impl Default for Notebook {
         Notebook {
             pages: vec![],
             pane: PaneState::new(252.0).range(200.0, 360.0),
+            main_w: 0.0,
             tree: TreeModel::new().key("nb-tree"),
             query: TextEdit::new(""),
             shelf: Shelf::All,
-            kind_filter: None,
             open: None,
             editor: None,
             delete_confirm: None,
@@ -287,24 +304,15 @@ impl Notebook {
         }
     }
 
-    /// Pages visible in the active index view after shelf, kind, and query filters.
+    /// Pages visible in the active index view after shelf and query filters.
     pub fn visible(&self) -> Vec<&Page> {
         let on_shelf = |p: &&Page| -> bool {
-            let shelf_ok = match &self.shelf {
+            match &self.shelf {
                 Shelf::All => !p.is_archived(),
                 Shelf::Topic(t) => !p.is_archived() && p.topic == *t,
                 Shelf::Archived => p.is_archived(),
                 Shelf::Gardener => false,
-            };
-            if !shelf_ok {
-                return false;
             }
-            if let Some(k) = self.kind_filter
-                && p.kind != k
-            {
-                return false;
-            }
-            true
         };
         let words: Vec<String> = self.query.text.split_whitespace().map(str::to_lowercase).collect();
         let mut scored: Vec<(usize, &Page)> =
@@ -336,41 +344,6 @@ fn score(p: &Page, words: &[String]) -> Option<usize> {
         };
         Some(acc + hit)
     })
-}
-
-/// Each kind's muted semantic ink dot/accent, legible in both light and dark modes.
-pub fn kind_color(kind: Kind, p: &Palette) -> Color {
-    match kind {
-        Kind::Note => p.text_3,
-        Kind::Fix => {
-            if p.dark {
-                oklch(0.76, 0.13, 155.0)
-            } else {
-                oklch(0.53, 0.13, 155.0)
-            }
-        }
-        Kind::Pitfall => {
-            if p.dark {
-                oklch(0.76, 0.14, 32.0)
-            } else {
-                oklch(0.53, 0.16, 32.0)
-            }
-        }
-        Kind::Pattern => {
-            if p.dark {
-                oklch(0.76, 0.125, 252.0)
-            } else {
-                oklch(0.53, 0.14, 252.0)
-            }
-        }
-        Kind::Decision => {
-            if p.dark {
-                oklch(0.76, 0.12, 300.0)
-            } else {
-                oklch(0.53, 0.13, 300.0)
-            }
-        }
-    }
 }
 
 impl State {
@@ -463,7 +436,6 @@ impl State {
     fn notebook_select_tree_node(&mut self, id: &str) {
         if let Some(slug) = id.strip_prefix("topic:") {
             self.notebook.shelf = Shelf::Topic(slug.to_string());
-            self.notebook.kind_filter = None;
             self.notebook.open = None;
             self.notebook.editor = None;
             self.notebook.delete_confirm = None;
@@ -505,7 +477,6 @@ impl State {
                 if matches!(self.notebook.shelf, Shelf::Archived | Shelf::Gardener) {
                     self.notebook.shelf = Shelf::All;
                 }
-                self.notebook.kind_filter = None;
                 self.notebook_send(NotebookOp::Create(draft));
                 self.notebook.sync_tree_selection();
             }
@@ -594,7 +565,7 @@ pub fn view(s: &State, p: &Palette, k: &Kit, inset: f32, reduced_motion: bool, l
         .w_full()
         .grow(1.0)
         .min_h(0.0)
-        .child(col().w_full().items_center().px(40.0).pt(24.0).pb(if gardener { 24.0 } else { 80.0 }).child(body))
+        .child(col().w_full().items_center().px(INDEX_PAD).pt(24.0).pb(if gardener { 24.0 } else { 80.0 }).child(body))
         .scroll(ScrollSpec { stick_bottom: following })
         .scroll_edge_fade(16.0);
     let scroll_area =
@@ -612,9 +583,22 @@ pub fn view(s: &State, p: &Palette, k: &Kit, inset: f32, reduced_motion: bool, l
     } else {
         scroll_area
     };
-    let main_area = col().key("nb-main-area").w_full().grow(1.0).min_h(0.0).instant_changes().child(main_inner);
+    // The white sheet is for reading and writing a note; the index and Curator sit on the window.
+    let reading = nb.open.is_some() || nb.editor.is_some();
+    let main_area = col()
+        .key("nb-main-area")
+        .on_layout(|s: &mut State, r| {
+            if r[2] > 0.0 && (r[2] - s.notebook.main_w).abs() > 0.5 {
+                s.notebook.main_w = r[2];
+            }
+        })
+        .w_full()
+        .grow(1.0)
+        .min_h(0.0)
+        .instant_changes()
+        .child(main_inner);
 
-    let toolbar = Toolbar::new().leading(toolbar_breadcrumb(nb, p, k)).trailing(chrome::tabs(s, k)).trailing(chrome::menu(s, p, k, layer));
+    let toolbar = Toolbar::new().leading(toolbar_breadcrumb(nb, p, k)).trailing(chrome::tabs(s, k)).trailing(chrome::curator_button(s, p));
 
     SplitView::new(main_area)
         .sidebar(&nb.pane, |s: &mut State| &mut s.notebook.pane, sidebar_view(s, p, k))
@@ -624,7 +608,7 @@ pub fn view(s: &State, p: &Palette, k: &Kit, inset: f32, reduced_motion: bool, l
         .sidebar_toggle(SidebarToggle::new().in_header().past_lights(10.0))
         .sidebar_peek(SidebarPeek::new())
         .reduced_motion(reduced_motion)
-        .build(&style::pane_kit(k))
+        .build(&if reading { style::pane_kit(k) } else { style::open_pane_kit(k) })
 }
 
 /// A small button's inline padding, so a plain crumb's label sits where a pressable one's does.
@@ -711,36 +695,21 @@ fn sidebar_view(s: &State, p: &Palette, k: &Kit) -> El {
     let search = search_input.build(k).key("nb-search");
 
     let gardener_selected = nb.editor.is_none() && nb.open.is_none() && nb.shelf == Shelf::Gardener;
-    let new_page = if gardener_selected {
-        crate::gardener::new_chat_button(s, k)
+    // Plain icon rows, the way ChatGPT, Grok and Notion start a sidebar: the new-thing action, then places.
+    let new_row = if gardener_selected {
+        crate::gardener::new_chat_row(k)
     } else {
-        Button::new("New Note")
-            .icon(&PLUS_ICON)
-            .variant(ButtonVariant::Outline)
-            .control_size(ControlSize::Regular)
-            .on_press(|s: &mut State| s.notebook_new_page())
-            .build(k)
-            .w_full()
-            .key("nb-new")
+        SidebarRow::new("New note").icon(&PLUS_ICON).on_select(|s: &mut State, _| s.notebook_new_page()).build(k).key("nb-new")
     };
 
     let all_selected = nb.editor.is_none() && nb.open.is_none() && nb.shelf == Shelf::All;
     let all_row = SidebarRow::new("All notes")
+        .icon(&NOTES_ICON)
         .badge(current_count.to_string())
         .selected(all_selected)
         .on_select(|s: &mut State, _| s.notebook_shelf(Shelf::All))
         .build(k)
         .key("nb-shelf-all");
-
-    let open_flags = nb.gardener.open_flags.len();
-    let mut gardener_row = SidebarRow::new("Curator").selected(gardener_selected);
-    if nb.chat.phase == crate::gardener::Phase::Working || nb.gardener.running.is_some() {
-        gardener_row = gardener_row.status(rune_kit::shell::RowStatus::Busy);
-    }
-    if open_flags > 0 {
-        gardener_row = gardener_row.badge(open_flags.to_string());
-    }
-    let gardener_row = gardener_row.on_select(|s: &mut State, _| s.notebook_shelf(Shelf::Gardener)).build(k).key("nb-shelf-gardener");
 
     let header = col()
         .key("nb-sidebar-header")
@@ -750,9 +719,8 @@ fn sidebar_view(s: &State, p: &Palette, k: &Kit) -> El {
         .pb(8.0)
         .gap(8.0)
         .child(search)
-        .child(new_page)
-        // A list parent so VoiceOver reads the shelf rows as a list (SidebarRow is a listitem).
-        .child(col().w_full().gap(2.0).role("list").label("Notebook").child(all_row).child(gardener_row));
+        // A list parent so VoiceOver reads the rows as a list (SidebarRow is a listitem).
+        .child(col().w_full().gap(2.0).role("list").label("Notebook").child(new_row).child(all_row));
 
     // In Curator the sidebar lists its chats, the way AI apps keep threads beside the conversation.
     if gardener_selected {
@@ -761,13 +729,11 @@ fn sidebar_view(s: &State, p: &Palette, k: &Kit) -> El {
             .w_full()
             .h_full()
             .min_h(0.0)
+            // Room for the settings gear pinned in the window's bottom-left corner.
+            .pb(SETTINGS_CORNER_H)
             .instant_changes()
             .child(header)
-            .child(if nb.gardener.chats.is_empty() {
-                el()
-            } else {
-                el().w_full().px(8.0).child(SidebarHeader::new("Chats").count(nb.gardener.chats.len()).build(k))
-            })
+            // Date groups are the history's only headers.
             .child(col().w_full().grow(1.0).min_h(0.0).child(crate::gardener::thread_list(s, k)));
     }
 
@@ -781,6 +747,7 @@ fn sidebar_view(s: &State, p: &Palette, k: &Kit) -> El {
         .w_full()
         .h_full()
         .min_h(0.0)
+        .pb(SETTINGS_CORNER_H)
         .instant_changes()
         .child(header)
         .child(el().w_full().px(8.0).child(topics_head.build(k)));
@@ -795,7 +762,6 @@ fn sidebar_view(s: &State, p: &Palette, k: &Kit) -> El {
                 .child(text("Categories appear as you or agents add notes.").font(style::META).color(p.text_3).wrap()),
         );
     } else {
-        let palette = *p;
         let q = query.clone();
         let mut tree_style = TreeStyle::from_kit(k).chevron_only_folders(true).guides_on_hover(0.55);
         tree_style.row_height = 26.0;
@@ -810,11 +776,8 @@ fn sidebar_view(s: &State, p: &Palette, k: &Kit) -> El {
                     }
                     item
                 }
-                NavNode::Page { title, kind, .. } => {
+                NavNode::Page { title, .. } => {
                     let mut item = TreeItem::new(title);
-                    if *kind != Kind::Note {
-                        item = item.dot(kind_color(*kind, &palette));
-                    }
                     if !q.is_empty() {
                         item = item.highlight(&q);
                     }
@@ -862,108 +825,226 @@ fn index_view(s: &State, p: &Palette, k: &Kit, reduced_motion: bool) -> El {
     };
 
     let pages = nb.visible();
+    let mut topics: Vec<&str> = nb.pages.iter().map(|page| page.topic.as_str()).collect();
+    topics.sort_unstable();
+    topics.dedup();
+    let topic_rank = |topic: &str| topics.binary_search(&topic).unwrap_or_default();
 
-    // Only show the kind filter bar when the library has tagged kinds beyond plain Notes.
-    let present_kinds: Vec<Kind> = Kind::ALL.iter().copied().filter(|&kind| nb.pages.iter().any(|pg| pg.kind == kind)).collect();
-    let show_kind_filter = present_kinds.len() > 1 || nb.kind_filter.is_some();
-
-    let mut header = col().key("nb-header").w_full().pb(16.0).gap(16.0).child(text(heading).font(style::DISPLAY).color(p.text));
-    if show_kind_filter {
-        let mut kind_labels = vec!["All"];
-        for kind in &present_kinds {
-            kind_labels.push(kind.plural());
-        }
-        let selected_kind_idx = match nb.kind_filter {
-            None => Some(0),
-            Some(kind) => present_kinds.iter().position(|&x| x == kind).map(|i| i + 1),
-        };
-        let pick_kinds = present_kinds.clone();
-        let kind_control = SegmentedControl::new(&kind_labels, selected_kind_idx)
-            .label("Filter by kind")
-            .fit()
-            .on_pick(move |s: &mut State, i: usize, _: &mut Tx| {
-                s.notebook.kind_filter = if i == 0 { None } else { pick_kinds.get(i - 1).copied() };
-            })
-            .build(k);
-        header = header.child(kind_control);
-    }
+    let header = col().key("nb-header").w_full().pb(24.0).child(text(heading).font(style::DISPLAY).color(p.text));
 
     let mut list = col().key("nb-index").w_full();
     if pages.is_empty() {
         let question = nb.query.text.trim().to_string();
         let heading = if question.is_empty() { "No matching notes".to_string() } else { format!("No notes match “{question}”") };
-        let mut empty = col().w_full().py(32.0).gap(14.0).child(text(heading).font(style::NAME).color(p.text_2));
+        let mut empty = col().w_full().max_w(INDEX_MAX_W).py(32.0).gap(14.0).child(text(heading).font(style::NAME).color(p.text_2));
         if let (false, Some(agent)) = (question.is_empty(), crate::gardener::selected_backend(s)) {
             empty = empty.child(ask_curator_card(s, &question, agent, p, k));
         }
         list = list.child(empty);
+    } else if let Shelf::Topic(topic) = &nb.shelf {
+        // The heading already names the category.
+        list = list.child(card_grid(s, &pages, topic_rank(topic), p));
     } else {
-        for (i, page) in pages.into_iter().enumerate() {
-            if i > 0 {
-                list = list.child(Divider::horizontal().build(k));
+        // One parent grouping: each category once with its notes as cards, most recent first.
+        let mut groups: Vec<(&str, Vec<&Page>)> = Vec::new();
+        for page in pages {
+            match groups.iter_mut().find(|(topic, _)| *topic == page.topic.as_str()) {
+                Some((_, members)) => members.push(page),
+                None => groups.push((page.topic.as_str(), vec![page])),
             }
-            list = list.child(index_row(s, page, p, k));
+        }
+        for (i, (topic, members)) in groups.into_iter().enumerate() {
+            let slug = topic.to_string();
+            let heading = row()
+                .key(format!("nb-group-head-{topic}"))
+                .role("button")
+                .label(format!("Open category {}", topic_label(topic)))
+                .focusable(true)
+                .gap(8.0)
+                .center_y()
+                .pb(12.0)
+                .cursor(Cursor::Pointer)
+                .on_press(move |s: &mut State| s.notebook_shelf(Shelf::Topic(slug.clone())))
+                .child(text(topic_label(topic).to_string()).font(style::NAME).color(p.text))
+                .child(text(members.len().to_string()).font(style::META).color(p.text_3));
+            list = list.child(
+                col().key(format!("nb-group-{topic}")).w_full().pt(if i == 0 { 0.0 } else { 32.0 }).child(heading).child(card_grid(
+                    s,
+                    &members,
+                    topic_rank(topic),
+                    p,
+                )),
+            );
         }
     }
 
-    col().w_full().max_w(INDEX_MAX_W).child(header).child(Divider::horizontal().build(k)).child(list)
+    col().w_full().child(header).child(list)
 }
 
-fn index_row(s: &State, page: &Page, p: &Palette, k: &Kit) -> El {
+/// Cards in as many equal columns as fit, so each row spans the full content width edge to edge.
+fn card_grid(s: &State, pages: &[&Page], rank: usize, p: &Palette) -> El {
+    let main_w = if s.notebook.main_w > 0.0 { s.notebook.main_w } else { (s.window_size[0] - 240.0).max(320.0) };
+    let avail = (main_w - INDEX_PAD * 2.0).max(200.0);
+    let cols = (((avail + CARD_GAP) / (CARD_MIN_W + CARD_GAP)).floor() as usize).max(1);
+    let mut grid = col().w_full().gap(CARD_GAP);
+    for chunk in pages.chunks(cols) {
+        let mut line = row().w_full().gap(CARD_GAP);
+        for page in chunk {
+            line = line.child(index_card(s, page, rank, p));
+        }
+        for _ in chunk.len()..cols {
+            line = line.child(el().grow(1.0).min_w(0.0));
+        }
+        grid = grid.child(line);
+    }
+    grid
+}
+
+/// A note in the index grid: title, the first lines of what it says, and when it changed.
+fn index_card(s: &State, page: &Page, rank: usize, p: &Palette) -> El {
     let id = page.id;
-    let show_topic = !matches!(s.notebook.shelf, Shelf::Topic(_));
-    let excerpt = page.excerpt(160);
-
-    let mut meta_top = row().w_full().gap(8.0).center_y();
-    if show_topic {
-        meta_top = meta_top.child(Badge::new(topic_label(&page.topic)).variant(BadgeVariant::Subtle).build(k));
+    let title = row()
+        .w_full()
+        .gap(10.0)
+        .items_start()
+        .child(text(page.title.clone()).font(style::NAME).color(p.text).max_lines(1).grow(1.0).min_w(0.0))
+        .child(text(ago(page.updated_at, s.now)).font(style::META).color(p.text_3).pt(1.0));
+    let mut info = col().grow(1.0).min_w(0.0).gap(6.0).pt(6.0).pr(8.0).child(title);
+    let excerpt = card_excerpt(&page.body);
+    if !excerpt.is_empty() {
+        info = info.child(text(excerpt).font(style::META).color(p.text_2).max_lines(3));
     }
-    if page.kind != Kind::Note {
-        let ink = kind_color(page.kind, p);
-        meta_top = meta_top
-            .child(el().size(6.0, 6.0).radius(3.0).fill(ink))
-            .child(text(page.kind.label().to_string()).font(style::META).color(ink));
-    }
-    meta_top = meta_top.child(rune::spacer()).child(text(ago(page.updated_at, s.now)).font(style::META).color(p.text_3));
-
-    let mut card = col()
+    row()
         .key(format!("nb-page-{id}"))
         .role("button")
         .label(page.title.clone())
         .focusable(true)
-        .mx(-ROW_BLEED)
-        .px(ROW_BLEED)
-        .py(15.0)
-        .gap(6.0)
-        .radius(8.0)
+        .grow(1.0)
+        .min_w(0.0)
+        .h(CARD_H)
+        .padding(CARD_PAD)
+        .gap(14.0)
+        .radius(14.0)
+        .fill(p.card)
+        .border(1.0, p.hairline)
         .hover(p.hover)
         .cursor(Cursor::Pointer)
+        .press_scale(0.985)
         .on_press(move |s: &mut State| s.notebook_open_page(id))
-        .child(meta_top)
-        .child(text(page.title.clone()).font(style::SECTION_TITLE).color(p.text).wrap());
-    if !excerpt.is_empty() {
-        card = card.child(text(excerpt).font(style::BODY).color(p.text_2).wrap().max_lines(2));
-    }
-    card.child(byline(s, page, p, 12.0).mt(2.0))
+        .child(pattern_tile(&page.topic, rank, p.dark))
+        .child(info)
 }
 
-/// "Claude Code · Feeder · helped 3×": author, source project, and usefulness count.
-fn byline(s: &State, page: &Page, p: &Palette, mark: f32) -> El {
-    let author = if page.agent == feeder_core::GARDENER { "Curator" } else { page.agent.as_str() };
-    let mut r = row().gap(6.0).center_y().child(agents::mark(author, p, mark, s.agent_icon(author)));
-    r = r.child(text(author.to_string()).font(style::META).color(p.text_2));
-    if let Some(project) = page.project_id.and_then(|pid| s.summary(pid)) {
-        r = r
-            .child(text("·").font(style::META).color(p.text_3))
-            .child(orb::orb(&project.project.orb, mark))
-            .child(text(project.project.name.clone()).font(style::META).color(p.text_2));
+#[derive(Clone, Copy)]
+struct CategoryDuotone {
+    #[cfg_attr(not(test), allow(dead_code))]
+    hue: f32,
+    ground: Color,
+    bright: Color,
+    dim: Color,
+    border: Color,
+}
+
+/// One monochromatic duotone palette per parent category, spread around the OKLCH hue wheel
+/// via the golden angle so every category gets its own distinct color family.
+fn category_duotone(seed: u64, rank: usize, dark: bool) -> CategoryDuotone {
+    const GOLDEN_ANGLE: f32 = 137.507_77;
+    let jitter = ((seed >> 8) % 100) as f32 / 100.0 * 10.0 - 5.0;
+    let hue = (255.0 + rank as f32 * GOLDEN_ANGLE + jitter).rem_euclid(360.0);
+    let ground = if dark { oklch(0.21, 0.060, hue) } else { oklch(0.25, 0.068, hue) };
+    let bright = if dark { oklch(0.86, 0.095, hue) } else { oklch(0.88, 0.095, hue) };
+    let dim = if dark { oklch(0.54, 0.095, hue) } else { oklch(0.56, 0.095, hue) };
+    let border = if dark { oklch(0.82, 0.06, hue).alpha(0.16) } else { Color::TRANSPARENT };
+    CategoryDuotone { hue, ground, bright, dim, border }
+}
+
+/// A category's pattern: dots in a category-unique monochromatic duotone, drawn from the
+/// category's name, so every note in a category shares it and no two categories match.
+fn pattern_tile(topic: &str, rank: usize, dark: bool) -> El {
+    let seed = topic.bytes().fold(0xcbf2_9ce4_8422_2325_u64, |h, b| (h ^ u64::from(b)).wrapping_mul(0x0100_0000_01b3));
+    memo(format!("nb-pattern-{topic}"), (seed, rank, dark), || {
+        const PITCH: f32 = 6.0;
+        const DOT: f32 = 2.0;
+        let mut rng = seed | 1;
+        let mut next = move || {
+            rng ^= rng << 13;
+            rng ^= rng >> 7;
+            rng ^= rng << 17;
+            (rng >> 11) as f32 / (1u64 << 53) as f32
+        };
+        // Kinds cycle through the categories; the seed varies direction, spacing and phase.
+        let kind = rank % 6;
+        let (freq, phase, angle, cx, cy) =
+            (2.0 + next() * 4.0, next() * std::f32::consts::TAU, next() * std::f32::consts::PI, next(), next());
+        let flip = next() < 0.5;
+        let palette = category_duotone(seed, rank, dark);
+        let bright = palette.bright;
+        let dim = palette.dim;
+        let n = (TILE / PITCH).floor() as usize;
+        let inset = (TILE - (n as f32 - 1.0) * PITCH - DOT) / 2.0;
+        let mut tile = el().size(TILE, TILE).radius(8.0).clip_rounded(8.0).fill(palette.ground).border(1.0, palette.border);
+        // Which way a fade runs: up, down, from the left or across a diagonal.
+        let dir = (seed >> 3) % 4;
+        for row_i in 0..n {
+            for col_i in 0..n {
+                let u = col_i as f32 / (n - 1) as f32;
+                let mut v = row_i as f32 / (n - 1) as f32;
+                if flip {
+                    v = 1.0 - v;
+                }
+                let r = next();
+                let on = match kind {
+                    // A field of dots thinning out towards one edge.
+                    0 => {
+                        let t = match dir {
+                            0 => v,
+                            1 => 1.0 - v,
+                            2 => u,
+                            _ => (u + v) / 2.0,
+                        };
+                        r < t.powf(1.3)
+                    }
+                    // Diagonal bands.
+                    1 => ((u * angle.cos() + v * angle.sin()) * freq + phase).rem_euclid(1.0) < 0.45,
+                    // Rings around a point.
+                    2 => (((u - cx).hypot(v - cy)) * freq * 1.5).rem_euclid(1.0) < 0.5,
+                    // A wave, solid below it.
+                    3 => v > 0.5 + 0.28 * (u * freq * 1.2 + phase).sin() - r * 0.08,
+                    // A checker of blocks.
+                    4 => (((u * freq * 1.5) as i32 + (v * freq * 1.5) as i32) % 2 == 0) && r < 0.9,
+                    // Scatter.
+                    _ => r < 0.36,
+                };
+                if !on {
+                    continue;
+                }
+                let tone = if next() < 0.55 { bright } else { dim };
+                let x = inset + col_i as f32 * PITCH;
+                let y = inset + row_i as f32 * PITCH;
+                tile = tile.child(el().size(DOT, DOT).radius(DOT / 2.0).fill(tone).absolute(x, y));
+            }
+        }
+        tile.a11y_hidden()
+    })
+}
+
+/// The note's opening prose for a card: headings and blank lines skipped, Markdown marks dropped.
+fn card_excerpt(body: &str) -> String {
+    let mut out = String::new();
+    for line in body.lines().map(str::trim) {
+        if line.is_empty() || line.starts_with('#') || line.starts_with("```") || line.starts_with('>') {
+            continue;
+        }
+        let clean = line.trim_start_matches(['-', '*', ' ']).replace("**", "").replace('`', "");
+        if !out.is_empty() {
+            out.push(' ');
+        }
+        out.push_str(&clean);
+        if out.chars().count() > 240 {
+            break;
+        }
     }
-    if page.helped > 0 {
-        r = r
-            .child(text("·").font(style::META).color(p.text_3))
-            .child(text(format!("helped {}×", page.helped)).font(style::META).color(p.text_3));
-    }
-    r
+    out
 }
 
 fn page_view(s: &State, page: &Page, p: &Palette, k: &Kit, layer: &mut Vec<El>) -> El {
@@ -985,15 +1066,6 @@ fn page_view(s: &State, page: &Page, p: &Palette, k: &Kit, layer: &mut Vec<El>) 
         })
         .build(k)
         .key("nb-copy");
-
-    let helped_label = if page.helped > 0 { format!("Helped ({})", page.helped) } else { "Helped".to_string() };
-    let helped_btn = Button::new(helped_label)
-        .variant(ButtonVariant::Ghost)
-        .control_size(ControlSize::Regular)
-        .help("Mark that this note helped you")
-        .on_press(move |s: &mut State| s.notebook_send(NotebookOp::Helped(id)))
-        .build(k)
-        .key("nb-helped");
 
     let edit_btn = Button::new("Edit")
         .variant(ButtonVariant::Outline)
@@ -1037,7 +1109,7 @@ fn page_view(s: &State, page: &Page, p: &Palette, k: &Kit, layer: &mut Vec<El>) 
         }))
         .build(k, layer);
 
-    let actions = row().gap(6.0).center_y().child(copy_btn).child(helped_btn).child(edit_btn).child(more_menu);
+    let actions = row().gap(6.0).center_y().child(copy_btn).child(edit_btn).child(more_menu);
 
     let top_bar = row()
         .w_full()
@@ -1120,53 +1192,13 @@ fn page_view(s: &State, page: &Page, p: &Palette, k: &Kit, layer: &mut Vec<El>) 
         ago(page.created_at, s.now)
     };
 
-    let mut meta = row().key("nb-meta").w_full().mt(12.0).gap(8.0).center_y().flex_wrap().child(topic_pill);
-    if page.kind != Kind::Note {
-        let ink = kind_color(page.kind, p);
-        meta = meta.child(
-            row()
-                .gap(5.0)
-                .center_y()
-                .child(el().size(6.0, 6.0).radius(3.0).fill(ink))
-                .child(text(page.kind.label().to_string()).font(style::META).color(ink)),
-        );
-    }
-    meta = meta
-        .child(text("·").font(style::META).color(p.text_3))
-        .child(byline(s, page, p, 12.0))
-        .child(text("·").font(style::META).color(p.text_3))
-        .child(text(revised).font(style::META).color(p.text_3));
-
-    if !page.tags.is_empty() {
-        for tag in &page.tags {
-            let t = tag.clone();
-            meta = meta.child(
-                row()
-                    .key(format!("nb-chip-{tag}"))
-                    .role("button")
-                    .label(format!("Search notebook for {tag}"))
-                    .h(20.0)
-                    .px(7.0)
-                    .center_y()
-                    .radius(5.0)
-                    .fill(k.c.layer_01)
-                    .border(1.0, k.c.border_muted)
-                    .hover(k.c.hover)
-                    .cursor(Cursor::Pointer)
-                    .on_press(move |s: &mut State| {
-                        s.notebook_shelf(Shelf::All);
-                        s.notebook.query = TextEdit::new(&t);
-                        s.notebook.apply_tree_filter();
-                    })
-                    .child(text(format!("#{tag}")).font(style::META).color(p.text_3)),
-            );
-        }
-    }
-
-    doc = doc.child(meta).child(Divider::horizontal().build(k).mt(18.0));
+    // One quiet line: the category the note lives in, and when it last changed.
+    let meta =
+        row().key("nb-meta").w_full().mt(12.0).gap(8.0).center_y().child(topic_pill).child(text(revised).font(style::META).color(p.text_3));
+    doc = doc.child(meta);
 
     // Freeform Markdown article body with callouts, tables, syntax highlighting, and interactive tasks.
-    doc = doc.child(render_article_markdown(&page.body, Some(id), p, k).mt(24.0));
+    doc = doc.child(render_article_markdown(&page.body, Some(id), p, k).mt(28.0));
 
     // The Notebook as a graph: notes that point here, then notes nearby by link, tag or category.
     let backlinks = linked_from(&s.notebook, id);
@@ -1229,9 +1261,6 @@ fn page_list(title: &str, key: &str, pages: &[&Page], p: &Palette, k: &Kit) -> E
             .hover(p.hover)
             .cursor(Cursor::Pointer)
             .on_press(move |s: &mut State| s.notebook_open_page(rid));
-        if r.kind != Kind::Note {
-            row_item = row_item.child(el().size(6.0, 6.0).radius(3.0).fill(kind_color(r.kind, p)));
-        }
         row_item = row_item
             .child(text(r.title.clone()).font(style::NAME).color(p.text).truncate().grow(1.0).min_w(0.0))
             .child(Badge::new(topic_label(&r.topic)).variant(BadgeVariant::Subtle).build(k));
@@ -2357,6 +2386,22 @@ mod tests {
         assert_eq!(nb.visible().iter().map(|p| p.id).collect::<Vec<_>>(), [2], "every word must match");
         nb.query = TextEdit::new("next.js");
         assert_eq!(nb.visible().iter().map(|p| p.id).collect::<Vec<_>>(), [4], "topic label matches search too");
+    }
+
+    #[test]
+    fn category_duotones_spread_hues_and_stay_colored() {
+        let mut hues = Vec::new();
+        for (rank, topic) in ["agents-mcp", "rust", "tooling-git", "design-ui", "nextjs", "general"].iter().enumerate() {
+            let seed = topic.bytes().fold(0xcbf2_9ce4_8422_2325_u64, |h, b| (h ^ u64::from(b)).wrapping_mul(0x0100_0000_01b3));
+            let d = category_duotone(seed, rank, false);
+            for prev in &hues {
+                let diff = (d.hue - prev).abs();
+                let sep = diff.min(360.0 - diff);
+                assert!(sep > 20.0, "categories {topic} collided in hue ({} vs {})", d.hue, prev);
+            }
+            assert!((d.ground.r - d.ground.g).abs() > 0.01 || (d.ground.g - d.ground.b).abs() > 0.01);
+            hues.push(d.hue);
+        }
     }
 
     #[test]

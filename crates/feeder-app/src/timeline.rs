@@ -2,7 +2,6 @@
 //! end of the list comes near. Each post wears its project's orb; the orb or the project's name
 //! opens that project's full history.
 
-use std::collections::BTreeSet;
 use std::rc::Rc;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -13,7 +12,7 @@ use rune_kit::{Divider, Kit, MarkdownStyle, Menu, MenuItem, Placement, Spinner, 
 
 use crate::style::{self, Palette};
 use crate::watch::TIMELINE_PAGE;
-use crate::{CopyTarget, FeedFilter, State, agents, chrome, feed, orb};
+use crate::{CopyTarget, State, agents, chrome, feed, orb};
 
 const COLUMN: f32 = 660.0;
 /// The project orb beside each post: the post's face, like an avatar in a timeline.
@@ -27,7 +26,7 @@ pub fn view(s: &State, p: &Palette, k: &Kit, layer: &mut Vec<El>) -> El {
     let total: i64 = s.projects.iter().filter(|p| !p.project.archived).map(|p| p.updates).sum();
     let visible = s.filtered_timeline();
     let query = s.feed_search.text.trim();
-    let unfiltered = s.feed_filter == FeedFilter::All && s.feed_agent.is_none() && s.branch_filter.is_none() && query.is_empty();
+    let unfiltered = s.branch_filter.is_none() && query.is_empty();
     let more = unfiltered && (visible.len() as i64) < total;
 
     let filter_bar = filter_row(s, p);
@@ -189,50 +188,9 @@ fn filter_row(s: &State, p: &Palette) -> El {
             .child(text(label).font(style::META).color(if active { p.text } else { p.text_3 }))
     };
 
-    let mut row_el = row()
-        .key("feed-filters")
-        .w_full()
-        .flex_wrap()
-        .gap(6.0)
-        .center_y()
-        .child(search_box)
-        .child(chip("f-all", "All".into(), s.feed_filter == FeedFilter::All).on_press(|s: &mut State| s.feed_filter = FeedFilter::All));
-
-    let needs_count = s.projects.iter().filter(|p| !p.project.archived && p.needs_you).count();
-    if needs_count > 0 || s.feed_filter == FeedFilter::NeedsYou {
-        row_el = row_el.child(
-            chip("f-needs", format!("Needs you ({needs_count})"), s.feed_filter == FeedFilter::NeedsYou)
-                .on_press(|s: &mut State| s.feed_filter = FeedFilter::NeedsYou),
-        );
-    }
+    let mut row_el = row().key("feed-filters").w_full().flex_wrap().gap(6.0).center_y().child(search_box);
 
     let unseen = s.unseen_count();
-    if unseen > 0 || s.feed_filter == FeedFilter::Unread {
-        row_el = row_el.child(
-            chip("f-unread", format!("Unread ({unseen})"), s.feed_filter == FeedFilter::Unread)
-                .on_press(|s: &mut State| s.feed_filter = FeedFilter::Unread),
-        );
-    }
-    row_el = row_el.child(
-        chip("f-shots", "With media".into(), s.feed_filter == FeedFilter::Shots)
-            .on_press(|s: &mut State| s.feed_filter = FeedFilter::Shots),
-    );
-
-    let agents: Vec<String> = s.timeline.iter().map(|u| u.agent.clone()).collect::<BTreeSet<_>>().into_iter().collect();
-    if agents.len() > 1 || s.feed_agent.is_some() {
-        let label = match &s.feed_agent {
-            Some(a) => a.clone(),
-            None => "All agents".into(),
-        };
-        let active = s.feed_agent.is_some();
-        row_el = row_el.child(chip("f-agent", label, active).on_press(move |s: &mut State| {
-            let next = match &s.feed_agent {
-                None => agents.first().cloned(),
-                Some(cur) => agents.iter().position(|a| a == cur).and_then(|i| agents.get(i + 1).cloned()),
-            };
-            s.feed_agent = next;
-        }));
-    }
     if let Some(branch) = &s.branch_filter {
         row_el = row_el.child(chip("f-branch", format!("Branch: {branch} ×"), true).on_press(|s: &mut State| s.branch_filter = None));
     }
@@ -288,8 +246,9 @@ fn needs_you_now(s: &State, p: &Palette) -> Option<El> {
             actions = actions
                 .child(action(format!("needs-reply-{id}"), "Reply", format!("Reply to {name}")).on_press_tx(
                     move |s: &mut State, tx: &mut Tx| {
-                        // The Needs you filter puts this post first, so its reply box is on screen.
-                        s.feed_filter = FeedFilter::NeedsYou;
+                        // The project opens on this update, newest first, with its reply box ready.
+                        s.open_project(id);
+                        s.pending_scroll = Some(format!("u-{uid}"));
                         s.start_reply(uid, tx);
                     },
                 ))
@@ -387,15 +346,11 @@ fn post(s: &State, (p, k, md): (&Palette, &Kit, &MarkdownStyle), u: &FeedUpdate,
         .gap(6.0)
         .center_y()
         .child(open_project("project", text(summary.project.name.clone()).font(style::NAME).color(p.text).truncate()).shrink())
-        .child(agents::mark(&u.agent, p, 14.0, s.agent_icon(&u.agent)))
-        .child(text(u.agent.clone()).font(style::META).color(p.text_2).truncate().shrink());
-    if let Some(branch) = feed::branch_pill_clickable(s, p, u.branch.as_deref()) {
-        header = header.child(action_dot(p)).child(branch);
-    }
-    header = header
-        .child(rune::spacer())
-        .child(post_actions(s, p, u, menu_trigger))
+        .child(agents::post_mark(s, &u.agent, u.via.as_deref(), p, 14.0))
+        .child(text(u.agent.clone()).font(style::META).color(p.text_2).truncate().shrink())
+        .child(action_dot(p))
         .child(text(ago(u.created_at, s.now)).font(style::META).color(p.text_3));
+    header = header.child(rune::spacer()).child(post_actions(s, p, u, menu_trigger));
 
     let mut words = col().grow(1.0).min_w(0.0).gap(8.0).child(header);
     let mut attention = feed::card_attention_tags(s, p, u);
@@ -417,9 +372,6 @@ fn post(s: &State, (p, k, md): (&Palette, &Kit, &MarkdownStyle), u: &FeedUpdate,
     }
     if let Some(footer) = post_footer(s, p, u) {
         words = words.child(footer);
-    }
-    if let Some(replies) = feed::replies_section(s, p, k, u) {
-        words = words.child(replies);
     }
 
     row()
@@ -495,10 +447,6 @@ fn more_action(uid: i64, p: &Palette) -> El {
 /// Reply, Copy and More actions, revealed on hover or keyboard focus.
 fn post_actions(s: &State, p: &Palette, u: &FeedUpdate, menu_trigger: Option<El>) -> El {
     let uid = u.id;
-    let reply_count = s.replies.get(&uid).map_or(0, Vec::len);
-    let reply_label = if reply_count > 0 { format!("Reply · {reply_count}") } else { "Reply".to_string() };
-    let reply = post_action(p, format!("reply-u-{uid}"), "Reply to update", text(reply_label).font(style::META).color(p.text_3))
-        .on_press_tx(move |s: &mut State, tx: &mut Tx| s.start_reply(uid, tx));
     let body = u.body.clone();
     let copy_label = if s.is_copied(CopyTarget::Update(uid)) { "Copied" } else { "Copy" };
     let copy = post_action(p, format!("copy-u-{uid}"), "Copy update", text(copy_label).font(style::META).color(p.text_3)).on_press_tx(
@@ -507,9 +455,9 @@ fn post_actions(s: &State, p: &Palette, u: &FeedUpdate, menu_trigger: Option<El>
             s.mark_copied(CopyTarget::Update(uid));
         },
     );
-    let shown = menu_trigger.is_some() || s.replying_to == Some(uid);
+    let shown = menu_trigger.is_some();
     let more = menu_trigger.unwrap_or_else(|| more_action(uid, p));
-    row().gap(2.0).center_y().group_opacity(if shown { 1.0 } else { 0.0 }, 1.0).child(reply).child(copy).child(more)
+    row().gap(2.0).center_y().group_opacity(if shown { 1.0 } else { 0.0 }, 1.0).child(copy).child(more)
 }
 
 fn post_menu(uid: i64, p: &Palette, k: &Kit, layer: &mut Vec<El>) -> El {
@@ -542,11 +490,15 @@ fn post_footer(s: &State, p: &Palette, u: &FeedUpdate) -> Option<El> {
     if diff.is_none() && link.is_none() {
         return None;
     }
+    // One line of quiet metadata on the body's left edge: the diff, then the note it became.
     let mut r = row().w_full().gap(8.0).center_y();
     if let Some(diff) = diff {
-        r = r.child(text(diff.to_string()).font(style::PATH).color(p.text_3).truncate().max_w(220.0));
+        r = r.child(text(diff.to_string()).font(style::META).color(p.text_3).truncate().max_w(220.0));
     }
     if let Some(link) = link {
+        if diff.is_some() {
+            r = r.child(action_dot(p));
+        }
         r = r.child(link);
     }
     Some(r)

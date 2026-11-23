@@ -7,6 +7,7 @@
 //! JSON (comments) is left alone and the snippet is printed instead. Each file is copied to
 //! `<file>.feeder-backup` before its first change.
 
+use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -155,16 +156,24 @@ pub fn app_path(tool: Tool) -> Option<PathBuf> {
 }
 
 pub(crate) fn which(cmd: &str) -> Option<PathBuf> {
-    let path = std::env::var_os("PATH")?;
-    let mut dirs: Vec<PathBuf> = std::env::split_paths(&path).collect();
+    let path = std::env::var_os("PATH");
+    let dirs = path.iter().flat_map(std::env::split_paths);
     // GUI apps and some shells don't put these on PATH.
-    dirs.extend([
-        home().join(".local/bin"),
-        home().join(".cargo/bin"),
-        PathBuf::from("/opt/homebrew/bin"),
-        PathBuf::from("/usr/local/bin"),
-    ]);
-    dirs.into_iter().map(|d| d.join(cmd)).find(|p| p.is_file())
+    let fallback =
+        [home().join(".local/bin"), home().join(".cargo/bin"), PathBuf::from("/opt/homebrew/bin"), PathBuf::from("/usr/local/bin")];
+    find_executable(cmd, dirs.chain(fallback))
+}
+
+fn find_executable(cmd: &str, dirs: impl IntoIterator<Item = PathBuf>) -> Option<PathBuf> {
+    dirs.into_iter().find_map(|dir| {
+        let candidate = dir.join(cmd);
+        let meta = candidate.metadata().ok()?;
+        if !meta.is_file() || meta.permissions().mode() & 0o111 == 0 {
+            return None;
+        }
+        // Curator launches the CLI from a different working directory.
+        std::path::absolute(candidate).ok()
+    })
 }
 
 /// The `feeder` the tools should start: an absolute path, since GUI apps don't see your shell's
@@ -254,6 +263,9 @@ fn configured_command(config: Config) -> Option<PathBuf> {
         Config::Json { path, key, opencode } => {
             let doc = read_json(&path)?;
             let server = doc.get(key)?.get("feeder")?;
+            if opencode && server.get("enabled").and_then(Value::as_bool) == Some(false) {
+                return None;
+            }
             let command = if opencode { server.get("command")?.get(0)? } else { server.get("command")? };
             command.as_str().map(PathBuf::from)
         }
@@ -542,6 +554,22 @@ mod tests {
     }
 
     #[test]
+    fn cli_lookup_skips_non_executable_files() {
+        let dir = std::env::temp_dir().join(format!("feeder-cli-lookup-{}-{:08x}", std::process::id(), fastrand::u32(..)));
+        let shadow = dir.join("shadow");
+        std::fs::create_dir_all(&shadow).expect("create fixture directories");
+        let blocked = shadow.join("opencode");
+        let runnable = dir.join("opencode");
+        std::fs::write(&blocked, "").expect("create non-executable candidate");
+        std::fs::set_permissions(&blocked, std::fs::Permissions::from_mode(0o644)).expect("clear execute bits");
+        std::fs::write(&runnable, "#!/bin/sh\n").expect("create runnable candidate");
+        std::fs::set_permissions(&runnable, std::fs::Permissions::from_mode(0o755)).expect("set execute bits");
+        let found = find_executable("opencode", [shadow, dir.clone()]);
+        std::fs::remove_dir_all(&dir).expect("remove fixtures");
+        assert_eq!(found, Some(runnable));
+    }
+
+    #[test]
     fn json_configs_keep_their_other_servers_and_order() {
         let dir = std::env::temp_dir().join(format!("feeder-setup-{}", std::process::id()));
         let path = dir.join("mcp.json");
@@ -578,6 +606,9 @@ mod tests {
         let opencode = Config::Json { path: dir.join("opencode.json"), key: "mcp", opencode: true };
         apply(opencode, &bin);
         assert_eq!(configured_command(Config::Json { path: dir.join("opencode.json"), key: "mcp", opencode: true }), Some(bin.clone()));
+        let disabled = json!({ "mcp": { "feeder": { "type": "local", "command": [bin, "mcp"], "enabled": false } } });
+        std::fs::write(dir.join("opencode.json"), disabled.to_string()).expect("disable the saved connection");
+        assert_eq!(configured_command(Config::Json { path: dir.join("opencode.json"), key: "mcp", opencode: true }), None);
         let link = dir.join("link");
         std::os::unix::fs::symlink(&bin, &link).unwrap();
         assert!(same_file(&link, &bin), "a link to the same CLI counts as connected");

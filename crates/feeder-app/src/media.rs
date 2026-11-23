@@ -199,6 +199,7 @@ mod tests {
             last_update_id: Some(5),
             last_at: Some(10),
             last_agent: Some("Claude Code".into()),
+            last_via: None,
             last_body: Some("Done".into()),
             needs_you: false,
             unread_replies: 0,
@@ -240,6 +241,7 @@ mod tests {
             diff_stat: None,
             commit_sha: None,
             attention_dismissed_at: None,
+            via: None,
             created_at: 10,
         }
     }
@@ -285,12 +287,10 @@ mod tests {
         ids.sort_unstable();
         assert_eq!(ids, vec![12, 21, 31, 41, 51]);
 
-        // A project's media filter keeps only updates with media, decoding the shown slide; Files decodes none.
+        // A project's Updates decode the shown slide of each visible post; Files decodes none.
         s.open = Some(1);
         s.feed_for = Some(1);
         s.feed.push(sample_carousel_update(5, 1));
-        s.project_media_only = true;
-        assert!(feed::visible_feed(&s).iter().all(|u| u.has_media()));
         let mut media_ids: Vec<i64> = desired_slides(&s).into_iter().map(|m| m.id).collect();
         media_ids.sort_unstable();
         assert_eq!(media_ids, vec![51]);

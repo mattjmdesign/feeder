@@ -11,14 +11,10 @@ fn agent_from(get: impl Fn(&str) -> Option<String>) -> Option<String> {
     if let Some(a) = get("FEEDER_AGENT") {
         return Some(agent_display_name(&a));
     }
-    let bundle = get("__CFBundleIdentifier").unwrap_or_default();
-    let found = if get("T3CODE_THREAD_ID").is_some() || bundle == "com.t3tools.t3code" {
-        "T3 Code"
-    } else if bundle.contains("antigravity") || get("ANTIGRAVITY_AGENT").is_some() {
-        "Antigravity"
-    } else if bundle == "com.todesktop.230313mzl4w4u92" || get("CURSOR_TRACE_ID").is_some() || get("CURSOR_AGENT").is_some() {
-        "Cursor"
-    } else if get("OPENCODE").is_some() || get("OPENCODE_SESSION").is_some() {
+    if let Some(host) = host_from(&get) {
+        return Some(host.into());
+    }
+    let found = if get("OPENCODE").is_some() || get("OPENCODE_SESSION").is_some() {
         "OpenCode"
     } else if get("CLAUDECODE").is_some() {
         "Claude Code"
@@ -29,7 +25,28 @@ fn agent_from(get: impl Fn(&str) -> Option<String>) -> Option<String> {
     } else {
         return None;
     };
-    Some(found.to_string())
+    Some(found.into())
+}
+
+/// The host app behind a post, independent of any explicit author name.
+pub(crate) fn host_from_env() -> Option<&'static str> {
+    host_from(|key| std::env::var(key).ok().filter(|value| !value.is_empty()))
+}
+
+fn host_from(get: impl Fn(&str) -> Option<String>) -> Option<&'static str> {
+    let bundle = get("__CFBundleIdentifier").unwrap_or_default();
+    let found = if bundle == "app.openbot.desktop" || get("OPENBOT_AGENT_PROCESS").is_some() {
+        "OpenBot"
+    } else if get("T3CODE_THREAD_ID").is_some() || bundle == "com.t3tools.t3code" {
+        "T3 Code"
+    } else if bundle.contains("antigravity") || get("ANTIGRAVITY_AGENT").is_some() {
+        "Antigravity"
+    } else if bundle == "com.todesktop.230313mzl4w4u92" || get("CURSOR_TRACE_ID").is_some() || get("CURSOR_AGENT").is_some() {
+        "Cursor"
+    } else {
+        return None;
+    };
+    Some(found)
 }
 
 pub fn agent_display_name(raw: &str) -> String {
@@ -94,7 +111,12 @@ mod tests {
             |pairs: &'static [(&'static str, &'static str)]| move |k: &str| pairs.iter().find(|(n, _)| *n == k).map(|(_, v)| v.to_string());
         assert_eq!(agent_from(env(&[("CLAUDECODE", "1"), ("T3CODE_THREAD_ID", "x")])).as_deref(), Some("T3 Code"));
         assert_eq!(agent_from(env(&[("CLAUDECODE", "1")])).as_deref(), Some("Claude Code"));
+        assert_eq!(agent_from(env(&[("CLAUDECODE", "1"), ("OPENBOT_AGENT_PROCESS", "1")])).as_deref(), Some("OpenBot"));
         assert_eq!(agent_from(env(&[("FEEDER_AGENT", "codex"), ("CLAUDECODE", "1")])).as_deref(), Some("Codex"));
+        let named_agent = &[("FEEDER_AGENT", "Rust Dev"), ("OPENBOT_AGENT_PROCESS", "1"), ("CLAUDECODE", "1")];
+        assert_eq!(agent_from(env(named_agent)).as_deref(), Some("Rust Dev"));
+        assert_eq!(host_from(env(named_agent)), Some("OpenBot"));
+        assert_eq!(host_from(env(&[("FEEDER_AGENT", "codex")])), None);
         assert_eq!(agent_from(env(&[])), None);
     }
 }

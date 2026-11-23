@@ -236,6 +236,7 @@ mod tests {
             diff_stat: None,
             commit_sha: None,
             attention_dismissed_at: None,
+            via: None,
         };
         let replies = vec![crate::Reply {
             id: 2,
