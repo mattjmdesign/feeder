@@ -4,6 +4,7 @@
 //! Every page change made through [`Store::curate`] is logged with the reason and the content it
 //! replaced, so the person can read why the Notebook changed and revert any change.
 
+use std::collections::HashMap;
 use std::fmt;
 use std::str::FromStr;
 
@@ -102,6 +103,17 @@ impl FlagStatus {
             _ => FlagStatus::Open,
         }
     }
+}
+
+/// The current Notebook review outcome for a Feed update.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FeedReviewStatus {
+    /// Curator still has an open flag for the update.
+    Queued,
+    /// The review resolved the flag. The linked note can be absent if it was deleted.
+    Reviewed { note_id: Option<i64> },
+    /// The review closed the flag without a note change.
+    Dismissed,
 }
 
 /// One report that the Notebook is missing something, or says something wrong.
@@ -383,6 +395,39 @@ impl Store {
              ORDER BY f.created_at DESC, f.id DESC LIMIT ?3"
         ))?;
         let rows = stmt.query_map(params![status.map(FlagStatus::as_str), scope.project_id(), limit], flag_row)?;
+        Ok(rows.collect::<rusqlite::Result<_>>()?)
+    }
+
+    /// Looks up review outcomes for visible Feed updates in one query.
+    ///
+    /// Updates never queued for review are absent. An open flag takes precedence over closed
+    /// flags, including when undoing a note change reopens an older flag for the update.
+    ///
+    /// # Errors
+    /// Returns an error if the store cannot read the review outcomes.
+    pub fn feed_review_statuses(&self, update_ids: &[i64]) -> Result<HashMap<i64, FeedReviewStatus>> {
+        if update_ids.is_empty() {
+            return Ok(HashMap::new());
+        }
+        let ids = serde_json::json!(update_ids).to_string();
+        let mut stmt = self.conn.prepare_cached(
+            "SELECT requested.value, f.status, c.page_id
+             FROM json_each(?1) requested
+             JOIN knowledge_flags f ON f.id = (
+                 SELECT id FROM knowledge_flags
+                 WHERE source_update_id = requested.value
+                 ORDER BY (status = 'open') DESC, id DESC LIMIT 1
+             )
+             LEFT JOIN notebook_changes c ON c.id = f.change_id",
+        )?;
+        let rows = stmt.query_map([ids], |row| {
+            let status = match FlagStatus::parse(&row.get::<_, String>(1)?) {
+                FlagStatus::Open => FeedReviewStatus::Queued,
+                FlagStatus::Resolved => FeedReviewStatus::Reviewed { note_id: row.get(2)? },
+                FlagStatus::Dismissed => FeedReviewStatus::Dismissed,
+            };
+            Ok((row.get(0)?, status))
+        })?;
         Ok(rows.collect::<rusqlite::Result<_>>()?)
     }
 
@@ -913,6 +958,43 @@ mod tests {
 
     fn missing(note: &str) -> NewFlag {
         NewFlag { kind: FlagKind::Missing, page_id: None, project_id: None, note: note.into(), suggestion: None }
+    }
+
+    #[test]
+    fn feed_review_status_follows_note_changes_and_undo() {
+        let t = temp_store("review-status");
+        let s = &t.store;
+        let project = s.project_named("Alpha", None).expect("project");
+        let post = |body: &str| {
+            s.post(project.id, crate::NewUpdate { agent: "Codex".into(), body: body.into(), ..Default::default() }).expect("post").id
+        };
+        let update = post("Done: documented how to ship.");
+        let unrelated = post("Done: fixed the editor.");
+        let ids = [update, unrelated, update];
+        let status = || s.feed_review_statuses(&ids).expect("read review states");
+        assert!(status().is_empty(), "an update starts without a review");
+        let flag = s.flag_update_for_notebook(update, "You").expect("queue update");
+        assert_eq!(s.flag_update_for_notebook(update, "You").expect("retry queue").id, flag.id);
+        assert_eq!(status(), HashMap::from([(update, FeedReviewStatus::Queued)]));
+
+        let saved = s
+            .curate(
+                Curation::Create { draft: draft("Shipping", "Run the release script."), project_id: Some(project.id) },
+                GARDENER,
+                &cites("Document the shipping steps", &[flag.id]),
+            )
+            .expect("save note");
+        assert_eq!(status().get(&update), Some(&FeedReviewStatus::Reviewed { note_id: Some(saved.page.id) }));
+
+        let reopened = Store::open(&t.dir).expect("reopen store");
+        assert_eq!(reopened.feed_review_statuses(&ids).expect("read persisted outcome"), status());
+        drop(reopened);
+
+        let again = s.flag_update_for_notebook(update, "You").expect("queue again");
+        s.close_flag(again.id, FlagOutcome::Dismissed { note: "Already documented".into() }, GARDENER).expect("dismiss review");
+        assert_eq!(status().get(&update), Some(&FeedReviewStatus::Dismissed));
+        s.revert_change(saved.change.id, "You").expect("revert note");
+        assert_eq!(status().get(&update), Some(&FeedReviewStatus::Queued), "undo reopens the earlier review");
     }
 
     #[test]

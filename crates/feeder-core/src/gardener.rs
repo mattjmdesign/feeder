@@ -403,6 +403,8 @@ pub(crate) fn migrate(conn: &Connection) -> Result<()> {
     }
     tx.execute_batch(
         "CREATE INDEX IF NOT EXISTS notebook_changes_by_run ON notebook_changes(gardener_run_id) WHERE gardener_run_id IS NOT NULL;
+         CREATE INDEX IF NOT EXISTS knowledge_flags_by_update
+             ON knowledge_flags(source_update_id, (status = 'open') DESC, id DESC) WHERE source_update_id IS NOT NULL;
          CREATE TABLE IF NOT EXISTS curator_flag_dismissals (
             run_id INTEGER NOT NULL REFERENCES gardener_runs(id),
             flag_id INTEGER NOT NULL REFERENCES knowledge_flags(id),

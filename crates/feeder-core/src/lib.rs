@@ -20,6 +20,7 @@ pub use detect::{
     latest_commit_summary, remove_post_commit_hook, slugify,
 };
 pub use guide::{GUIDE, NOTEBOOK_GUIDE, notebook_skill_markdown, skill_markdown};
+pub use knowledge::FeedReviewStatus;
 pub use knowledge::{
     Change, ChangeAction, Curated, Curation, FLAG_NOTE_CHARS, FLAG_SUGGESTION_MAX_CHARS, Flag, FlagKind, FlagOutcome, FlagStatus, GARDENER,
     NewFlag, PageSnapshot, Provenance, REASON_MAX_CHARS,
