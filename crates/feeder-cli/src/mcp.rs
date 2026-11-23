@@ -159,8 +159,8 @@ impl Server {
                     "mimeType": "text/markdown"
                 }, {
                     "uriTemplate": "feeder://notebook/{id}",
-                    "name": "Notebook page",
-                    "description": "A single Feeder notebook lesson in Markdown.",
+                    "name": "Library page",
+                    "description": "A single Feeder Library lesson in Markdown.",
                     "mimeType": "text/markdown"
                 }]
             })),
@@ -168,23 +168,23 @@ impl Server {
             "prompts/list" if self.role == Role::Agent => Ok(json!({ "prompts": [{
                 "name": "update",
                 "title": "Post a Feeder update",
-                "description": "Write this project's update the Feeder way and post it."
+                "description": "Write this project's short Feed update (Done / Why / Next) and post it."
             }, {
                 "name": "lesson",
-                "title": "Flag a lesson for Curator",
-                "description": "Flag missing or incorrect Notebook knowledge uncovered in this session."
+                "title": "Flag a lesson draft for Curator",
+                "description": "Submit a full Markdown lesson draft (mistake, root cause, fix/rule) for Curator to add to the Library."
             }] })),
             "prompts/get" if self.role == Role::Agent => match params.get("name").and_then(Value::as_str) {
                 Some("update") => Ok(json!({
-                    "description": "Write this project's update the Feeder way and post it.",
+                    "description": "Write this project's short Feed update and post it.",
                     "messages": [{ "role": "user", "content": { "type": "text", "text": format!(
-                        "{GUIDE}\n\nNow look at what changed in this project during this session (and `git log`/`git status` if useful), decide whether a screenshot or clip helps, then call post_update."
+                        "{GUIDE}\n\nNow look at what changed in this project during this session (and `git log`/`git status` if useful), decide whether a screenshot or clip helps, then call post_update. If you also solved a non-obvious bug or learned a reusable rule, follow up with flag_knowledge and put a full Markdown lesson draft in suggestion."
                     ) } }]
                 })),
                 Some("lesson") => Ok(json!({
-                    "description": "Flag missing or incorrect Notebook knowledge uncovered in this session.",
+                    "description": "Submit a full Markdown lesson draft for Curator to review for the Library.",
                     "messages": [{ "role": "user", "content": { "type": "text", "text": format!(
-                        "{NOTEBOOK_GUIDE}\n\nLook back over this session for a reusable lesson. Search the Notebook first. If you find a gap or a correction, call flag_knowledge with the verified fix in suggestion when available. If the Notebook already covers it accurately, skip the flag."
+                        "{NOTEBOOK_GUIDE}\n\nLook back over this session for a reusable lesson or user correction. Search the Library first with search_notebook. If you find a gap or correction, call flag_knowledge with a full Markdown lesson draft in suggestion (symptom/mistake, root cause, verified fix or rule). If the Library already covers it accurately, skip the flag."
                     ) } }]
                 })),
                 _ => Err((-32602, "unknown prompt".to_string())),
@@ -205,7 +205,7 @@ impl Server {
             Role::Agent => (
                 json!({ "tools": {}, "prompts": {}, "resources": {} }),
                 format!(
-                    "Feeder is the user's local project update centre. Post an update with post_update when you finish a meaningful piece of work or when asked, and call get_feed before picking a project back up. Search the shared Notebook before non-trivial debugging. Flag gaps and suggest fixes with flag_knowledge. Curator maintains the shared notes.\n\n{GUIDE}\n\n{NOTEBOOK_GUIDE}"
+                    "Feeder is the user's local project update centre and shared knowledge Library. Use `post_update` for short 3-block Feed handoffs (Done / Why / Next, under {MAX_CHARS} chars) and `get_feed` before picking a project back up. Search the shared Library (`search_notebook`) before non-trivial debugging. Whenever the user corrects you or you uncover a reusable fix, pitfall, or pattern, ALSO call `flag_knowledge` on top of your Feed update and put a full Markdown lesson draft in `suggestion` (symptom, root cause, code snippet, rule). Curator reviews those drafts and proposes clean Library edits for the user to approve.\n\n{GUIDE}\n\n{NOTEBOOK_GUIDE}"
                 ),
             ),
             Role::Gardener(run) => (json!({ "tools": {} }), self.curator_mode(run)?.instructions().to_string()),
@@ -1012,13 +1012,15 @@ fn tools() -> Value {
             "name": "post_update",
             "title": "Post a project update",
             "description": format!(
-                "Add an update to this project's feed in Feeder, the user's local project update centre. \
+                "Add a short status update to this project's Feed in Feeder. \
                  Write up to {MAX_PARAGRAPHS} short blocks (under {MAX_CHARS} characters total) covering: \
                  (1) Done:/Shipped:/Fixed: what was done + verification, (2) Why:/Benefit: why it was done \
                  and the benefit, and (3) Next:/Decision needed: what to do next and why. Markdown renders: \
                  **bold** sparingly for the key takeaway, `code` for files, branches and commands. Attach \
                  a screenshot or short clip (`screenshot_path`), or up to {MAX_MEDIA_PER_UPDATE} files in a carousel \
-                 (`screenshots`) whenever the work changed multiple screens or states."
+                 (`screenshots`) whenever the work changed multiple screens or states. For deeper reusable \
+                 lessons, non-obvious bug fixes, or user corrections, also call `flag_knowledge` with a full \
+                 Markdown article draft in `suggestion` so Curator can propose adding it to the Library."
             ),
             "inputSchema": {
                 "type": "object",
@@ -2003,7 +2005,7 @@ mod tests {
         let listed = request(&mut server, "tools/list", json!({}));
         let names: Vec<&str> =
             listed.pointer("/result/tools").and_then(Value::as_array).unwrap().iter().filter_map(|tool| tool["name"].as_str()).collect();
-        assert_eq!(names, ["search_notebook", "read_page"]);
+        assert_eq!(names, ["search_notebook", "read_page", "list_flags", "read_traces"]);
         let call = |name: &str, arguments: Value| server.call(&json!({ "name": name, "arguments": arguments }));
         for query in ["deployment", ""] {
             let result = call("search_notebook", json!({ "query": query }));
@@ -2015,7 +2017,9 @@ mod tests {
         assert_eq!(call("read_page", json!({ "id": own_id }))["isError"], false);
         assert_eq!(call("read_page", json!({ "id": shared_id }))["isError"], false);
         assert_eq!(call("read_page", json!({ "id": other_id }))["isError"], true);
-        for tool in ["read_traces", "list_flags", "write_page", "archive_page", "dismiss_flag"] {
+        assert_eq!(call("list_flags", json!({}))["isError"], false);
+        assert_eq!(call("read_traces", json!({}))["isError"], false);
+        for tool in ["write_page", "archive_page", "dismiss_flag"] {
             let result = call(tool, json!({ "id": own_id }));
             assert_eq!(result["isError"], true, "{tool} was not refused");
             assert!(result.to_string().contains("tool unavailable in this Curator session"), "{result}");

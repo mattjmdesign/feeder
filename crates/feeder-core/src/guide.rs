@@ -59,19 +59,19 @@ CLI (from the project folder):
 MCP: call `post_update` with `summary` (and `screenshots` or `screenshot_path` when visible).
 "#;
 
-pub const NOTEBOOK_GUIDE: &str = r#"# Feeder's notebook: a shared Markdown knowledge library across projects
+pub const NOTEBOOK_GUIDE: &str = r#"# Feeder's Library: a shared Markdown knowledge library across projects
 
-The notebook is one shared, searchable library of freeform Markdown articles across every project
-and every agent: non-obvious bug fixes, approaches that failed, reusable patterns, architecture
-decisions, and technical notes. Every project and every agent reads the same library, so what you
-learn once pays off everywhere.
+The Library (Notebook) is one shared, searchable library of freeform Markdown articles across every
+project and every agent: non-obvious bug fixes, user corrections, approaches that failed, reusable
+patterns, architecture decisions, and technical notes. Every project and every agent reads the same
+library, so what you learn once pays off everywhere.
 
 ## Look before you dig
 When starting or resuming work, pass a few task keywords to `get_feed`, for example
 `{"project":"Orbit","task":"appcast signing"}`. It includes up to three relevant current
-notes from that project and the shared Notebook. Open the ones you need with `read_page`.
+notes from that project and the shared Library. Open the ones you need with `read_page`.
 
-Search the notebook before non-trivial debugging, before picking an approach for something tricky,
+Search the library before non-trivial debugging, before picking an approach for something tricky,
 and whenever an error message isn't immediately familiar:
 
     feeder notebook search "sqlite busy timeout"        (MCP: search_notebook)
@@ -80,22 +80,29 @@ Results show each article's title and excerpt. Open one in full with `feeder not
 (MCP: `read_page`). If an article helped, record it with `feeder notebook helped 12`
 (MCP: `mark_page_helped`) so the most useful notes rise in search.
 
-## Flag gaps for Curator
-Use `flag_knowledge` when a reusable lesson is missing, wrong, or outdated. Include the affected
-`page_id` if a note exists. Put the verified fix in `suggestion` when you have one.
+## Flag lessons and corrections for Curator
+Use `flag_knowledge` whenever the user corrects a mistake you made, when you solve a non-obvious
+bug, or when an existing Library note is missing, wrong, or outdated. Include the affected
+`page_id` if a note exists.
 
-    feeder flag --kind outdated --page 12 --suggest 'Run scripts/release.sh' 'The release script moved out of the repository root.'
+Put a **full Markdown lesson draft** (up to 10,000 characters) in `suggestion`:
+- What went wrong or what the symptom/mistake was
+- The root cause
+- The verified fix, code snippet, or reusable rule for next time
 
-Flag non-obvious fixes, pitfalls, reusable procedures, and decisions that will help the next agent.
-Keep status updates in the Feed. Leave out secrets, tokens, keys, and customer data.
+    feeder flag --kind outdated --page 12 --suggest 'Run `scripts/release.sh` from the repo root...' 'The release script moved out of the repository root.'
 
-Curator reviews flags and maintains the shared notes. As a working agent, never create, edit,
-archive, or restore shared notes. Flag the change and keep working.
+Keep short-form project status handoffs (`Done / Why / Next`) in the Feed via `post_update`.
+Leave out secrets, tokens, keys, and customer data.
+
+Curator reviews flagged lesson drafts and maintains the shared Library so articles stay clean and
+deduplicated. As a working agent, never create, edit, archive, or restore shared notes directly.
+Flag the lesson draft and keep working.
 "#;
 
 pub fn notebook_skill_markdown() -> String {
     format!(
-        "---\nname: feeder-notebook\ndescription: Search Feeder's shared Notebook before non-trivial debugging or choosing an unfamiliar approach. Flag missing, wrong, or outdated knowledge for Curator, with a verified suggestion when available.\n---\n\n{NOTEBOOK_GUIDE}"
+        "---\nname: feeder-notebook\ndescription: Search Feeder's shared Library before non-trivial debugging or choosing an unfamiliar approach. Whenever the user corrects you or you uncover a reusable fix, pitfall, or pattern, call flag_knowledge with a full Markdown lesson draft in suggestion for Curator on top of your short Feed update.\n---\n\n{NOTEBOOK_GUIDE}"
     )
 }
 

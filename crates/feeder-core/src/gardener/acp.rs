@@ -34,7 +34,7 @@ pub(super) fn command(
     cmd.current_dir(cwd).arg("acp");
     match backend {
         Backend::OpenCode => {
-            let config = opencode_config(mode, run.model.as_deref());
+            let config = opencode_config(mode, run.model.as_deref(), server);
             std::fs::write(cwd.join("opencode.json"), config.to_string())?;
             let config_dir = cwd.join("config");
             std::fs::create_dir_all(&config_dir)?;
@@ -62,7 +62,7 @@ fn supported_version(stdout: &str, minimum: (u32, u32, u32)) -> bool {
     stdout.split_whitespace().find_map(parse).is_some_and(|version| version.0 == minimum.0 && version >= minimum)
 }
 
-fn opencode_config(mode: SessionMode, model: Option<&str>) -> Value {
+fn opencode_config(mode: SessionMode, model: Option<&str>, server: &Value) -> Value {
     let mut permissions = vec![json!({ "action": "*", "resource": "*", "effect": "deny" })];
     let mut policies = vec![
         policy("tool.use", "*", "deny"),
@@ -77,9 +77,39 @@ fn opencode_config(mode: SessionMode, model: Option<&str>) -> Value {
         policies.push(policy("tool.use", &format!("{action}:*"), "allow"));
         permissions.push(policy(&action, "*", "allow"));
     }
+    let mut mcp = serde_json::Map::new();
+    for inherited in inherited_opencode_mcp_names() {
+        if inherited != "feeder" {
+            mcp.insert(inherited, json!({ "type": "local", "command": ["true"], "enabled": false }));
+        }
+    }
+    if let Some(bin) = server["command"].as_str() {
+        let mut command = vec![Value::String(bin.to_string())];
+        if let Some(args) = server["args"].as_array() {
+            command.extend(args.iter().cloned());
+        }
+        let mut environment = serde_json::Map::new();
+        if let Some(envs) = server["env"].as_array() {
+            for entry in envs {
+                if let (Some(k), Some(v)) = (entry["name"].as_str(), entry["value"].as_str()) {
+                    environment.insert(k.to_string(), Value::String(v.to_string()));
+                }
+            }
+        }
+        mcp.insert(
+            "feeder".into(),
+            json!({
+                "type": "local",
+                "command": command,
+                "environment": environment,
+                "enabled": true,
+            }),
+        );
+    }
     let mut config = json!({
         "default_agent": "feeder-curator",
         "agents": { "feeder-curator": { "description": "Feeder Curator", "mode": "primary", "system": mode.instructions() } },
+        "mcp": mcp,
         "update": "disable",
         "permissions": permissions,
         "policies": policies,
@@ -89,6 +119,25 @@ fn opencode_config(mode: SessionMode, model: Option<&str>) -> Value {
         config["agents"]["feeder-curator"]["model"] = json!(model);
     }
     config
+}
+
+fn inherited_opencode_mcp_names() -> Vec<String> {
+    let Some(home) = std::env::var_os("HOME") else { return Vec::new() };
+    let path = std::path::PathBuf::from(home).join(".config/opencode/opencode.json");
+    let Ok(bytes) = std::fs::read(path) else { return Vec::new() };
+    let Ok(parsed) = serde_json::from_slice::<Value>(&bytes) else { return Vec::new() };
+    let Some(mcp) = parsed["mcp"].as_object() else { return Vec::new() };
+    let mut names = Vec::new();
+    for (key, val) in mcp {
+        if key == "servers" {
+            if let Some(servers) = val.as_object() {
+                names.extend(servers.keys().cloned());
+            }
+        } else {
+            names.push(key.clone());
+        }
+    }
+    names
 }
 
 fn policy(action: &str, resource: &str, effect: &str) -> Value {
@@ -481,17 +530,28 @@ mod tests {
             handle_request(&json!(7), "fs/read_text_file", &json!({}), Some("s"), SessionMode::Ask).pointer("/error/code"),
             Some(&json!(-32601))
         );
-        let ask = opencode_config(SessionMode::Ask, None);
-        let review = opencode_config(SessionMode::Review, Some("openai/gpt-6-sol"));
+        let server = json!({
+            "name": "feeder",
+            "command": "/usr/local/bin/feeder",
+            "args": ["mcp", "--gardener", "--gardener-run", "7"],
+            "env": [{ "name": "FEEDER_HOME", "value": "/tmp/feeder-home" }],
+        });
+        let ask = opencode_config(SessionMode::Ask, None, &server);
+        let review = opencode_config(SessionMode::Review, Some("openai/gpt-6-sol"), &server);
         let grants = |config: &Value, action: &str| {
             config["permissions"].as_array().unwrap().iter().any(|p| p["effect"] == "allow" && p["action"] == action)
         };
         assert!(grants(&ask, "feeder_read_page"));
+        assert!(grants(&ask, "feeder_read_traces"));
+        assert!(grants(&ask, "feeder_list_flags"));
         assert!(!grants(&ask, "feeder_write_page"));
         assert!(grants(&review, "feeder_write_page"));
         assert!(!grants(&review, "shell"));
         assert!(ask["model"].is_null());
         assert_eq!(review["agents"]["feeder-curator"]["model"], "openai/gpt-6-sol");
+        assert_eq!(review["mcp"]["feeder"]["command"], json!(["/usr/local/bin/feeder", "mcp", "--gardener", "--gardener-run", "7"]));
+        assert_eq!(review["mcp"]["feeder"]["environment"]["FEEDER_HOME"], "/tmp/feeder-home");
+        assert_eq!(review["mcp"]["feeder"]["enabled"], true);
     }
 
     #[test]

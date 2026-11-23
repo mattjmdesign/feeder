@@ -114,8 +114,8 @@ enum Command {
         #[arg(long)]
         json: bool,
     },
-    #[command(about = "The shared notebook of lessons: fixes, pitfalls, patterns and decisions across projects.")]
-    #[command(visible_aliases = ["nb", "kb"])]
+    #[command(about = "The shared library of lessons: fixes, pitfalls, patterns and decisions across projects.")]
+    #[command(visible_aliases = ["library", "lib", "nb", "kb"])]
     Notebook {
         #[command(subcommand)]
         action: Option<notebook::NotebookCmd>,

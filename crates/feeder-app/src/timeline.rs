@@ -448,7 +448,7 @@ fn post_menu(uid: i64, p: &Palette, k: &Kit, layer: &mut Vec<El>) -> El {
         .placement(Placement::BottomEnd)
         .min_width(176.0)
         .on_close(|s: &mut State| s.post_menu = None)
-        .item(MenuItem::new("Flag for Notebook").on_select(move |s: &mut State| {
+        .item(MenuItem::new("Flag for Library").on_select(move |s: &mut State| {
             s.post_menu = None;
             s.flag_update_for_notebook(uid);
         }))

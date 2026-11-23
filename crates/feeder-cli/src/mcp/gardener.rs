@@ -124,7 +124,9 @@ impl Server {
         let mut text = String::new();
         let mut data = Vec::new();
         for u in &updates {
-            let project = projects.iter().find(|p| p.project.id == u.project_id).map_or_else(String::new, |p| p.project.name.clone());
+            let project_sum = projects.iter().find(|p| p.project.id == u.project_id);
+            let project = project_sum.map_or_else(String::new, |p| p.project.name.clone());
+            let brief = project_sum.and_then(|p| p.project.brief.as_deref()).map(str::trim).filter(|b| !b.is_empty());
             let rs: Vec<_> = replies.iter().filter(|r| r.update_id == u.id).collect();
             text.push_str(&format!(
                 "\n## update #{} · {project} · {} · {}\n{}\n",
@@ -133,6 +135,9 @@ impl Server {
                 ago(u.created_at, now),
                 clip(&u.body, TRACE_CHARS)
             ));
+            if let Some(brief) = brief {
+                text.push_str(&format!("_Project brief: {}_\n", clip(brief, 400)));
+            }
             for r in &rs {
                 let who = if r.from_human { "the person" } else { r.author.as_str() };
                 text.push_str(&format!("> reply from {who}: {}\n", clip(&r.body, TRACE_CHARS)));
@@ -140,7 +145,7 @@ impl Server {
             let rs_json: Vec<Value> =
                 rs.iter().map(|r| json!({ "from_person": r.from_human, "author": r.author, "body": clip(&r.body, TRACE_CHARS) })).collect();
             data.push(
-                json!({ "update_id": u.id, "project": project, "agent": u.agent, "body": clip(&u.body, TRACE_CHARS), "replies": rs_json }),
+                json!({ "update_id": u.id, "project": project, "project_brief": brief, "agent": u.agent, "body": clip(&u.body, TRACE_CHARS), "replies": rs_json }),
             );
         }
         if text.is_empty() {
@@ -175,6 +180,27 @@ impl Server {
             flags: id_list(args, "flags"),
             updates: id_list(args, "updates"),
         };
+        if store.is_curator_chat_run(run_id).map_err(|e| e.to_string())? {
+            let proposal = store.propose_gardener_run(run_id, curation, &provenance).map_err(|e| e.to_string())?;
+            let text = format!(
+                "Proposed {} “{}” (proposal #{}). The person can apply or dismiss this in chat.",
+                proposal.action.as_str(),
+                proposal.title,
+                proposal.id
+            );
+            return Ok(ToolOutput::text(
+                text,
+                json!({
+                    "proposal_id": proposal.id,
+                    "status": proposal.status.as_str(),
+                    "action": proposal.action.as_str(),
+                    "title": proposal.title,
+                    "page_id": proposal.page_id,
+                    "source_updates": proposal.source_updates,
+                    "source_flags": proposal.source_flags,
+                }),
+            ));
+        }
         let done = store.curate_gardener_run(run_id, curation, &provenance).map_err(|e| e.to_string())?;
         let text = format!(
             "{} page #{}: {}. Change #{} can be reverted by the person.",

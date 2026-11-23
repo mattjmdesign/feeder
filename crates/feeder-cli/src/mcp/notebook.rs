@@ -126,15 +126,15 @@ pub(super) fn tools() -> Vec<Value> {
         }),
         json!({
             "name": "flag_knowledge",
-            "title": "Flag missing or wrong notebook knowledge",
-            "description": "Search the Notebook first. Flag missing, incorrect, or outdated knowledge instead of writing or archiving shared notes. Add the matching `page_id` when there is one and put the verified fix in `suggestion` if you know it. Curator reviews the flag. Never include secrets.",
+            "title": "Flag missing or wrong library knowledge",
+            "description": "Search the Library first. Flag missing, incorrect, or outdated knowledge (or a user correction / non-obvious bug fix) instead of writing or archiving shared notes directly. Add the matching `page_id` when there is one and put a full Markdown lesson draft (mistake/symptom, root cause, verified fix or rule) in `suggestion`. Curator reviews the flag. Never include secrets.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
                     "kind": { "type": "string", "enum": ["missing", "wrong", "outdated"], "description": "What you found (default `missing`)." },
                     "note": { "type": "string", "description": "What's missing or wrong, in a sentence or two (4–2000 chars)." },
                     "page_id": { "type": "integer", "description": "The page that's wrong or outdated, if any." },
-                    "suggestion": { "type": "string", "description": "Optional verified correction or reusable lesson for Curator to review." },
+                    "suggestion": { "type": "string", "description": "Full Markdown lesson draft (up to 10,000 chars): symptom or mistake, root cause, code snippet or rule for Curator to review." },
                     "project": { "type": "string", "description": "The project you were working in. Defaults to the one the server runs in." }
                 },
                 "required": ["note"]

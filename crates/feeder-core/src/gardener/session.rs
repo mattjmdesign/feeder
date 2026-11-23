@@ -313,7 +313,7 @@ impl Inner {
             }
             _ => {}
         }
-        let servers = if self.backend == Backend::Antigravity { json!([]) } else { json!([server]) };
+        let servers = json!([]);
         let (pipes, monitor) = self.spawn_provider(cmd, true, None)?;
         let stdout = pipes.stdout.ok_or_else(|| Error::Invalid("The provider has no ACP output".into()))?;
         let opening = format!("{}\n\n{opening}", self.mode.instructions());

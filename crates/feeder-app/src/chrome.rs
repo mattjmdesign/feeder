@@ -696,7 +696,7 @@ pub fn palette_items(s: &State) -> Vec<PaletteItem> {
     let commands = [
         (PaletteAction::GoHome, "Go to Home", "Project orb shelf · ⌘1"),
         (PaletteAction::GoFeed, "Go to Feed", "All active updates · ⌘2"),
-        (PaletteAction::GoNotebook, "Go to Notebook", "Lessons learned across projects · ⌘3"),
+        (PaletteAction::GoNotebook, "Go to Library", "Lessons learned across projects · ⌘3"),
         (PaletteAction::GoCurator, "Go to Curator", "Ask questions or review flags · ⌘4"),
         (PaletteAction::MarkAllRead, "Mark All Read", "Clear unseen project dots"),
         (
@@ -1124,7 +1124,7 @@ pub fn settings(s: &State, p: &Palette, k: &Kit, layer: &mut Vec<El>) {
             .child(curator_settings::header(
                 p,
                 "Connected Tools",
-                "Tools connected here can post updates to Feeder and read the Notebook. This doesn’t give Curator your subscription.",
+                "Tools connected here can post updates to Feeder and read the Library. This doesn’t give Curator your subscription.",
             ))
             .child(agents_section(s, p, k)),
         SettingsPage::Curator => curator_settings::pane(s, p, k, &mut pops),
@@ -1322,7 +1322,7 @@ fn uninstall_section(s: &State, p: &Palette, k: &Kit) -> El {
         "Removing Feeder from your tools deletes its MCP server and skills from their settings. Each file keeps a .feeder-backup copy.",
     )];
     if s.agents.uninstalled && !any_connected {
-        rows.push(note("Feeder is out of your tools. Quit Feeder and move it to the Trash. To delete your projects and notebook too, delete the data folder above."));
+        rows.push(note("Feeder is out of your tools. Quit Feeder and move it to the Trash. To delete your projects and library too, delete the data folder above."));
     } else {
         rows.push(
             Button::new("Remove Feeder from All Tools")

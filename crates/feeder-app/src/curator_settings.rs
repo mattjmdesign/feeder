@@ -205,7 +205,7 @@ pub fn pane(s: &State, p: &Palette, k: &Kit, layer: &mut Vec<El>) -> El {
     let mut pane = col().w_full().gap(28.0).child(header(
         p,
         "Curator",
-        "Curator reads your agents’ updates and keeps the Notebook in order. It runs only on a subscription you turn on here.",
+        "Curator reads your agents’ updates and keeps the Library in order. It runs only on a subscription you turn on here.",
     ));
 
     let enabled: Vec<Backend> = prefs.enabled().into_iter().filter(|b| installed.contains(b)).collect();

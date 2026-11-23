@@ -3,6 +3,13 @@
 What changed in each version of Feeder, newest first. Each section is copied from
 `release-notes/<version>.md` by `scripts/changelog.sh`; edit those files, not this one.
 
+## 0.5.8
+
+- **Propose & Approve cards in Curator chat.** Every Curator chat can now inspect your entire Library, open flagged lessons, and recent Feed updates, replies, and project briefs, and propose creating, updating, or archiving Library notes right inside chat. Each proposal renders as an inline card with the reason, a unified diff preview, and **Apply** / **Dismiss** buttons (switching to **Open** and **Revert** once applied).
+- **Fixed OpenCode Curator tool loading.** OpenCode Curator sessions now declare Feeder's scoped Curator MCP server directly in the session config and disable inherited global MCP servers, preventing collisions with a user's global `feeder mcp` entry that previously left Curator with zero Library tools.
+- **Notebook is now Library.** Renamed Notebook to **Library** across the top tab (`Home`, `Feed`, `Library`), breadcrumbs, search bar, Quick Jump (`⌘K`), Feed flag links, and Settings, while keeping `feeder library` / `feeder notebook` and `feeder://library/...` / `feeder://notebook/...` compatible.
+- **One-click Curator actions and deeper lesson drafts.** Added **Check Recent Feed Updates** alongside **Review Flagged Lessons** on Curator's home screen, and updated the MCP instructions and `flag_knowledge` schema so coding agents keep Feed updates short (`Done / Why / Next`) while submitting full Markdown lesson drafts in `suggestion` whenever they learn a reusable fix or receive a correction.
+
 ## 0.5.7
 
 - **Curator as its own top-level view.** Clicking the Curator orb now opens Curator on its own screen instead of inside Notebook. `Home`, `Feed`, and `Notebook` clear their active highlight while Curator is open, and Curator gets its own breadcrumb (`Curator`), chat search, `+ New Chat` action, and date-grouped chat history.

@@ -6,8 +6,8 @@ use std::time::{Duration, Instant};
 
 use feeder_core::gardener::{Backend, ChatSummary, Run, RunStatus};
 use feeder_core::{
-    Change, FeedUpdate, Flag, FlagStatus, GARDENER, HUMAN_AUTHOR, OnSimilar, Page, PageDraft, PageFilter, ProjectSummary, Reply, Settings,
-    Standing, Store, WorkingTree, now_ms, read_working_tree,
+    Change, FeedUpdate, Flag, FlagStatus, GARDENER, HUMAN_AUTHOR, OnSimilar, Page, PageDraft, PageFilter, ProjectSummary, Proposal, Reply,
+    Settings, Standing, Store, WorkingTree, now_ms, read_working_tree,
 };
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
@@ -52,6 +52,8 @@ pub enum NotebookOp {
     SetStanding(i64, Standing),
     Delete(i64),
     Revert(i64),
+    ApplyProposal(i64),
+    DismissProposal(i64),
     FlagUpdate(i64),
     DeleteChat(i64),
 }
@@ -59,6 +61,7 @@ pub enum NotebookOp {
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct GardenerView {
     pub changes: Vec<Change>,
+    pub proposals: Vec<Proposal>,
     pub open_flags: Vec<Flag>,
     pub last_run: Option<Run>,
     pub running: Option<Run>,
@@ -71,6 +74,7 @@ const GARDENER_LIST: usize = 30;
 fn gardener_view(s: &Store, backends: &[Backend]) -> feeder_core::Result<GardenerView> {
     Ok(GardenerView {
         changes: s.changes(Some(GARDENER), None, GARDENER_LIST)?,
+        proposals: s.curator_proposals(GARDENER_LIST)?,
         open_flags: s.flags(Some(FlagStatus::Open), GARDENER_LIST)?,
         last_run: s.gardener_runs(1)?.into_iter().find(|r| r.status != RunStatus::Running),
         running: s.running_gardener()?,
@@ -311,11 +315,13 @@ impl Watcher {
                             NotebookOp::SetStanding(id, standing) => s.set_page_standing(id, standing),
                             NotebookOp::Delete(id) => s.delete_page(id),
                             NotebookOp::Revert(id) => s.revert_change(id, HUMAN_AUTHOR).map(|_| ()),
+                            NotebookOp::ApplyProposal(id) => s.apply_curator_proposal(id).map(|_| ()),
+                            NotebookOp::DismissProposal(id) => s.dismiss_curator_proposal(id).map(|_| ()),
                             NotebookOp::FlagUpdate(update_id) => s.flag_update_for_notebook(update_id, HUMAN_AUTHOR).map(|_| ()),
                             NotebookOp::DeleteChat(run_id) => s.delete_curator_chat(run_id),
                         };
                         if let Err(e) = res {
-                            mutation_error = Some(format!("Notebook change failed: {e}"));
+                            mutation_error = Some(format!("Library change failed: {e}"));
                         }
                     }
 

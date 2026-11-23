@@ -2,9 +2,10 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 use feeder_core::gardener::{
-    Backend, ChatOpening, ChatSummary, Event, OPENING, RunConfig, RunStatus, Scope, Session, SessionEnv, SessionMode, StoredEvent, ToolCall,
+    Backend, CHECK_UPDATES_OPENING, ChatOpening, ChatSummary, Event, OPENING, RunConfig, RunStatus, Scope, Session, SessionEnv,
+    SessionMode, StoredEvent, ToolCall,
 };
-use feeder_core::{Change, Flag, ago};
+use feeder_core::{Change, ChangeAction, Flag, ProposalStatus, ago};
 use rune::{Cursor, El, Icon, Key, KeyEvent, ScrollSpec, TextEdit, Transition, Tx, Waker, col, el, icon, row, text};
 use rune_kit::diff::{FileDiff, LineKind};
 use rune_kit::search::Fold;
@@ -78,7 +79,7 @@ impl Default for Chat {
             backend: None,
             run_config: RunConfig::default(),
             scope: Scope::Notebook,
-            mode: SessionMode::Ask,
+            mode: SessionMode::Review,
             viewing: None,
             saved: Arc::new(Mutex::new(None)),
             expanded: Vec::new(),
@@ -93,7 +94,7 @@ impl Default for Chat {
 impl Chat {
     fn draft(&self) -> Option<(SessionMode, &str)> {
         let text = self.input.text.trim();
-        (!text.is_empty()).then_some((SessionMode::Ask, text))
+        (!text.is_empty()).then_some((SessionMode::Review, text))
     }
 
     fn can_reuse_session(&self, backend: Backend, run_config: &RunConfig) -> bool {
@@ -403,9 +404,17 @@ impl State {
             self.gardener_start(scope, SessionMode::Review, OPENING.to_string(), Some(REVIEW_JOB));
         }
     }
+
+    fn gardener_check_recent_updates(&mut self) {
+        if matches!(self.notebook.chat.phase, Phase::Idle | Phase::Ended) && self.notebook.chat.viewing.is_none() {
+            let scope = self.notebook.chat.scope;
+            self.gardener_start(scope, SessionMode::Review, CHECK_UPDATES_OPENING.to_string(), Some(CHECK_UPDATES_JOB));
+        }
+    }
 }
 
-const REVIEW_JOB: &str = "Review flagged updates";
+const REVIEW_JOB: &str = "Review flagged lessons";
+const CHECK_UPDATES_JOB: &str = "Check recent Feed updates";
 
 pub fn scoped_flags(s: &State) -> Vec<&Flag> {
     let scope = s.notebook.chat.scope;
@@ -421,54 +430,58 @@ pub fn scoped_flags(s: &State) -> Vec<&Flag> {
         .collect()
 }
 
-fn intro(s: &State, p: &Palette) -> El {
+fn intro(s: &State, p: &Palette, k: &Kit) -> El {
     const ORB: f32 = 64.0;
     let shadow = el().w(ORB * 0.7).h(8.0).radius(4.0).radial_gradient(
         [0.5, 0.5],
         ORB * 0.35,
         [(0.0, rune::oklch(0.0, 0.0, 0.0).alpha(if p.dark { 0.55 } else { 0.18 })), (1.0, rune::oklch(0.0, 0.0, 0.0).alpha(0.0))],
     );
-    let mut words = col()
-        .items_center()
-        .gap(2.0)
-        .max_w(420.0)
-        .child(text("Ask about anything in your Notebook.").font(style::BODY).color(p.text_3).align(rune::Align::Center));
     let n = scoped_flags(s).len();
     let ready = selected_backend(s).is_some() && s.notebook.gardener.running.is_none();
-    words = if n > 0 {
-        let what = if n == 1 { "1 flagged update is waiting.".to_string() } else { format!("{n} flagged updates are waiting.") };
-        words.child(
-            row().gap(6.0).center_y().child(text(what).font(style::BODY).color(p.text_3)).child(
-                row()
-                    .key("gardener-review-flags")
-                    .role("button")
-                    .label("Review flagged updates")
-                    .focusable(true)
-                    .cursor(if ready { Cursor::Pointer } else { Cursor::Default })
-                    .opacity(if ready { 1.0 } else { 0.5 })
-                    .on_press(move |s: &mut State| {
-                        if ready {
-                            s.gardener_review_flags();
-                        }
-                    })
-                    .child(text("Review").font(style::BODY).color(p.text_2)),
-            ),
-        )
+    let sub = if n == 1 {
+        "1 flagged lesson is waiting for review.".to_string()
+    } else if n > 1 {
+        format!("{n} flagged lessons are waiting for review.")
     } else {
-        words.child(
-            text("It turns flagged updates into notes your agents read next time.")
-                .font(style::BODY)
-                .color(p.text_3)
-                .align(rune::Align::Center),
-        )
+        "It turns flagged lessons and Feed updates into notes your agents read next time.".to_string()
     };
+    let words = col()
+        .items_center()
+        .gap(2.0)
+        .max_w(440.0)
+        .child(text("Ask about anything across your Library and Feed.").font(style::BODY).color(p.text_3).align(rune::Align::Center))
+        .child(text(sub).font(style::BODY).color(p.text_3).align(rune::Align::Center));
+    let mut actions = row().gap(8.0).center_y();
+    if n > 0 {
+        let label = if n == 1 { "Review 1 Flagged Lesson".to_string() } else { format!("Review {n} Flagged Lessons") };
+        actions = actions.child(
+            Button::new(label)
+                .variant(ButtonVariant::Outline)
+                .control_size(ControlSize::Small)
+                .disabled(!ready)
+                .on_press(|s: &mut State| s.gardener_review_flags())
+                .build(k)
+                .key("gardener-review-flags"),
+        );
+    }
+    actions = actions.child(
+        Button::new("Check Recent Feed Updates")
+            .variant(ButtonVariant::Outline)
+            .control_size(ControlSize::Small)
+            .disabled(!ready)
+            .on_press(|s: &mut State| s.gardener_check_recent_updates())
+            .build(k)
+            .key("gardener-check-updates"),
+    );
     col()
         .key("gardener-intro")
         .items_center()
         .gap(14.0)
-        .pb(28.0)
+        .pb(24.0)
         .child(col().items_center().gap(10.0).child(crate::orb::orb(&chrome::CURATOR_ORB, ORB)).child(shadow))
         .child(words)
+        .child(actions)
 }
 
 pub fn selected_backend(s: &State) -> Option<Backend> {
@@ -510,7 +523,7 @@ pub fn empty_view(s: &State, p: &Palette, k: &Kit, max_w: f32, layer: &mut Vec<E
     if let Some(bar) = top_bar(s, p, k) {
         stack = stack.child(col().w_full().max_w(max_w.min(CHAT_MAX_W)).px(40.0).child(bar));
     }
-    stack = stack.child(intro(s, p)).child(composer(s, p, k, max_w, layer));
+    stack = stack.child(intro(s, p, k)).child(composer(s, p, k, max_w, layer));
     col().w_full().grow(1.0).min_h(0.0).justify_center().items_center().pb(48.0).child(stack)
 }
 
@@ -828,7 +841,7 @@ fn tool_label(s: &State, call: &ToolCall) -> String {
     match call.name.as_str() {
         "list_flags" => "Read open flags".into(),
         "read_traces" => "Read recent Feed updates".into(),
-        "search_notebook" if arg("query").trim().is_empty() => "Searched Notebook".into(),
+        "search_notebook" if arg("query").trim().is_empty() => "Searched Library".into(),
         "search_notebook" => format!("Searched “{}”", arg("query")),
         "read_page" => format!("Read {}", page_title()),
         "write_page" if id.is_some() => format!("Revised “{}”", arg("title")),
@@ -843,7 +856,7 @@ fn live_label(call: &ToolCall) -> String {
     let query = call.text_arg("query").map(str::trim).filter(|q| !q.is_empty());
     match (call.name.as_str(), query) {
         ("search_notebook", Some(q)) => format!("Searching “{q}”…"),
-        ("search_notebook", None) => "Searching Notebook…".into(),
+        ("search_notebook", None) => "Searching Library…".into(),
         ("list_flags", _) => "Reading open flags…".into(),
         ("read_traces", _) => "Reading recent Feed updates…".into(),
         ("read_page", _) => "Reading page…".into(),
@@ -866,11 +879,18 @@ fn change_id(output: &str) -> Option<i64> {
     number_after(output, &["\"change_id\":", "Change #"])
 }
 
+fn proposal_id(output: &str) -> Option<i64> {
+    number_after(output, &["\"proposal_id\":", "proposal #"])
+}
+
 fn edited_page(output: &str) -> Option<i64> {
-    number_after(output, &["\"page\":{\"id\":", "page #"])
+    number_after(output, &["\"page\":{\"id\":", "\"page_id\":", "page #"])
 }
 
 fn edit_card(s: &State, i: usize, call: &ToolCall, result: &ToolResult, p: &Palette, k: &Kit) -> El {
+    if let Some(pid) = proposal_id(&result.output) {
+        return proposal_card(s, i, pid, call, result, p, k);
+    }
     let page = edited_page(&result.output).or_else(|| call.int_arg("id"));
     let (verb, fallback) = match call.name.as_str() {
         "archive_page" => ("Archived", String::new()),
@@ -914,7 +934,7 @@ fn edit_card(s: &State, i: usize, call: &ToolCall, result: &ToolResult, p: &Pale
             Button::new("Open")
                 .variant(ButtonVariant::Outline)
                 .control_size(ControlSize::Small)
-                .on_press(move |s: &mut State| s.notebook_open_page(id))
+                .on_press(move |s: &mut State| s.open_notebook_page_from_anywhere(id))
                 .build(k)
                 .key(format!("gardener-open-{i}")),
         );
@@ -931,6 +951,123 @@ fn edit_card(s: &State, i: usize, call: &ToolCall, result: &ToolResult, p: &Pale
                 .build(k)
                 .key(format!("gardener-revert-{cid}"))
         });
+    }
+    card.child(actions)
+}
+
+fn proposal_card(s: &State, i: usize, pid: i64, call: &ToolCall, result: &ToolResult, p: &Palette, k: &Kit) -> El {
+    let proposal = s.notebook.gardener.proposals.iter().find(|pr| pr.id == pid);
+    let status = proposal.map_or(ProposalStatus::Pending, |pr| pr.status);
+    let action = proposal.map_or_else(
+        || match call.name.as_str() {
+            "archive_page" => ChangeAction::Archived,
+            _ if call.int_arg("id").is_some() => ChangeAction::Revised,
+            _ => ChangeAction::Created,
+        },
+        |pr| pr.action,
+    );
+    let page_id = proposal.and_then(|pr| pr.page_id).or_else(|| edited_page(&result.output)).or_else(|| call.int_arg("id"));
+    let existing = page_id.and_then(|id| s.notebook.page(id));
+    let verb = match (status, action) {
+        (ProposalStatus::Applied, ChangeAction::Created) => "Added to Library",
+        (ProposalStatus::Applied, ChangeAction::Revised) => "Updated in Library",
+        (ProposalStatus::Applied, ChangeAction::Archived) => "Archived",
+        (_, ChangeAction::Archived) => "Proposed archive",
+        (_, ChangeAction::Revised) => "Proposed update",
+        _ => "Proposed note",
+    };
+    let title = proposal
+        .map(|pr| pr.title.as_str())
+        .or_else(|| call.text_arg("title"))
+        .or_else(|| existing.map(|pg| pg.title.as_str()))
+        .unwrap_or_default()
+        .to_string();
+    let reason = proposal.map(|pr| pr.reason.as_str()).or_else(|| call.text_arg("reason")).unwrap_or("").trim();
+    let mut card = col()
+        .key(format!("gardener-proposal-{pid}-{i}"))
+        .role("group")
+        .label(format!("{verb}: {title}"))
+        .w_full()
+        .gap(6.0)
+        .px(12.0)
+        .py(10.0)
+        .radius(8.0)
+        .border(1.0, p.hairline)
+        .child(text(verb).font(style::META).color(p.text_3))
+        .child(text(title).font(style::NAME).color(p.text).wrap());
+    if !reason.is_empty() {
+        card = card.child(text(reason.to_string()).font(style::META).color(p.text_2).wrap());
+    }
+    let old_body = proposal.and_then(|pr| pr.before_body.as_deref()).or_else(|| existing.map(|pg| pg.body.as_str())).unwrap_or("");
+    let new_body = proposal.map(|pr| pr.body.as_str()).or_else(|| call.text_arg("body")).unwrap_or("");
+    if action != ChangeAction::Archived {
+        if let Some(diff) = diff_preview(old_body, new_body, p, k) {
+            card = card.child(diff);
+        }
+    } else if let Some(pg) = existing
+        && !pg.excerpt(160).is_empty()
+    {
+        card = card.child(text(pg.excerpt(160)).font(style::META).color(p.text_2).wrap().max_lines(2));
+    }
+    let mut actions = row().gap(6.0).pt(2.0);
+    match status {
+        ProposalStatus::Pending => {
+            actions = actions
+                .child(
+                    Button::new("Apply")
+                        .variant(ButtonVariant::Contrast)
+                        .control_size(ControlSize::Small)
+                        .on_press(move |s: &mut State| s.gardener_send_op(NotebookOp::ApplyProposal(pid)))
+                        .build(k)
+                        .key(format!("gardener-apply-proposal-{pid}")),
+                )
+                .child(
+                    Button::new("Dismiss")
+                        .variant(ButtonVariant::GhostMuted)
+                        .control_size(ControlSize::Small)
+                        .on_press(move |s: &mut State| s.gardener_send_op(NotebookOp::DismissProposal(pid)))
+                        .build(k)
+                        .key(format!("gardener-dismiss-proposal-{pid}")),
+                );
+            if let Some(id) = page_id.filter(|_| existing.is_some()) {
+                actions = actions.child(
+                    Button::new("Open")
+                        .variant(ButtonVariant::Outline)
+                        .control_size(ControlSize::Small)
+                        .on_press(move |s: &mut State| s.open_notebook_page_from_anywhere(id))
+                        .build(k)
+                        .key(format!("gardener-open-proposal-{pid}")),
+                );
+            }
+        }
+        ProposalStatus::Dismissed => {
+            actions = actions.child(Badge::new("Dismissed").variant(BadgeVariant::Subtle).build(k));
+        }
+        ProposalStatus::Applied => {
+            if let Some(id) = page_id.filter(|_| existing.is_some()) {
+                actions = actions.child(
+                    Button::new("Open")
+                        .variant(ButtonVariant::Outline)
+                        .control_size(ControlSize::Small)
+                        .on_press(move |s: &mut State| s.open_notebook_page_from_anywhere(id))
+                        .build(k)
+                        .key(format!("gardener-open-proposal-{pid}")),
+                );
+            }
+            if let Some(cid) = proposal.and_then(|pr| pr.change_id) {
+                let reverted = s.notebook.gardener.changes.iter().find(|c| c.id == cid).is_some_and(Change::is_reverted);
+                actions = actions.child(if reverted {
+                    Badge::new("Reverted").variant(BadgeVariant::Subtle).build(k)
+                } else {
+                    Button::new("Revert")
+                        .variant(ButtonVariant::Outline)
+                        .control_size(ControlSize::Small)
+                        .on_press(move |s: &mut State| s.gardener_send_op(NotebookOp::Revert(cid)))
+                        .build(k)
+                        .key(format!("gardener-revert-{cid}"))
+                });
+            }
+        }
     }
     card.child(actions)
 }
@@ -1290,9 +1427,16 @@ mod tests {
         let mut chat = Chat { phase: Phase::Working, ..Chat::default() };
         assert_eq!(working_status(&chat), "Starting…");
         chat.items.push(Item::Tool { call: call("a", "search_notebook"), result: None, open: false });
-        assert_eq!(working_status(&chat), "Searching Notebook…");
+        assert_eq!(working_status(&chat), "Searching Library…");
         chat.items.push(Item::Reply("Done".into()));
         assert_eq!(working_status(&chat), "Thinking…");
+    }
+
+    #[test]
+    fn proposal_ids_come_from_either_cli_output() {
+        assert_eq!(proposal_id(r#"{"proposal_id":9,"status":"pending"}"#), Some(9));
+        assert_eq!(proposal_id("Proposed created “SQLite” (proposal #4)."), Some(4));
+        assert_eq!(proposal_id("No proposal"), None);
     }
 
     #[test]

@@ -23,7 +23,7 @@ pub use guide::{GUIDE, NOTEBOOK_GUIDE, notebook_skill_markdown, skill_markdown};
 pub use knowledge::FeedReviewStatus;
 pub use knowledge::{
     Change, ChangeAction, Curated, Curation, FLAG_NOTE_CHARS, FLAG_SUGGESTION_MAX_CHARS, Flag, FlagKind, FlagOutcome, FlagStatus, GARDENER,
-    NewFlag, PageSnapshot, Provenance, REASON_MAX_CHARS,
+    NewFlag, PageSnapshot, Proposal, ProposalStatus, Provenance, REASON_MAX_CHARS,
 };
 pub use notebook::{
     BODY_CHARS, CANONICAL_TOPICS, HUMAN_AUTHOR, Kind, OnSimilar, Page, PageDraft, PageFilter, Standing, TAG_COUNT, TITLE_CHARS,

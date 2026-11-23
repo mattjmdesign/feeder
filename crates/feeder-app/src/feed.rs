@@ -38,7 +38,7 @@ pub fn bar_chrome(s: &State, id: i64, p: &Palette, k: &Kit) -> (El, Option<El>) 
     let (back_text, back_a11y) = match s.tab {
         Tab::Home => ("‹  Home", "Back to Home"),
         Tab::Feed => ("‹  Feed", "Back to Feed"),
-        Tab::Notebook => ("‹  Notebook", "Back to Notebook"),
+        Tab::Notebook => ("‹  Library", "Back to Library"),
         Tab::Curator => ("‹  Curator", "Back to Curator"),
     };
     let back = chrome::bar_button("back", back_text, p).label(back_a11y).on_press(|s: &mut State| s.close_project());
@@ -668,7 +668,7 @@ pub fn card_actions(s: &State, p: &Palette, u: &FeedUpdate) -> El {
     let reply_btn = small_btn(format!("reply-u-{uid}"), "Reply", "Reply to update")
         .on_press_tx(move |s: &mut State, tx: &mut Tx| s.start_reply(uid, tx));
     let flag_btn =
-        small_btn(format!("flag-u-{uid}"), "Flag", "Flag for Notebook").on_press(move |s: &mut State| s.flag_update_for_notebook(uid));
+        small_btn(format!("flag-u-{uid}"), "Flag", "Flag for Library").on_press(move |s: &mut State| s.flag_update_for_notebook(uid));
     let delete_btn =
         small_btn(format!("del-u-{uid}"), "Delete", "Delete update").on_press(move |s: &mut State| s.delete_confirm = Some(uid));
 
@@ -684,7 +684,7 @@ pub fn flag_pill(s: &State, p: &Palette, u: &FeedUpdate) -> Option<El> {
         row()
             .key(format!("flagged-u-{uid}"))
             .role("button")
-            .label("Flagged for Notebook, review with Curator")
+            .label("Flagged for Library, review with Curator")
             .help("Review with Curator")
             .focusable(true)
             .px(7.0)
@@ -707,13 +707,13 @@ pub fn notebook_link(s: &State, p: &Palette, update_id: i64) -> Option<El> {
         row()
             .key(format!("nb-link-{update_id}-{page_id}"))
             .role("button")
-            .label(format!("Open Notebook note {title}"))
+            .label(format!("Open Library note {title}"))
             .help(format!("Open \"{title}\""))
             .focusable(true)
             .center_y()
             .cursor(Cursor::Pointer)
             .on_press(move |s: &mut State| s.open_notebook_page_from_anywhere(page_id))
-            .child(text("Open in Notebook ›").font(style::META).color(p.text_2)),
+            .child(text("Open in Library ›").font(style::META).color(p.text_2)),
     )
 }
 

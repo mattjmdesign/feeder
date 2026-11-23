@@ -366,7 +366,7 @@ impl State {
         self.push_toast(
             "flagged-for-notebook",
             ToastItem {
-                title: "Flagged for Notebook".into(),
+                title: "Flagged for Library".into(),
                 description: Some("Curator turns it into a note when you review.".into()),
                 kind: ToastKind::Flagged { project_id },
             },
@@ -571,7 +571,7 @@ fn toolbar_breadcrumb(nb: &Notebook, p: &Palette, k: &Kit) -> El {
             ed.title.text.trim().to_string()
         };
         row_el = row_el
-            .child(crumb_btn("nb-bc-root", "Notebook", false).on_press(|s: &mut State| {
+            .child(crumb_btn("nb-bc-root", "Library", false).on_press(|s: &mut State| {
                 s.notebook.editor = None;
                 s.notebook_shelf(Shelf::All);
             }))
@@ -586,7 +586,7 @@ fn toolbar_breadcrumb(nb: &Notebook, p: &Palette, k: &Kit) -> El {
         let target_shelf = if page.is_archived() { Shelf::Archived } else { Shelf::Topic(slug.clone()) };
         let parent_name = if page.is_archived() { "Archived".to_string() } else { t_label };
         return row_el
-            .child(crumb_btn("nb-bc-root", "Notebook", false).on_press(|s: &mut State| s.notebook_shelf(Shelf::All)))
+            .child(crumb_btn("nb-bc-root", "Library", false).on_press(|s: &mut State| s.notebook_shelf(Shelf::All)))
             .child(sep())
             .child(crumb_btn("nb-bc-topic", &parent_name, false).on_press(move |s: &mut State| s.notebook_shelf(target_shelf.clone())))
             .child(sep())
@@ -594,13 +594,13 @@ fn toolbar_breadcrumb(nb: &Notebook, p: &Palette, k: &Kit) -> El {
     }
 
     match &nb.shelf {
-        Shelf::All => row_el.child(text("Notebook").key("nb-bc-root").font(k.ty.ui_compact).color(p.text).pl(CRUMB_PAD)),
+        Shelf::All => row_el.child(text("Library").key("nb-bc-root").font(k.ty.ui_compact).color(p.text).pl(CRUMB_PAD)),
         Shelf::Topic(slug) => row_el
-            .child(crumb_btn("nb-bc-root", "Notebook", false).on_press(|s: &mut State| s.notebook_shelf(Shelf::All)))
+            .child(crumb_btn("nb-bc-root", "Library", false).on_press(|s: &mut State| s.notebook_shelf(Shelf::All)))
             .child(sep())
             .child(text(topic_label(slug).to_string()).font(k.ty.ui_compact).color(p.text).truncate().pl(CRUMB_PAD)),
         Shelf::Archived => row_el
-            .child(crumb_btn("nb-bc-root", "Notebook", false).on_press(|s: &mut State| s.notebook_shelf(Shelf::All)))
+            .child(crumb_btn("nb-bc-root", "Library", false).on_press(|s: &mut State| s.notebook_shelf(Shelf::All)))
             .child(sep())
             .child(text("Archived").font(k.ty.ui_compact).color(p.text).pl(CRUMB_PAD)),
     }
@@ -614,8 +614,8 @@ fn sidebar_view(s: &State, p: &Palette, k: &Kit) -> El {
     let query = nb.query.text.trim().to_string();
 
     let mut search_input = TextInput::new(&nb.query)
-        .placeholder("Search notebook")
-        .label("Search the notebook")
+        .placeholder("Search library")
+        .label("Search the library")
         .leading_icon(k.glyph.search)
         .width(None)
         .on_edit(|s: &mut State| &mut s.notebook.query)
@@ -649,7 +649,7 @@ fn sidebar_view(s: &State, p: &Palette, k: &Kit) -> El {
         .pb(8.0)
         .gap(8.0)
         .child(search)
-        .child(col().w_full().gap(2.0).role("list").label("Notebook").child(new_row).child(all_row));
+        .child(col().w_full().gap(2.0).role("list").label("Library").child(new_row).child(all_row));
 
     let mut topics_head = SidebarHeader::new("Categories");
     if !topics.is_empty() {
@@ -680,7 +680,7 @@ fn sidebar_view(s: &State, p: &Palette, k: &Kit) -> El {
         let mut tree_style = TreeStyle::from_kit(k).chevron_only_folders(true).guides_on_hover(0.55);
         tree_style.row_height = 26.0;
         let tree_el = Tree::new(|s: &State| &s.notebook.tree, |s: &mut State| &mut s.notebook.tree, NavNode::label)
-            .name("Notebook categories")
+            .name("Library categories")
             .style(tree_style)
             .row(move |node, _row: &TreeRow| match node {
                 NavNode::Topic { label, count, .. } => {
@@ -729,7 +729,7 @@ fn index_view(s: &State, p: &Palette, k: &Kit) -> El {
     }
 
     let heading = match &nb.shelf {
-        Shelf::All => "Notebook".to_string(),
+        Shelf::All => "Library".to_string(),
         Shelf::Topic(slug) => topic_label(slug).to_string(),
         Shelf::Archived => "Archived".to_string(),
     };
@@ -1157,8 +1157,9 @@ fn page_list(title: &str, key: &str, pages: &[&Page], p: &Palette, k: &Kit) -> E
 }
 
 fn links_to(body: &str, id: i64) -> bool {
-    let target = format!("feeder://notebook/{id}");
-    body.match_indices(&target).any(|(at, _)| !body[at + target.len()..].starts_with(|c: char| c.is_ascii_digit()))
+    [format!("feeder://notebook/{id}"), format!("feeder://library/{id}")]
+        .into_iter()
+        .any(|target| body.match_indices(&target).any(|(at, _)| !body[at + target.len()..].starts_with(|c: char| c.is_ascii_digit())))
 }
 
 fn linked_from(nb: &Notebook, id: i64) -> Vec<&Page> {
@@ -1397,8 +1398,12 @@ pub(crate) fn render_live_markdown(src: &str, reduced_motion: bool, p: &Palette,
         .reveal(if reduced_motion { 0.0 } else { LIVE_WORD_FADE })
         .tasks_read_only()
         .on_link(|s: &mut State, url: &str| {
-            if let Some(id) = url.strip_prefix("feeder://notebook/").and_then(|id| id.parse::<i64>().ok()) {
-                s.notebook_open_page(id);
+            if let Some(id) = url
+                .strip_prefix("feeder://notebook/")
+                .or_else(|| url.strip_prefix("feeder://library/"))
+                .and_then(|id| id.parse::<i64>().ok())
+            {
+                s.open_notebook_page_from_anywhere(id);
             }
         })
         .render(&md_style)
@@ -1408,8 +1413,12 @@ pub(crate) fn render_article_markdown(src: &str, page_id: Option<i64>, p: &Palet
     let md_style = feed::markdown_style(p, k).body_font(style::PROSE);
     let article_markdown = |text: String| {
         Markdown::new(text).selectable(true).on_link(|s: &mut State, url: &str| {
-            if let Some(id) = url.strip_prefix("feeder://notebook/").and_then(|id| id.parse::<i64>().ok()) {
-                s.notebook_open_page(id);
+            if let Some(id) = url
+                .strip_prefix("feeder://notebook/")
+                .or_else(|| url.strip_prefix("feeder://library/"))
+                .and_then(|id| id.parse::<i64>().ok())
+            {
+                s.open_notebook_page_from_anywhere(id);
             }
         })
     };

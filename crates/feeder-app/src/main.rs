@@ -67,7 +67,7 @@ impl Tab {
         match self {
             Tab::Home => "Home",
             Tab::Feed => "Feed",
-            Tab::Notebook => "Notebook",
+            Tab::Notebook => "Library",
             Tab::Curator => "Curator",
         }
     }
@@ -891,7 +891,7 @@ impl State {
             self.tab = Tab::Curator;
             return true;
         }
-        if let Some(page) = rest.strip_prefix("notebook") {
+        if let Some(page) = rest.strip_prefix("notebook").or_else(|| rest.strip_prefix("library")) {
             self.close_project();
             self.close_settings();
             self.tab = Tab::Notebook;
@@ -1498,10 +1498,31 @@ fn main() {
                 }]);
                 gardener::replay(&mut s.notebook.chat, feeder_core::gardener::Backend::ClaudeCode, events);
             }),
+            ("curator-proposal", |s| {
+                use feeder_core::gardener::{Event, ToolCall};
+                s.tab = Tab::Curator;
+                let events = vec![
+                    Event::Started,
+                    Event::Text("Flag 2 says the busy timeout and writer rule are missing, so I'm proposing an update to the SQLite note.".into()),
+                    Event::ToolStarted(ToolCall {
+                        id: "w".into(),
+                        name: "write_page".into(),
+                        input: r###"{"id":1,"title":"SQLite returns SQLITE_BUSY under parallel writes","reason":"Add the 5,000 ms busy_timeout and single-writer channel rule from flag #2.","body":"## What happened\n\nTwo worker threads writing the same database failed with 'database is locked' under load.\n\n## Why\n\nEach connection opened in the default rollback journal mode, which locks the whole file for every write.\n\n## Takeaway\n\nOpen every connection in WAL mode, set `PRAGMA busy_timeout = 5000`, and route writes through a single background worker channel."}"###.parse().unwrap_or_default(),
+                    }),
+                    Event::ToolFinished {
+                        id: "w".into(),
+                        output: r#"{"proposal_id":1,"status":"pending","action":"revised","page_id":1}"#.into(),
+                        failed: false,
+                    },
+                    Event::Text("I've proposed adding the 5,000 ms `busy_timeout` and single-writer rule to [SQLite returns SQLITE_BUSY under parallel writes](feeder://library/1). Click **Apply** above to save it.".into()),
+                    Event::TurnFinished,
+                ];
+                gardener::replay(&mut s.notebook.chat, feeder_core::gardener::Backend::OpenCode, events);
+            }),
             ("notebook-curator-diagram", |s| {
                 use feeder_core::gardener::Event;
                 s.tab = Tab::Curator;
-                let answer = "Releases go through one script:\n\n```mermaid\nflowchart LR\n  A[Bump version] --> B[Write release notes]\n  B --> C[scripts/changelog.sh]\n  C --> D[scripts/release.sh]\n  D --> E[Sign + notarize]\n  E --> F[Publish appcast]\n```\n\nThe signing key for the appcast isn't in the Notebook yet.";
+                let answer = "Releases go through one script:\n\n```mermaid\nflowchart LR\n  A[Bump version] --> B[Write release notes]\n  B --> C[scripts/changelog.sh]\n  C --> D[scripts/release.sh]\n  D --> E[Sign + notarize]\n  E --> F[Publish appcast]\n```\n\nThe signing key for the appcast isn't in the Library yet.";
                 let events = vec![Event::Started, Event::Text(answer.into()), Event::TurnFinished];
                 gardener::replay(&mut s.notebook.chat, feeder_core::gardener::Backend::ClaudeCode, events);
                 s.notebook.chat.items.insert(0, gardener::Item::You("How do we ship the Mac app?".into()));
@@ -1720,7 +1741,11 @@ mod tests {
         assert_eq!(s.tab, Tab::Notebook);
         assert_eq!(s.notebook.open, Some(3));
 
-        assert!(s.open_feeder_url("feeder://notebook"));
+        assert!(s.open_feeder_url("feeder://library/4"));
+        assert_eq!(s.tab, Tab::Notebook);
+        assert_eq!(s.notebook.open, Some(4));
+
+        assert!(s.open_feeder_url("feeder://library"));
         assert_eq!(s.tab, Tab::Notebook);
         assert_eq!(s.notebook.open, None);
         assert_eq!(s.notebook.shelf, notebook::Shelf::All);

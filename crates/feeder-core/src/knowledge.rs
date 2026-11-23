@@ -243,8 +243,55 @@ pub struct Curated {
     pub change: Change,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum ProposalStatus {
+    Pending,
+    Applied,
+    Dismissed,
+}
+
+impl ProposalStatus {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            ProposalStatus::Pending => "pending",
+            ProposalStatus::Applied => "applied",
+            ProposalStatus::Dismissed => "dismissed",
+        }
+    }
+
+    fn parse(s: &str) -> ProposalStatus {
+        match s {
+            "applied" => ProposalStatus::Applied,
+            "dismissed" => ProposalStatus::Dismissed,
+            _ => ProposalStatus::Pending,
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Proposal {
+    pub id: i64,
+    pub run_id: i64,
+    pub action: ChangeAction,
+    pub page_id: Option<i64>,
+    pub project_id: Option<i64>,
+    pub kind: Kind,
+    pub topic: String,
+    pub title: String,
+    pub tags: Vec<String>,
+    pub body: String,
+    pub before_body: Option<String>,
+    pub reason: String,
+    pub source_flags: Vec<i64>,
+    pub source_updates: Vec<i64>,
+    pub status: ProposalStatus,
+    pub change_id: Option<i64>,
+    pub created_at: i64,
+}
+
 const FLAG_COLS: &str = "id, kind, page_id, project_id, agent, note, suggestion, status, resolution, resolved_by, change_id, created_at, resolved_at, source_update_id";
 const CHANGE_COLS: &str = "c.id, c.page_id, c.page_title, c.action, c.agent, c.reason, c.before, c.created_at, c.reverted_at, c.undoes, c.source_updates, c.gardener_run_id, c.source_flags";
+const PROPOSAL_COLS: &str = "id, run_id, action, page_id, project_id, kind, topic, title, tags, body, before_body, reason, source_flags, source_updates, status, change_id, created_at";
 
 impl Store {
     pub fn flag_knowledge(&self, flag: NewFlag, agent: &str) -> Result<Flag> {
@@ -395,8 +442,153 @@ impl Store {
         Ok(result)
     }
 
-    pub fn curate_gardener_run(&self, run_id: i64, mut curation: Curation, provenance: &Provenance) -> Result<Curated> {
+    pub fn is_curator_chat_run(&self, run_id: i64) -> Result<bool> {
+        Ok(self.conn.query_row("SELECT EXISTS(SELECT 1 FROM curator_chats WHERE run_id = ?1)", [run_id], |r| r.get(0))?)
+    }
+
+    pub fn curate_gardener_run(&self, run_id: i64, curation: Curation, provenance: &Provenance) -> Result<Curated> {
         let tx = Transaction::new_unchecked(&self.conn, TransactionBehavior::Immediate)?;
+        let (curation, evidence) = self.prepare_gardener_curation(run_id, curation, provenance)?;
+        let result = self.curate_inner(curation, GARDENER, &evidence, Some(run_id))?;
+        tx.execute("UPDATE gardener_runs SET edits = edits + 1 WHERE id = ?1", [run_id])?;
+        tx.commit()?;
+        Ok(result)
+    }
+
+    pub fn propose_gardener_run(&self, run_id: i64, curation: Curation, provenance: &Provenance) -> Result<Proposal> {
+        let tx = Transaction::new_unchecked(&self.conn, TransactionBehavior::Immediate)?;
+        let (curation, evidence) = self.prepare_gardener_curation(run_id, curation, provenance)?;
+        let reason = evidence.reason.trim().to_string();
+        if reason.chars().count() > REASON_MAX_CHARS {
+            return Err(Error::Invalid(format!("keep the reason under {REASON_MAX_CHARS} characters")));
+        }
+        self.check_gardener_edit(&curation, &evidence)?;
+        let (action, page_id, project_id, draft, before_body) = match curation {
+            Curation::Create { draft, project_id } => {
+                let draft = draft.checked()?;
+                if let Some(existing) = self.similar_pages(&draft)?.into_iter().find(|p| p.project_id == project_id) {
+                    return Err(Error::Invalid(format!(
+                        "the notebook already has a page on this: #{} \"{}\". Revise it (pass id {}) rather than adding another, or file this as new only if it's a genuinely different note",
+                        existing.id, existing.title, existing.id
+                    )));
+                }
+                let duplicate_pending: bool = tx.query_row(
+                    "SELECT EXISTS(SELECT 1 FROM curator_proposals WHERE run_id = ?1 AND status = 'pending' AND lower(title) = lower(?2))",
+                    params![run_id, draft.title],
+                    |r| r.get(0),
+                )?;
+                if duplicate_pending {
+                    return Err(Error::Invalid(format!("a proposal for \"{}\" is already pending in this session", draft.title)));
+                }
+                (ChangeAction::Created, None, project_id, draft, None)
+            }
+            Curation::Revise { page_id, draft } => {
+                let old = self.page(page_id)?.ok_or_else(|| Error::NotFound(format!("no notebook page {page_id}")))?;
+                let draft = draft.checked()?;
+                (ChangeAction::Revised, Some(page_id), old.project_id, draft, Some(old.body))
+            }
+            Curation::Archive { page_id } => {
+                let old = self.page(page_id)?.ok_or_else(|| Error::NotFound(format!("no notebook page {page_id}")))?;
+                let draft = PageDraft {
+                    kind: old.kind,
+                    topic: Some(old.topic.clone()),
+                    title: old.title.clone(),
+                    tags: old.tags.clone(),
+                    body: old.body.clone(),
+                };
+                (ChangeAction::Archived, Some(page_id), old.project_id, draft, Some(old.body))
+            }
+        };
+        let topic = draft.resolved_topic();
+        tx.execute(
+            "INSERT INTO curator_proposals (
+                run_id, action, page_id, project_id, kind, topic, title, tags, body, before_body,
+                reason, source_flags, source_updates, status, created_at
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, 'pending', ?14)",
+            params![
+                run_id,
+                action.as_str(),
+                page_id,
+                project_id,
+                draft.kind.as_str(),
+                topic,
+                draft.title,
+                draft.tags.join(" "),
+                draft.body,
+                before_body,
+                reason,
+                encode_ids(&evidence.flags),
+                encode_ids(&evidence.updates),
+                now_ms(),
+            ],
+        )?;
+        let id = tx.last_insert_rowid();
+        tx.execute("UPDATE gardener_runs SET edits = edits + 1 WHERE id = ?1", [run_id])?;
+        tx.commit()?;
+        self.curator_proposal(id)?.ok_or_else(|| Error::NotFound(format!("proposal {id} vanished")))
+    }
+
+    pub fn curator_proposal(&self, id: i64) -> Result<Option<Proposal>> {
+        let mut stmt = self.conn.prepare(&format!("SELECT {PROPOSAL_COLS} FROM curator_proposals WHERE id = ?1"))?;
+        let row = stmt.query_row([id], proposal_row).optional()?;
+        row.transpose()
+    }
+
+    pub fn curator_proposals(&self, limit: usize) -> Result<Vec<Proposal>> {
+        let limit = i64::try_from(limit.max(1)).unwrap_or(i64::MAX);
+        let mut stmt = self.conn.prepare(&format!("SELECT {PROPOSAL_COLS} FROM curator_proposals ORDER BY id DESC LIMIT ?1"))?;
+        let rows = stmt.query_map([limit], proposal_row)?;
+        rows.collect::<rusqlite::Result<Vec<_>>>()?.into_iter().collect()
+    }
+
+    pub fn apply_curator_proposal(&self, id: i64) -> Result<Curated> {
+        let tx = Transaction::new_unchecked(&self.conn, TransactionBehavior::Immediate)?;
+        let proposal = self.curator_proposal(id)?.ok_or_else(|| Error::NotFound(format!("no proposal {id}")))?;
+        if proposal.status != ProposalStatus::Pending {
+            return Err(Error::Invalid(format!("proposal {id} was already {}", proposal.status.as_str())));
+        }
+        let draft = PageDraft {
+            kind: proposal.kind,
+            topic: Some(proposal.topic.clone()),
+            title: proposal.title.clone(),
+            tags: proposal.tags.clone(),
+            body: proposal.body.clone(),
+        };
+        let curation = match proposal.action {
+            ChangeAction::Created => Curation::Create { draft, project_id: proposal.project_id },
+            ChangeAction::Revised => {
+                let page_id = proposal.page_id.ok_or_else(|| Error::Invalid("revision proposal has no page_id".into()))?;
+                Curation::Revise { page_id, draft }
+            }
+            ChangeAction::Archived => {
+                let page_id = proposal.page_id.ok_or_else(|| Error::Invalid("archive proposal has no page_id".into()))?;
+                Curation::Archive { page_id }
+            }
+            ChangeAction::Restored => return Err(Error::Invalid("unsupported proposal action".into())),
+        };
+        let provenance =
+            Provenance { reason: proposal.reason.clone(), flags: proposal.source_flags.clone(), updates: proposal.source_updates.clone() };
+        let curated = self.curate_inner(curation, GARDENER, &provenance, Some(proposal.run_id))?;
+        tx.execute(
+            "UPDATE curator_proposals SET status = 'applied', change_id = ?1, page_id = ?2 WHERE id = ?3",
+            params![curated.change.id, curated.page.id, id],
+        )?;
+        tx.commit()?;
+        Ok(curated)
+    }
+
+    pub fn dismiss_curator_proposal(&self, id: i64) -> Result<Proposal> {
+        let tx = Transaction::new_unchecked(&self.conn, TransactionBehavior::Immediate)?;
+        let proposal = self.curator_proposal(id)?.ok_or_else(|| Error::NotFound(format!("no proposal {id}")))?;
+        if proposal.status != ProposalStatus::Pending {
+            return Err(Error::Invalid(format!("proposal {id} was already {}", proposal.status.as_str())));
+        }
+        tx.execute("UPDATE curator_proposals SET status = 'dismissed' WHERE id = ?1", [id])?;
+        tx.commit()?;
+        self.curator_proposal(id)?.ok_or_else(|| Error::NotFound(format!("no proposal {id}")))
+    }
+
+    fn prepare_gardener_curation(&self, run_id: i64, mut curation: Curation, provenance: &Provenance) -> Result<(Curation, Provenance)> {
         let run = self.curator_run_with_budget(run_id)?;
         let mut evidence = provenance.clone();
         let mut project = run.scope.project_id();
@@ -428,10 +620,7 @@ impl Store {
                 }
             }
         }
-        let result = self.curate_inner(curation, GARDENER, &evidence, Some(run_id))?;
-        tx.execute("UPDATE gardener_runs SET edits = edits + 1 WHERE id = ?1", [run_id])?;
-        tx.commit()?;
-        Ok(result)
+        Ok((curation, evidence))
     }
 
     pub fn dismiss_gardener_flag(&self, run_id: i64, id: i64, reason: String) -> Result<Flag> {
@@ -694,9 +883,11 @@ impl Store {
 }
 
 fn notebook_link_ids(body: &str) -> impl Iterator<Item = i64> + '_ {
-    body.split("feeder://notebook/").skip(1).filter_map(|tail| {
-        let end = tail.find(|ch: char| !ch.is_ascii_digit()).unwrap_or(tail.len());
-        tail[..end].parse().ok()
+    ["feeder://notebook/", "feeder://library/"].into_iter().flat_map(move |prefix| {
+        body.split(prefix).skip(1).filter_map(|tail| {
+            let end = tail.find(|ch: char| !ch.is_ascii_digit()).unwrap_or(tail.len());
+            tail[..end].parse().ok()
+        })
     })
 }
 
@@ -772,6 +963,45 @@ fn decode_ids(ids: Option<&str>) -> Vec<i64> {
     ids.unwrap_or_default().split_whitespace().filter_map(|id| id.parse().ok()).collect()
 }
 
+fn proposal_row(r: &Row<'_>) -> rusqlite::Result<Result<Proposal>> {
+    let action_str: String = r.get(2)?;
+    let kind_str: String = r.get(5)?;
+    let tags_str: String = r.get(8)?;
+    let status_str: String = r.get(14)?;
+    let id: i64 = r.get(0)?;
+    let run_id: i64 = r.get(1)?;
+    let page_id: Option<i64> = r.get(3)?;
+    let project_id: Option<i64> = r.get(4)?;
+    let topic: String = r.get(6)?;
+    let title: String = r.get(7)?;
+    let body: String = r.get(9)?;
+    let before_body: Option<String> = r.get(10)?;
+    let reason: String = r.get(11)?;
+    let source_flags = decode_ids(r.get::<_, Option<String>>(12)?.as_deref());
+    let source_updates = decode_ids(r.get::<_, Option<String>>(13)?.as_deref());
+    let change_id: Option<i64> = r.get(15)?;
+    let created_at: i64 = r.get(16)?;
+    Ok(ChangeAction::parse(&action_str).map(|action| Proposal {
+        id,
+        run_id,
+        action,
+        page_id,
+        project_id,
+        kind: kind_str.parse().unwrap_or(Kind::Note),
+        topic,
+        title,
+        tags: tags_str.split_whitespace().map(str::to_string).collect(),
+        body,
+        before_body,
+        reason,
+        source_flags,
+        source_updates,
+        status: ProposalStatus::parse(&status_str),
+        change_id,
+        created_at,
+    }))
+}
+
 pub(crate) fn migrate(conn: &Connection) -> Result<()> {
     conn.execute_batch(
         "CREATE TABLE IF NOT EXISTS notebook_changes (
@@ -804,7 +1034,27 @@ pub(crate) fn migrate(conn: &Connection) -> Result<()> {
             created_at INTEGER NOT NULL,
             resolved_at INTEGER
         );
-        CREATE INDEX IF NOT EXISTS knowledge_flags_by_status ON knowledge_flags(status, created_at DESC, id DESC);",
+        CREATE INDEX IF NOT EXISTS knowledge_flags_by_status ON knowledge_flags(status, created_at DESC, id DESC);
+        CREATE TABLE IF NOT EXISTS curator_proposals (
+            id INTEGER PRIMARY KEY,
+            run_id INTEGER NOT NULL,
+            action TEXT NOT NULL,
+            page_id INTEGER REFERENCES notebook_pages(id) ON DELETE SET NULL,
+            project_id INTEGER REFERENCES projects(id) ON DELETE SET NULL,
+            kind TEXT NOT NULL,
+            topic TEXT NOT NULL,
+            title TEXT NOT NULL,
+            tags TEXT NOT NULL,
+            body TEXT NOT NULL,
+            before_body TEXT,
+            reason TEXT NOT NULL,
+            source_flags TEXT,
+            source_updates TEXT,
+            status TEXT NOT NULL DEFAULT 'pending',
+            change_id INTEGER REFERENCES notebook_changes(id) ON DELETE SET NULL,
+            created_at INTEGER NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS curator_proposals_by_run ON curator_proposals(run_id, id DESC);",
     )?;
     Ok(())
 }
@@ -1138,5 +1388,57 @@ mod tests {
         }
         assert_eq!("Stale".parse::<FlagKind>().expect("synonym"), FlagKind::Outdated);
         assert!("bogus".parse::<FlagKind>().is_err());
+    }
+
+    #[test]
+    fn proposals_wait_for_approval_and_apply_or_dismiss_cleanly() {
+        use crate::gardener::Backend;
+
+        let t = temp_store("proposals");
+        let s = &t.store;
+        let flag1 = s.flag_knowledge(missing("Missing changelog check"), "Codex").expect("flag 1");
+        let flag2 = s.flag_knowledge(missing("Missing Sparkle check"), "Codex").expect("flag 2");
+        let run = s.start_gardener_run(Backend::OpenCode).expect("start run");
+
+        let p1 = s
+            .propose_gardener_run(
+                run,
+                Curation::Create { draft: draft("Check the changelog", "Run `scripts/changelog.sh --check`."), project_id: None },
+                &cites("Flag 1 reported the missing check", &[flag1.id]),
+            )
+            .expect("propose create");
+        assert_eq!(p1.status, ProposalStatus::Pending);
+        assert_eq!(p1.action, ChangeAction::Created);
+        assert!(s.pages(&crate::PageFilter::default()).expect("list pages").is_empty(), "not written until applied");
+        assert_eq!(s.flag(flag1.id).expect("read flag").expect("exists").status, FlagStatus::Open);
+
+        let dup = s.propose_gardener_run(
+            run,
+            Curation::Create { draft: draft("Check the changelog", "Duplicate proposal in same run."), project_id: None },
+            &cites("Duplicate", &[flag1.id]),
+        );
+        assert!(dup.is_err(), "duplicate pending proposal in the same session is refused");
+
+        let p2 = s
+            .propose_gardener_run(
+                run,
+                Curation::Create { draft: draft("Fetch Sparkle before clippy", "Use `scripts/fetch-sparkle.sh`."), project_id: None },
+                &cites("Flag 2 reported Sparkle clippy command", &[flag2.id]),
+            )
+            .expect("propose second create");
+
+        let applied = s.apply_curator_proposal(p1.id).expect("apply p1");
+        assert_eq!(applied.page.title, "Check the changelog");
+        assert_eq!(s.flag(flag1.id).expect("read flag 1").expect("exists").status, FlagStatus::Resolved);
+        let p1_after = s.curator_proposal(p1.id).expect("read p1").expect("exists");
+        assert_eq!(p1_after.status, ProposalStatus::Applied);
+        assert_eq!(p1_after.page_id, Some(applied.page.id));
+        assert_eq!(p1_after.change_id, Some(applied.change.id));
+        assert!(s.apply_curator_proposal(p1.id).is_err(), "cannot apply twice");
+
+        let dismissed = s.dismiss_curator_proposal(p2.id).expect("dismiss p2");
+        assert_eq!(dismissed.status, ProposalStatus::Dismissed);
+        assert!(s.dismiss_curator_proposal(p2.id).is_err(), "cannot dismiss twice");
+        assert_eq!(s.flag(flag2.id).expect("read flag 2").expect("exists").status, FlagStatus::Open);
     }
 }
