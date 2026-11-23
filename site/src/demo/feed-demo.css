@@ -4,7 +4,6 @@
     background: transparent;
   }
 
-  /* Light theme defaults matching Feeder's real light appearance */
   .fd-win {
     position: absolute;
     top: 24px;
@@ -276,7 +275,6 @@
     padding: 8px 0 5px;
   }
 
-  /* ── Multi-image carousel inside the lead update card ── */
   .fd-carousel {
     display: grid;
     gap: 8px;

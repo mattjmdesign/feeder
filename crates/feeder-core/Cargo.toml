@@ -7,7 +7,6 @@ license.workspace = true
 [dependencies]
 rusqlite.workspace = true
 serde.workspace = true
-# Config edits keep the user's key order (`setup`).
 serde_json = { workspace = true, features = ["preserve_order"] }
 fastrand.workspace = true
 dirs.workspace = true

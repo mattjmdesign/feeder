@@ -1,6 +1,3 @@
-// The app's orbs (crates/feeder-app/src/orb.rs) as CSS backgrounds: a pattern body under the same
-// rim shade, bounce light, edge highlight and glints, so the site's orbs match the app's.
-
 export type Pattern = 'nebula' | 'aurora' | 'pearl' | 'eclipse' | 'tide' | 'ember';
 
 export const PATTERNS: Pattern[] = ['nebula', 'aurora', 'pearl', 'eclipse', 'tide', 'ember'];
@@ -37,7 +34,6 @@ const white = (a: number) => `rgb(255 255 255 / ${a})`;
 const black = (a: number) => `rgb(0 0 0 / ${a})`;
 const clear = 'transparent';
 
-/** `radial-gradient` sized in fractions of the orb's radius, like the app's. */
 function radial(cx: number, cy: number, rx: number, ry: number, stops: string): string {
   return `radial-gradient(${(rx * 50).toFixed(2)}% ${(ry * 50).toFixed(2)}% at ${(cx * 100).toFixed(1)}% ${(cy * 100).toFixed(1)}%, ${stops})`;
 }
@@ -102,7 +98,6 @@ function pattern(o: Orb): string[] {
   }
 }
 
-/** The orb as a CSS `background` value; put it on a circle. */
 export function orbBackground(o: Orb): string {
   const caustic = (a: number) => tone(o, 1, 0.86, 0.75, a);
   const lighting = [
@@ -116,12 +111,10 @@ export function orbBackground(o: Orb): string {
   return [...lighting, ...pattern(o), base(o)].join(', ');
 }
 
-/** The orb's signature colour, for glows. */
 export function orbAccent(o: Orb, a = 1): string {
   return o.pattern === 'pearl' ? tone(o, 0, 0.8, 0.9, a) : tone(o, 0, 0.72, 1, a);
 }
 
-/** A fresh orb whose hue sits far from `avoid`, like the app's `Orb::generate`. */
 export function randomOrb(avoid?: number): Orb {
   const r = Math.random;
   let h0 = r() * 360;

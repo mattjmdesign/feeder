@@ -13,14 +13,11 @@ use rune_kit::{Button, ButtonVariant, ControlSize, Kit, scroll_bar};
 use crate::State;
 use crate::style::{self, Palette};
 
-/// Line height and code typography for the file viewer.
 const CODE_LINE_H: f32 = 20.0;
 const CODE_FONT_SIZE: f32 = 12.5;
 const GUTTER_FONT_SIZE: f32 = 11.5;
 const MONO_ADVANCE: f32 = 7.6;
-/// Bounds per-row text shaping even for minified single-line bundles.
 const MAX_LINE_BYTES: usize = 4096;
-/// Bounds wrapped-mode DOM size so multi-thousand-line files stay responsive when wrapped.
 const WRAP_PAGE_LINES: usize = 500;
 
 #[derive(Default)]
@@ -66,7 +63,6 @@ struct CodeDoc {
 }
 
 struct CodeLine {
-    /// 1-based line number, or `None` on continuation chunks of an over-long minified line.
     number: Option<usize>,
     range: Range<usize>,
     highlights: Vec<(Range<usize>, Paint)>,
@@ -239,8 +235,6 @@ impl Worker {
     fn start(wake: Option<Waker>) -> Self {
         let (requests, inbox) = mpsc::channel::<Request>();
         let (out, results) = mpsc::channel();
-        // One reader per window. When selection changes rapidly, keep only the newest queued
-        // request. The UI ignores a result for a file that is no longer selected.
         let _ = std::thread::Builder::new().name("feeder-file-preview".into()).spawn(move || {
             while let Ok(first) = inbox.recv() {
                 let request = inbox.try_iter().last().unwrap_or(first);
@@ -461,7 +455,7 @@ fn code_view(preview: &Preview, doc: &CodeDoc, p: &Palette, k: &Kit) -> El {
     out
 }
 
-#[allow(clippy::too_many_arguments)]
+#[expect(clippy::too_many_arguments, reason = "internal row renderer; each argument is an independent style or layout input")]
 fn code_line_row(
     doc: &CodeDoc,
     line: &CodeLine,
@@ -539,8 +533,6 @@ fn display_columns(line: &str) -> usize {
     cols
 }
 
-/// Expands tabs to 4-column stops (and adds soft break points when wrapped) without changing what
-/// gets copied to the clipboard.
 fn tabbed(code: &str, mut spans: Vec<Span>, wrap: bool) -> (String, Vec<Span>, Vec<Range<usize>>) {
     if !code.contains('\t') && !(wrap && code.contains(['.', '(', '[', '/'])) {
         return (code.to_owned(), spans, Vec::new());

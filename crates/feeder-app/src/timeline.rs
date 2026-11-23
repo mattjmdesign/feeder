@@ -1,7 +1,3 @@
-//! The Feed tab: every project's updates in one stream, newest first, loading further back as the
-//! end of the list comes near. Each post wears its project's orb; the orb or the project's name
-//! opens that project's full history.
-
 use std::rc::Rc;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -15,11 +11,8 @@ use crate::watch::TIMELINE_PAGE;
 use crate::{CopyTarget, State, agents, chrome, feed, orb};
 
 const COLUMN: f32 = 660.0;
-/// The project orb beside each post: the post's face, like an avatar in a timeline.
 const AVATAR: f32 = 32.0;
-/// Space between the avatar and the post's text.
 const GUTTER: f32 = 12.0;
-/// Start loading the next page this far (in points) before the end.
 const PRELOAD: f32 = 1200.0;
 
 pub fn view(s: &State, p: &Palette, k: &Kit, layer: &mut Vec<El>) -> El {
@@ -100,7 +93,6 @@ fn posts(s: &State, p: &Palette, k: &Kit, visible: &[(&FeedUpdate, &ProjectSumma
         })
         .collect();
     let keys = rows.clone();
-    // Rune mounts the menu in the root overlay, independently of the lazy row that anchors it.
     let menu = s.post_menu.filter(|id| rows.iter().any(|r| r.id == *id)).map(|id| (id, post_menu(id, p, k, layer)));
     let (p, k) = (*p, k.clone());
     let md = feed::markdown_style(&p, &k);
@@ -214,8 +206,6 @@ fn strip_label(label: &str, p: &Palette) -> El {
     text(label.to_uppercase()).font(style::LABEL).color(p.text_3).pb(2.0)
 }
 
-/// Decisions waiting on the person, pinned above everything else: the question itself, and the
-/// ways to act on it without hunting for the post.
 fn needs_you_now(s: &State, p: &Palette) -> Option<El> {
     let waiting: Vec<&ProjectSummary> = s.projects.iter().filter(|p| !p.project.archived && p.needs_you).collect();
     if waiting.is_empty() {
@@ -246,7 +236,6 @@ fn needs_you_now(s: &State, p: &Palette) -> Option<El> {
             actions = actions
                 .child(action(format!("needs-reply-{id}"), "Reply", format!("Reply to {name}")).on_press_tx(
                     move |s: &mut State, tx: &mut Tx| {
-                        // The project opens on this update, newest first, with its reply box ready.
                         s.open_project(id);
                         s.pending_scroll = Some(format!("u-{uid}"));
                         s.start_reply(uid, tx);
@@ -285,7 +274,6 @@ fn needs_you_now(s: &State, p: &Palette) -> Option<El> {
     Some(rows)
 }
 
-/// Agents at work right now, pinned above the posts: native Spinner, who, where, and what.
 fn working_now(s: &State, p: &Palette, k: &Kit) -> Option<El> {
     let live: Vec<&ProjectSummary> = s.projects.iter().filter(|p| !p.project.archived && p.active_pulse.is_some()).collect();
     if live.is_empty() {
@@ -320,9 +308,6 @@ fn working_now(s: &State, p: &Palette, k: &Kit) -> Option<El> {
     Some(rows)
 }
 
-/// One post, laid out like a timeline: the project's orb on the left; one header line of
-/// project, agent, branch and time; the update itself; then quiet actions that appear on hover
-/// or keyboard focus.
 fn post(s: &State, (p, k, md): (&Palette, &Kit, &MarkdownStyle), u: &FeedUpdate, summary: &ProjectSummary, menu_trigger: Option<El>) -> El {
     let id = summary.project.id;
     let uid = u.id;
@@ -388,9 +373,6 @@ fn post(s: &State, (p, k, md): (&Palette, &Kit, &MarkdownStyle), u: &FeedUpdate,
         .child(words)
 }
 
-/// The update as a post: keeps full rich-text Markdown contrast for code blocks, lists, links,
-/// and bold. Only an opening "Done" label is omitted so the post reads naturally; Why, Next, and
-/// any other section labels stay visible.
 fn post_body(p: &Palette, md: &MarkdownStyle, u: &FeedUpdate) -> El {
     let mut body = col().w_full().gap(10.0);
     for (i, section) in crate::prose::sections(&u.body).into_iter().enumerate() {
@@ -444,7 +426,6 @@ fn more_action(uid: i64, p: &Palette) -> El {
         .on_press(move |s: &mut State| s.post_menu = if s.post_menu == Some(uid) { None } else { Some(uid) })
 }
 
-/// Reply, Copy and More actions, revealed on hover or keyboard focus.
 fn post_actions(s: &State, p: &Palette, u: &FeedUpdate, menu_trigger: Option<El>) -> El {
     let uid = u.id;
     let body = u.body.clone();
@@ -483,14 +464,12 @@ fn post_menu(uid: i64, p: &Palette, k: &Kit, layer: &mut Vec<El>) -> El {
         .build(k, layer)
 }
 
-/// The post's footer: diff stat and/or a quiet link to the Notebook note sourced from this update.
 fn post_footer(s: &State, p: &Palette, u: &FeedUpdate) -> Option<El> {
     let diff = u.diff_stat.as_deref().map(str::trim).filter(|d| !d.is_empty());
     let link = feed::notebook_link(s, p, u.id);
     if diff.is_none() && link.is_none() {
         return None;
     }
-    // One line of quiet metadata on the body's left edge: the diff, then the note it became.
     let mut r = row().w_full().gap(8.0).center_y();
     if let Some(diff) = diff {
         r = r.child(text(diff.to_string()).font(style::META).color(p.text_3).truncate().max_w(220.0));

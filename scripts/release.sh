@@ -1,20 +1,9 @@
 #!/usr/bin/env bash
-# Publishes the committed version of Feeder: builds a signed, notarized DMG, signs an update feed
-# for it, and attaches both to a GitHub release on this repo. Installed copies of Feeder check the
-# latest release's appcast.xml and offer the update; the website's Download button fetches the
-# latest release's Feeder.dmg.
-#   scripts/release.sh                 notes from release-notes/<version>.md
-#   scripts/release.sh path/to/NOTES.md
-# Needs, in this Mac's keychain: a Developer ID Application certificate, the `feeder` notarytool
-# profile and the `feeder` Sparkle key. Needs `gh` signed in with access to the releases repo.
 set -euo pipefail
 
 cd "$(dirname "$0")/.."
 RELEASES_REPO="mattjmdesign/feeder"
-# Built into every copy of Feeder. Changing either strands the copies already installed.
 FEED_URL="https://github.com/$RELEASES_REPO/releases/latest/download/appcast.xml"
-# Feeder 0.2 and 0.3 read their feed from this repo. Every release also posts its signed feed
-# there, so those copies are offered the update and pick up FEED_URL once they install it.
 LEGACY_FEED_REPO="mattjmdesign/feeder-releases"
 PUBLIC_KEY="woqv+TW3eu0pE9safKDR37DCbBMSAvq/IjYQfLFdnm8="
 
@@ -38,8 +27,6 @@ for repo in "$RELEASES_REPO" "$LEGACY_FEED_REPO"; do
     exit 1
   fi
 done
-# notarytool keeps its credential in the data-protection keychain, which macOS seals while the
-# screen is locked. Check before a three-minute build rather than after it.
 if ! xcrun notarytool history --keychain-profile feeder >/dev/null 2>&1; then
   echo "Can't read the 'feeder' notarization credential. Unlock this Mac (or run" >&2
   echo "'xcrun notarytool store-credentials feeder') and try again." >&2
@@ -59,14 +46,11 @@ case "$(rustc -vV | sed -n 's/^host: //p')" in
   *) ARCH="x86_64" ;;
 esac
 BUILT="dist/Feeder-$VERSION-macos-$ARCH.dmg"
-# Every release's image is Feeder.dmg, so releases/latest/download/Feeder.dmg always works; the
-# feed tells versions apart by their release tag.
 NAME="Feeder"
 STAGE="dist/release-$VERSION"
 rm -rf "$STAGE"
 mkdir -p "$STAGE"
 mv "$BUILT" "$STAGE/$NAME.dmg"
-# generate_appcast embeds the notes that share the archive's name.
 cp "$NOTES" "$STAGE/$NAME.md"
 
 echo "› signing the update feed"
@@ -76,10 +60,8 @@ echo "› signing the update feed"
 echo "› publishing $TAG"
 gh release create "$TAG" --repo "$RELEASES_REPO" --title "Feeder $VERSION" --notes-file "$NOTES" \
   "$STAGE/$NAME.dmg" "$STAGE/appcast.xml"
-# The feed's download links point at $RELEASES_REPO, so this copy only redirects older installs.
 gh release create "$TAG" --repo "$LEGACY_FEED_REPO" --title "Feeder $VERSION" \
   --notes "Feeder now lives at https://github.com/$RELEASES_REPO. This release only carries the update feed." \
   "$STAGE/appcast.xml"
-# Published images live on the releases page; keep only this one locally.
 find dist -mindepth 1 -maxdepth 1 ! -name "release-$VERSION" -exec rm -rf {} +
 echo "✓ https://github.com/$RELEASES_REPO/releases/tag/$TAG"

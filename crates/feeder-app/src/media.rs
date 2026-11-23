@@ -1,11 +1,3 @@
-//! Scoped media loading for Feed, Project Updates, and Lightbox.
-//!
-//! Only slides near the active view's visible rows (plus any open Lightbox slide and its
-//! filmstrip) are kept decoded in memory; on a view without media the last set stays, so
-//! returning to Feed is instant. Rune's `ImageCache::file` decodes raster images at
-//! their native resolution and releases pixels when the handle is dropped, so keeping one handle
-//! per visible slide avoids both duplicate decoding and unbounded RAM growth.
-
 use std::collections::{HashMap, HashSet};
 use std::ops::Range;
 use std::path::PathBuf;
@@ -16,14 +8,10 @@ use rune::{Image, ImageCache, Player};
 use crate::files::ProjectView;
 use crate::{State, Tab, feed};
 
-/// Logical SVG rasterization size (raster images decode natively in Rune).
 const IMAGE_SIZE_PT: f32 = 960.0;
-/// Number of posts around the visible viewport window whose active media stays decoded.
 const ROW_OVERSCAN: usize = 3;
-/// Initial row window decoded before the first virtual-list visibility callback lands.
 const INITIAL_WINDOW: Range<usize> = 0..8;
 
-/// One visual slide attached to an update (from `update.media`, with fallback to `update.screenshot`).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct MediaSlide {
     pub id: i64,
@@ -52,7 +40,6 @@ pub fn media_slides(u: &FeedUpdate) -> Vec<MediaSlide> {
     }
 }
 
-/// Reconciles decoded images and preloaded video players with what the current view can display.
 pub fn sync(s: &mut State) {
     if s.images.is_none() {
         return;
@@ -80,16 +67,12 @@ pub fn sync(s: &mut State) {
             }
         }
     }
-    // Off the media views (Home, Notebook, Files) nothing is wanted. Keep the last view's
-    // decoded screenshots then, so coming back to Feed shows them at once instead of decoding
-    // them all again; they're bounded by the visible-row window. Video players still stop.
     if !(slides.is_empty() && on_other_view(s)) {
         s.shots.retain(|id, _| live.contains(id));
     }
     s.videos.retain(|id, _| live.contains(id));
 }
 
-/// Whether the window shows no media view: not Feed, not a project's updates, no Lightbox.
 fn on_other_view(s: &State) -> bool {
     let project_updates = s.open.is_some() && s.files.view == ProjectView::Updates;
     let feed = s.open.is_none() && s.tab == Tab::Feed;
@@ -98,7 +81,6 @@ fn on_other_view(s: &State) -> bool {
 
 fn decode_image(cache: &ImageCache, path: &std::path::Path) -> Image {
     let img = cache.file(path, IMAGE_SIZE_PT, 2.0);
-    // Headless frames run ahead of the decoder; wait so snapshots show the image.
     if rune::tooling::headless_run().is_some() {
         let _ = img.wait();
     }
@@ -119,7 +101,6 @@ fn row_window(visible: Option<&Range<usize>>, total: usize) -> Range<usize> {
     }
 }
 
-/// Computes the slides needed for the current view without performing I/O.
 fn desired_slides(s: &State) -> Vec<MediaSlide> {
     let mut needed: HashMap<i64, MediaSlide> = HashMap::new();
     let mut add = |slide: MediaSlide| {
@@ -145,7 +126,6 @@ fn desired_slides(s: &State) -> Vec<MediaSlide> {
     if let Some(id) = s.lightbox
         && let Some((_, _, slides)) = s.find_media(id)
     {
-        // Keep all slides of the open carousel so the filmstrip thumbnails stay ready.
         for slide in slides {
             add(slide);
         }
@@ -268,26 +248,22 @@ mod tests {
             s.timeline.push(sample_carousel_update(id, 1));
         }
 
-        // Home and Notebook decode no feed media.
         s.tab = Tab::Home;
         assert!(desired_slides(&s).is_empty());
         s.tab = Tab::Notebook;
         assert!(desired_slides(&s).is_empty());
 
-        // Feed decodes only the active slide of rows near the visible window.
         s.tab = Tab::Feed;
         s.feed_visible_rows = Some(0..2);
         let mut ids: Vec<i64> = desired_slides(&s).into_iter().map(|m| m.id).collect();
         ids.sort_unstable();
         assert_eq!(ids, vec![11, 21, 31, 41, 51]);
 
-        // Stepping to slide 2 switches the decoded slide for that post.
         s.set_card_slide(1, 1);
         let mut ids: Vec<i64> = desired_slides(&s).into_iter().map(|m| m.id).collect();
         ids.sort_unstable();
         assert_eq!(ids, vec![12, 21, 31, 41, 51]);
 
-        // A project's Updates decode the shown slide of each visible post; Files decodes none.
         s.open = Some(1);
         s.feed_for = Some(1);
         s.feed.push(sample_carousel_update(5, 1));
@@ -298,7 +274,6 @@ mod tests {
         s.files.view = ProjectView::Files;
         assert!(desired_slides(&s).is_empty());
 
-        // Lightbox keeps all slides of its carousel for the filmstrip.
         s.lightbox = Some(51);
         let mut lb_ids: Vec<i64> = desired_slides(&s).into_iter().map(|m| m.id).collect();
         lb_ids.sort_unstable();

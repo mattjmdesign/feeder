@@ -1,12 +1,10 @@
-//! `feeder notebook`: search, read and write the shared notebook of lessons from a terminal.
-
 use clap::Subcommand;
 use feeder_core::{Kind, NOTEBOOK_GUIDE, OnSimilar, Page, PageDraft, PageFilter, Standing, Store, detect_project, now_ms};
 use serde_json::{Value, json};
 
 #[derive(Subcommand)]
 pub enum NotebookCmd {
-    /// Search pages by words in the title, tags, rule and story; best match first.
+    #[command(about = "Search pages by words in the title, tags, rule and story; best match first.")]
     Search {
         query: Vec<String>,
         #[arg(long)]
@@ -15,7 +13,7 @@ pub enum NotebookCmd {
         topic: Option<String>,
         #[arg(long)]
         tag: Option<String>,
-        /// Include archived pages.
+        #[arg(help = "Include archived pages.")]
         #[arg(long)]
         all: bool,
         #[arg(short = 'n', long, default_value_t = 8)]
@@ -23,7 +21,7 @@ pub enum NotebookCmd {
         #[arg(long)]
         json: bool,
     },
-    /// List pages, the most recently revised first.
+    #[command(about = "List pages, the most recently revised first.")]
     List {
         #[arg(long)]
         kind: Option<String>,
@@ -31,57 +29,57 @@ pub enum NotebookCmd {
         topic: Option<String>,
         #[arg(long)]
         tag: Option<String>,
-        /// Only pages that came from this project.
+        #[arg(help = "Only pages that came from this project.")]
         #[arg(short, long)]
         project: Option<String>,
-        /// Include archived pages.
+        #[arg(help = "Include archived pages.")]
         #[arg(long)]
         all: bool,
         #[arg(long)]
         json: bool,
     },
-    /// Show one page in full.
+    #[command(about = "Show one page in full.")]
     Show {
         id: i64,
         #[arg(long)]
         json: bool,
     },
-    /// Write a new Markdown note, or revise one with `--id`. `feeder notebook guide` explains how.
+    #[command(about = "Write a new Markdown note, or revise one with `--id`. `feeder notebook guide` explains how.")]
     #[command(after_long_help = NOTEBOOK_GUIDE)]
     Write {
-        /// Revise this page instead of adding a new one.
+        #[arg(help = "Revise this page instead of adding a new one.")]
         #[arg(long)]
         id: Option<i64>,
-        /// Optional kind (`note`, `fix`, `pitfall`, `pattern`, `decision`). Defaults to `note`.
+        #[arg(help = "Optional kind (`note`, `fix`, `pitfall`, `pattern`, `decision`). Defaults to `note`.")]
         #[arg(long)]
         kind: Option<String>,
-        /// Optional category/topic (`rust`, `react`, `nextjs`, `design`, `general`, or a custom slug).
+        #[arg(help = "Optional category/topic (`rust`, `react`, `nextjs`, `design`, `general`, or a custom slug).")]
         #[arg(long)]
         topic: Option<String>,
         #[arg(long)]
         title: String,
-        /// Optional comma-separated tags: `rust,sqlite`.
+        #[arg(help = "Optional comma-separated tags: `rust,sqlite`.")]
         #[arg(long, value_delimiter = ',')]
         tags: Vec<String>,
-        /// Freeform Markdown body. Pass `-` or omit with `--file` / piped stdin.
+        #[arg(help = "Freeform Markdown body. Pass `-` or omit with `--file` / piped stdin.")]
         #[arg(long)]
         body: Option<String>,
-        /// Read the Markdown body from a `.md` file.
+        #[arg(help = "Read the Markdown body from a `.md` file.")]
         #[arg(short, long)]
         file: Option<std::path::PathBuf>,
-        /// Legacy: what happened (composed into Markdown if `--body` is omitted).
+        #[arg(help = "Legacy: what happened (composed into Markdown if `--body` is omitted).")]
         #[arg(long)]
         what: Option<String>,
-        /// Legacy: why / root cause (composed into Markdown if `--body` is omitted).
+        #[arg(help = "Legacy: why / root cause (composed into Markdown if `--body` is omitted).")]
         #[arg(long)]
         why: Option<String>,
-        /// Legacy: rule to follow (composed into Markdown if `--body` is omitted).
+        #[arg(help = "Legacy: rule to follow (composed into Markdown if `--body` is omitted).")]
         #[arg(long = "do")]
         rule: Option<String>,
-        /// The project it came from. Defaults to the current folder's project, if it has a feed.
+        #[arg(help = "The project it came from. Defaults to the current folder's project, if it has a feed.")]
         #[arg(short, long)]
         project: Option<String>,
-        /// File it even if a similar page exists (only for a genuinely different note).
+        #[arg(help = "File it even if a similar page exists (only for a genuinely different note).")]
         #[arg(long)]
         new: bool,
         #[arg(short, long)]
@@ -89,30 +87,30 @@ pub enum NotebookCmd {
         #[arg(long)]
         json: bool,
     },
-    /// Record that a page helped, so useful pages rise in search.
+    #[command(about = "Record that a page helped, so useful pages rise in search.")]
     Helped { id: i64 },
-    /// Archive an outdated page (kept for the record, hidden from search).
+    #[command(about = "Archive an outdated page (kept for the record, hidden from search).")]
     Archive { id: i64 },
-    /// Bring an archived page back.
+    #[command(about = "Bring an archived page back.")]
     Restore { id: i64 },
-    /// Delete a page for good.
+    #[command(about = "Delete a page for good.")]
     Rm {
         id: i64,
-        /// Required: confirms the deletion.
+        #[arg(help = "Required: confirms the deletion.")]
         #[arg(long)]
         yes: bool,
     },
-    /// High-level categories/topics in use, with page counts and top tags.
+    #[command(about = "High-level categories/topics in use, with page counts and top tags.")]
     Topics {
         #[arg(long)]
         json: bool,
     },
-    /// Tags in use, with how many pages carry each.
+    #[command(about = "Tags in use, with how many pages carry each.")]
     Tags {
         #[arg(long)]
         json: bool,
     },
-    /// How to use the notebook well (the same guide agents get).
+    #[command(about = "How to use the notebook well (the same guide agents get).")]
     Guide,
 }
 
@@ -270,7 +268,6 @@ fn parse_kind(kind: Option<String>) -> Result<Option<Kind>, String> {
     kind.map(|k| k.parse::<Kind>()).transpose().map_err(|e| e.to_string())
 }
 
-/// The project a new page came from: the one named, else the current folder's (if it has a feed).
 fn origin_project(store: &Store, name: Option<&str>) -> Result<Option<i64>, String> {
     if let Some(name) = name {
         let p = store.find_project(name).map_err(|e| e.to_string())?.ok_or(format!("no project called {name}"))?;

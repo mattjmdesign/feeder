@@ -1,6 +1,3 @@
-//! Feeder's shared core: the local store every client writes to (CLI, MCP server, desktop app),
-//! the rules an update must follow, and the orb each project is drawn as.
-
 mod agent;
 mod detect;
 mod file_preview;
@@ -40,10 +37,7 @@ pub use store::{
     TodoItem, data_dir, image_dimensions, media_kind_for_path,
 };
 pub use time::{ago, day_key, day_label, now_ms, relative_time};
-pub use update::{
-    AttentionKind, MAX_CHARS, MAX_PARAGRAPHS, UpdateError, build_resume_prompt, extract_block, parse_attention, update_blocks,
-    validate_body,
-};
+pub use update::{AttentionKind, MAX_CHARS, MAX_PARAGRAPHS, UpdateError, extract_block, parse_attention, update_blocks, validate_body};
 pub use worktree::{ChangeKind, Commit, FileChange, TreeStatus, WorkingTree, read_working_tree};
 
 pub type Result<T> = std::result::Result<T, Error>;

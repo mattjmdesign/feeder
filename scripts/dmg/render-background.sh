@@ -1,6 +1,4 @@
 #!/usr/bin/env bash
-# Renders background.html to background.tiff (1x and 2x, transparent) with headless Chrome.
-# Run after editing background.html; the TIFF is committed so releases don't need Chrome.
 set -euo pipefail
 cd "$(dirname "$0")"
 chrome="/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"

@@ -1,7 +1,3 @@
-// Feeder's notifications, posted as Feeder (its name and icon) through UserNotifications.
-// macOS asks once, "Feeder would like to send you notifications", the first time one is posted.
-// Clicking a notification opens the feeder:// link it carries.
-
 #import <AppKit/AppKit.h>
 #import <UserNotifications/UserNotifications.h>
 
@@ -10,7 +6,6 @@
 
 @implementation FeederNotifier
 
-// Show banners while Feeder is open too; macOS hides them for the frontmost app by default.
 - (void)userNotificationCenter:(UNUserNotificationCenter *)center
        willPresentNotification:(UNNotification *)notification
          withCompletionHandler:(void (^)(UNNotificationPresentationOptions))completionHandler {
@@ -32,13 +27,10 @@
 
 static FeederNotifier *notifier;
 
-// UserNotifications needs an app bundle; `cargo run` has none.
 static bool bundled(void) {
     return NSBundle.mainBundle.bundleIdentifier != nil;
 }
 
-// Installs the delegate at launch, so a click on a notification that outlived the last run
-// still opens its link.
 void feeder_notify_start(void) {
     if (!bundled() || notifier != nil) {
         return;
@@ -47,15 +39,13 @@ void feeder_notify_start(void) {
     UNUserNotificationCenter.currentNotificationCenter.delegate = notifier;
 }
 
-// Posts a notification; `url` may be NULL. False outside an app bundle, where the caller
-// falls back.
 bool feeder_notify(const char *title, const char *body, const char *url) {
     if (!bundled()) {
         return false;
     }
     feeder_notify_start();
-    NSString *titleText = [NSString stringWithUTF8String:title] ?: @"Feeder";
-    NSString *bodyText = [NSString stringWithUTF8String:body] ?: @"";
+    NSString *titleText = (title != NULL ? [NSString stringWithUTF8String:title] : nil) ?: @"Feeder";
+    NSString *bodyText = (body != NULL ? [NSString stringWithUTF8String:body] : nil) ?: @"";
     NSString *link = url != NULL ? [NSString stringWithUTF8String:url] : nil;
     UNUserNotificationCenter *center = UNUserNotificationCenter.currentNotificationCenter;
     [center requestAuthorizationWithOptions:UNAuthorizationOptionAlert

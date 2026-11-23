@@ -1,10 +1,3 @@
-//! The Notebook tab: Feeder's freeform Markdown knowledge library, modelled on Obsidian & Notion.
-//!
-//! Writing a new note opens a borderless blank canvas (title + single category selector + live
-//! syntax-decorated `.md` editor with formatting toolbar, keyboard shortcuts, smart list
-//! continuation, and Write/Preview toggle). Reading renders full GFM Markdown with syntax-highlighted
-//! code blocks, tables, Obsidian `> [!note]` callouts, and interactive persisted task checkboxes.
-
 use std::collections::HashMap;
 
 use feeder_core::{
@@ -27,13 +20,10 @@ use crate::watch::NotebookOp;
 use crate::{CopyTarget, State, ToastItem, ToastKind, agents, chrome, feed};
 
 const INDEX_MAX_W: f32 = 720.0;
-/// The narrowest a card gets before the grid drops a column, and every card's height.
 const CARD_MIN_W: f32 = 340.0;
 const CARD_H: f32 = 112.0;
-/// The pattern tile at a card's left, square, inset by the card's padding.
 const TILE: f32 = CARD_H - 2.0 * CARD_PAD;
 const CARD_PAD: f32 = 8.0;
-/// The scroll column's side padding around the index.
 const INDEX_PAD: f32 = 32.0;
 const CARD_GAP: f32 = 12.0;
 const DOC_MAX_W: f32 = 720.0;
@@ -56,21 +46,17 @@ static MORE_ICON: Icon = Icon {
     body: r#"<circle cx="3.5" cy="8" r="1.2" fill="currentColor"/><circle cx="8" cy="8" r="1.2" fill="currentColor"/><circle cx="12.5" cy="8" r="1.2" fill="currentColor"/>"#,
 };
 
-/// Height kept clear at the bottom of the sidebar for the settings gear.
 const SETTINGS_CORNER_H: f32 = 44.0;
 
-/// What the index view is currently showing.
 #[derive(Clone, Debug, PartialEq, Eq, Default)]
 pub enum Shelf {
     #[default]
     All,
     Topic(String),
     Archived,
-    /// The gardener's changes and open flags.
     Gardener,
 }
 
-/// Tree node stored inside `TreeModel<NavNode>` in the Obsidian-style sidebar.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum NavNode {
     Topic { slug: String, label: String, count: usize },
@@ -87,30 +73,21 @@ impl NavNode {
 }
 
 pub struct Notebook {
-    /// Every page (current + archived), newest revision first.
     pub pages: Vec<Page>,
     pub pane: PaneState,
-    /// The main pane's width from the last layout, so the index grid can fill its rows.
     pub main_w: f32,
     pub tree: TreeModel<NavNode>,
     pub query: TextEdit,
     pub shelf: Shelf,
-    /// The page being read.
     pub open: Option<i64>,
     pub editor: Option<Editor>,
     pub delete_confirm: Option<i64>,
     pub action_menu_open: bool,
-    /// Opens the first current page once snapshots arrive (used by `--scene notebook-page`).
     pub auto_open_first: bool,
     pub gardener: crate::watch::GardenerView,
-    /// Whether the Gardener page lists its open flags.
-    /// The Gardener page's live session.
     pub chat: crate::gardener::Chat,
-    /// Saved chats a snapshot scene shows in place of the database's.
     pub preview_chats: Option<Vec<feeder_core::gardener::ChatSummary>>,
-    /// Curator changes a snapshot scene shows in place of the database's.
     pub preview_changes: Option<Vec<feeder_core::Change>>,
-    /// The provider picked for new Curator chats; `None` uses the first installed.
     pub curator_backend: Option<feeder_core::gardener::Backend>,
     pub provider_open: bool,
 }
@@ -146,11 +123,8 @@ pub enum TopicChoice {
     Custom,
 }
 
-/// A freeform Markdown note being written or revised on a borderless canvas.
 pub struct Editor {
-    /// The page being revised, or None for a brand-new note.
     pub id: Option<i64>,
-    /// Preserved metadata from existing notes (defaults to `Kind::Note` for fresh notes).
     pub kind: Kind,
     pub tags: Vec<String>,
     pub topic_choice: TopicChoice,
@@ -248,7 +222,6 @@ impl Notebook {
         self.sync_tree();
     }
 
-    /// Rebuilds the sidebar `TreeModel` from `self.pages`, keeping prior expand/collapse state.
     pub fn sync_tree(&mut self) {
         let topics = topic_counts(&self.pages);
         let mut was_expanded: HashMap<String, bool> = HashMap::new();
@@ -304,7 +277,6 @@ impl Notebook {
         }
     }
 
-    /// Pages visible in the active index view after shelf and query filters.
     pub fn visible(&self) -> Vec<&Page> {
         let on_shelf = |p: &&Page| -> bool {
             match &self.shelf {
@@ -324,7 +296,6 @@ impl Notebook {
     }
 }
 
-/// How well a page matches every search word (title counts most), or None when a word is missing.
 fn score(p: &Page, words: &[String]) -> Option<usize> {
     let title = p.title.to_lowercase();
     let topic_slug = p.topic.to_lowercase();
@@ -385,14 +356,12 @@ impl State {
         self.notebook.sync_tree_selection();
     }
 
-    /// Jumps from another tab (such as Feed) straight to a Notebook page.
     pub fn open_notebook_page_from_anywhere(&mut self, id: i64) {
         self.open = None;
         self.tab = crate::Tab::Notebook;
         self.notebook_open_page(id);
     }
 
-    /// Flags a Feed update for Curator review (idempotent on the store side).
     pub fn flag_update_for_notebook(&mut self, update_id: i64) {
         self.notebook_send(NotebookOp::FlagUpdate(update_id));
         let project_id = self.feed.iter().chain(&self.timeline).chain(&self.search_hits).find(|u| u.id == update_id).map(|u| u.project_id);
@@ -407,7 +376,6 @@ impl State {
         );
     }
 
-    /// Opens Curator on the flags waiting for review, scoped to a project when there is one.
     pub fn open_flag_review(&mut self, project_id: Option<i64>, tx: &mut Tx) {
         match project_id {
             Some(id) => self.start_project_curator(id, tx),
@@ -419,7 +387,6 @@ impl State {
         }
     }
 
-    /// The open flag raised from this Feed update, if it's still waiting for review.
     pub fn open_flag_for_update(&self, update_id: i64) -> bool {
         self.notebook.gardener.open_flags.iter().any(|f| f.source_update_id == Some(update_id))
     }
@@ -446,7 +413,6 @@ impl State {
         }
     }
 
-    /// Checks the editor's note and saves it, or surfaces what's missing inline.
     pub fn notebook_save(&mut self) {
         let Some(editor) = self.notebook.editor.as_mut() else { return };
         let draft = match editor.draft().checked() {
@@ -490,7 +456,6 @@ impl State {
         );
     }
 
-    /// Esc inside the notebook unwinds overlays -> editor -> delete confirmation -> open page -> search query.
     pub fn notebook_escape(&mut self) -> bool {
         let nb = &mut self.notebook;
         if nb.action_menu_open {
@@ -526,7 +491,6 @@ impl State {
     }
 }
 
-/// The open editor's field `pick` chooses, or the scratch field once the editor has closed.
 fn editor_field(s: &mut State, pick: fn(&mut Editor) -> &mut TextEdit) -> &mut TextEdit {
     match s.notebook.editor.as_mut() {
         Some(ed) => pick(ed),
@@ -549,8 +513,6 @@ pub fn view(s: &State, p: &Palette, k: &Kit, inset: f32, reduced_motion: bool, l
         index_view(s, p, k, reduced_motion)
     };
 
-    // The Gardener page reads as a conversation: it follows new output and keeps its composer
-    // pinned under the scroll area.
     let gardener = nb.editor.is_none() && nb.open.is_none() && nb.shelf == Shelf::Gardener;
     let following = gardener && !nb.chat.items.is_empty();
     let scroll_key = match (&nb.editor, nb.open, &nb.shelf) {
@@ -583,13 +545,14 @@ pub fn view(s: &State, p: &Palette, k: &Kit, inset: f32, reduced_motion: bool, l
     } else {
         scroll_area
     };
-    // The white sheet is for reading and writing a note; the index and Curator sit on the window.
     let reading = nb.open.is_some() || nb.editor.is_some();
     let main_area = col()
         .key("nb-main-area")
-        .on_layout(|s: &mut State, r| {
+        .on_layout_tx(|s: &mut State, r, tx| {
             if r[2] > 0.0 && (r[2] - s.notebook.main_w).abs() > 0.5 {
                 s.notebook.main_w = r[2];
+            } else {
+                tx.live_only();
             }
         })
         .w_full()
@@ -611,7 +574,6 @@ pub fn view(s: &State, p: &Palette, k: &Kit, inset: f32, reduced_motion: bool, l
         .build(&if reading { style::pane_kit(k) } else { style::open_pane_kit(k) })
 }
 
-/// A small button's inline padding, so a plain crumb's label sits where a pressable one's does.
 const CRUMB_PAD: f32 = 10.0;
 
 fn toolbar_breadcrumb(nb: &Notebook, p: &Palette, k: &Kit) -> El {
@@ -695,7 +657,6 @@ fn sidebar_view(s: &State, p: &Palette, k: &Kit) -> El {
     let search = search_input.build(k).key("nb-search");
 
     let gardener_selected = nb.editor.is_none() && nb.open.is_none() && nb.shelf == Shelf::Gardener;
-    // Plain icon rows, the way ChatGPT, Grok and Notion start a sidebar: the new-thing action, then places.
     let new_row = if gardener_selected {
         crate::gardener::new_chat_row(k)
     } else {
@@ -719,21 +680,17 @@ fn sidebar_view(s: &State, p: &Palette, k: &Kit) -> El {
         .pb(8.0)
         .gap(8.0)
         .child(search)
-        // A list parent so VoiceOver reads the rows as a list (SidebarRow is a listitem).
         .child(col().w_full().gap(2.0).role("list").label("Notebook").child(new_row).child(all_row));
 
-    // In Curator the sidebar lists its chats, the way AI apps keep threads beside the conversation.
     if gardener_selected {
         return col()
             .key("nb-sidebar")
             .w_full()
             .h_full()
             .min_h(0.0)
-            // Room for the settings gear pinned in the window's bottom-left corner.
             .pb(SETTINGS_CORNER_H)
             .instant_changes()
             .child(header)
-            // Date groups are the history's only headers.
             .child(col().w_full().grow(1.0).min_h(0.0).child(crate::gardener::thread_list(s, k)));
     }
 
@@ -842,10 +799,8 @@ fn index_view(s: &State, p: &Palette, k: &Kit, reduced_motion: bool) -> El {
         }
         list = list.child(empty);
     } else if let Shelf::Topic(topic) = &nb.shelf {
-        // The heading already names the category.
         list = list.child(card_grid(s, &pages, topic_rank(topic), p));
     } else {
-        // One parent grouping: each category once with its notes as cards, most recent first.
         let mut groups: Vec<(&str, Vec<&Page>)> = Vec::new();
         for page in pages {
             match groups.iter_mut().find(|(topic, _)| *topic == page.topic.as_str()) {
@@ -881,7 +836,6 @@ fn index_view(s: &State, p: &Palette, k: &Kit, reduced_motion: bool) -> El {
     col().w_full().child(header).child(list)
 }
 
-/// Cards in as many equal columns as fit, so each row spans the full content width edge to edge.
 fn card_grid(s: &State, pages: &[&Page], rank: usize, p: &Palette) -> El {
     let main_w = if s.notebook.main_w > 0.0 { s.notebook.main_w } else { (s.window_size[0] - 240.0).max(320.0) };
     let avail = (main_w - INDEX_PAD * 2.0).max(200.0);
@@ -900,7 +854,6 @@ fn card_grid(s: &State, pages: &[&Page], rank: usize, p: &Palette) -> El {
     grid
 }
 
-/// A note in the index grid: title, the first lines of what it says, and when it changed.
 fn index_card(s: &State, page: &Page, rank: usize, p: &Palette) -> El {
     let id = page.id;
     let title = row()
@@ -945,8 +898,6 @@ struct CategoryDuotone {
     border: Color,
 }
 
-/// One monochromatic duotone palette per parent category, spread around the OKLCH hue wheel
-/// via the golden angle so every category gets its own distinct color family.
 fn category_duotone(seed: u64, rank: usize, dark: bool) -> CategoryDuotone {
     const GOLDEN_ANGLE: f32 = 137.507_77;
     let jitter = ((seed >> 8) % 100) as f32 / 100.0 * 10.0 - 5.0;
@@ -958,8 +909,6 @@ fn category_duotone(seed: u64, rank: usize, dark: bool) -> CategoryDuotone {
     CategoryDuotone { hue, ground, bright, dim, border }
 }
 
-/// A category's pattern: dots in a category-unique monochromatic duotone, drawn from the
-/// category's name, so every note in a category shares it and no two categories match.
 fn pattern_tile(topic: &str, rank: usize, dark: bool) -> El {
     let seed = topic.bytes().fold(0xcbf2_9ce4_8422_2325_u64, |h, b| (h ^ u64::from(b)).wrapping_mul(0x0100_0000_01b3));
     memo(format!("nb-pattern-{topic}"), (seed, rank, dark), || {
@@ -972,7 +921,6 @@ fn pattern_tile(topic: &str, rank: usize, dark: bool) -> El {
             rng ^= rng << 17;
             (rng >> 11) as f32 / (1u64 << 53) as f32
         };
-        // Kinds cycle through the categories; the seed varies direction, spacing and phase.
         let kind = rank % 6;
         let (freq, phase, angle, cx, cy) =
             (2.0 + next() * 4.0, next() * std::f32::consts::TAU, next() * std::f32::consts::PI, next(), next());
@@ -983,7 +931,6 @@ fn pattern_tile(topic: &str, rank: usize, dark: bool) -> El {
         let n = (TILE / PITCH).floor() as usize;
         let inset = (TILE - (n as f32 - 1.0) * PITCH - DOT) / 2.0;
         let mut tile = el().size(TILE, TILE).radius(8.0).clip_rounded(8.0).fill(palette.ground).border(1.0, palette.border);
-        // Which way a fade runs: up, down, from the left or across a diagonal.
         let dir = (seed >> 3) % 4;
         for row_i in 0..n {
             for col_i in 0..n {
@@ -994,7 +941,6 @@ fn pattern_tile(topic: &str, rank: usize, dark: bool) -> El {
                 }
                 let r = next();
                 let on = match kind {
-                    // A field of dots thinning out towards one edge.
                     0 => {
                         let t = match dir {
                             0 => v,
@@ -1004,15 +950,10 @@ fn pattern_tile(topic: &str, rank: usize, dark: bool) -> El {
                         };
                         r < t.powf(1.3)
                     }
-                    // Diagonal bands.
                     1 => ((u * angle.cos() + v * angle.sin()) * freq + phase).rem_euclid(1.0) < 0.45,
-                    // Rings around a point.
                     2 => (((u - cx).hypot(v - cy)) * freq * 1.5).rem_euclid(1.0) < 0.5,
-                    // A wave, solid below it.
                     3 => v > 0.5 + 0.28 * (u * freq * 1.2 + phase).sin() - r * 0.08,
-                    // A checker of blocks.
                     4 => (((u * freq * 1.5) as i32 + (v * freq * 1.5) as i32) % 2 == 0) && r < 0.9,
-                    // Scatter.
                     _ => r < 0.36,
                 };
                 if !on {
@@ -1028,7 +969,6 @@ fn pattern_tile(topic: &str, rank: usize, dark: bool) -> El {
     })
 }
 
-/// The note's opening prose for a card: headings and blank lines skipped, Markdown marks dropped.
 fn card_excerpt(body: &str) -> String {
     let mut out = String::new();
     for line in body.lines().map(str::trim) {
@@ -1164,7 +1104,6 @@ fn page_view(s: &State, page: &Page, p: &Palette, k: &Kit, layer: &mut Vec<El>) 
         doc = doc.child(confirm);
     }
 
-    // Spacious Notion/Obsidian article header: title + single quiet metadata line.
     let mut title_line = col().w_full().gap(8.0).child(text(page.title.clone()).font(style::TITLE).color(p.text).wrap());
     if page.is_archived() {
         title_line = title_line.child(row().child(Badge::new("Archived").variant(BadgeVariant::Neutral).standard().build(k)));
@@ -1192,15 +1131,12 @@ fn page_view(s: &State, page: &Page, p: &Palette, k: &Kit, layer: &mut Vec<El>) 
         ago(page.created_at, s.now)
     };
 
-    // One quiet line: the category the note lives in, and when it last changed.
     let meta =
         row().key("nb-meta").w_full().mt(12.0).gap(8.0).center_y().child(topic_pill).child(text(revised).font(style::META).color(p.text_3));
     doc = doc.child(meta);
 
-    // Freeform Markdown article body with callouts, tables, syntax highlighting, and interactive tasks.
     doc = doc.child(render_article_markdown(&page.body, Some(id), p, k).mt(28.0));
 
-    // The Notebook as a graph: notes that point here, then notes nearby by link, tag or category.
     let backlinks = linked_from(&s.notebook, id);
     if !backlinks.is_empty() {
         doc = doc.child(Divider::horizontal().build(k).mt(36.0)).child(page_list("Linked from", "nb-backlink", &backlinks, p, k));
@@ -1216,7 +1152,6 @@ fn page_view(s: &State, page: &Page, p: &Palette, k: &Kit, layer: &mut Vec<El>) 
     doc
 }
 
-/// The empty-search hand-off to Curator: the question, the agent that will answer, one press.
 fn ask_curator_card(s: &State, question: &str, agent: feeder_core::gardener::Backend, p: &Palette, k: &Kit) -> El {
     let q = question.to_string();
     row()
@@ -1243,7 +1178,6 @@ fn ask_curator_card(s: &State, question: &str, agent: feeder_core::gardener::Bac
         .child(icon(&crate::gardener::SEND_ICON, 14.0).color(p.text_3).a11y_hidden())
 }
 
-/// A titled list of note rows, used for Linked from and Related.
 fn page_list(title: &str, key: &str, pages: &[&Page], p: &Palette, k: &Kit) -> El {
     let mut list = col().w_full().mt(36.0).gap(4.0).child(text(title.to_string()).font(style::HEADING).color(p.text_2).mb(6.0));
     for r in pages {
@@ -1269,20 +1203,17 @@ fn page_list(title: &str, key: &str, pages: &[&Page], p: &Palette, k: &Kit) -> E
     list
 }
 
-/// Whether `body` links to note `id` with a `feeder://notebook/ID` link.
 fn links_to(body: &str, id: i64) -> bool {
     let target = format!("feeder://notebook/{id}");
     body.match_indices(&target).any(|(at, _)| !body[at + target.len()..].starts_with(|c: char| c.is_ascii_digit()))
 }
 
-/// Current notes whose text links to note `id`, most recently updated first.
 fn linked_from(nb: &Notebook, id: i64) -> Vec<&Page> {
     let mut pages: Vec<&Page> = nb.current().filter(|p| p.id != id && links_to(&p.body, id)).collect();
     pages.sort_by_key(|p| std::cmp::Reverse(p.updated_at));
     pages
 }
 
-/// Up to three current pages related by a direct link, shared tags or matching category.
 fn related_pages<'a>(nb: &'a Notebook, page: &Page) -> Vec<&'a Page> {
     let mut scored: Vec<(usize, &Page)> = nb
         .current()
@@ -1298,8 +1229,6 @@ fn related_pages<'a>(nb: &'a Notebook, page: &Page) -> Vec<&'a Page> {
     scored.sort_by(|a, b| b.0.cmp(&a.0).then(b.1.helped.cmp(&a.1.helped)).then(b.1.updated_at.cmp(&a.1.updated_at)));
     scored.into_iter().take(3).map(|(_, p)| p).collect()
 }
-
-// ── Rich Article Renderer (GFM + Obsidian Callouts + Interactive Tasks) ──
 
 static CALLOUT_NOTE_ICON: Icon = Icon {
     name: "nb-callout-note",
@@ -1372,7 +1301,6 @@ impl CalloutKind {
         }
     }
 
-    /// Quiet, low-chroma tint for the callout's small leading glyph — never neon, never a left bar.
     fn icon_color(self, p: &Palette) -> Color {
         match self {
             Self::Note => p.text_2,
@@ -1506,12 +1434,8 @@ fn split_article_chunks(src: &str) -> Vec<ArticleChunk> {
     chunks
 }
 
-/// How long each newly streamed word takes to fade in, in seconds.
 const LIVE_WORD_FADE: f32 = 0.22;
 
-/// A reply still arriving from Curator: Rune's streaming Markdown, so unfinished emphasis, links
-/// and tables draw as what they're becoming instead of flashing raw markers, with each new word
-/// fading in (shown at once under Reduce Motion).
 pub(crate) fn render_live_markdown(src: &str, reduced_motion: bool, p: &Palette, k: &Kit) -> El {
     let md_style = feed::markdown_style(p, k).body_font(style::PROSE);
     Markdown::new(src.to_string())
@@ -1588,8 +1512,6 @@ pub(crate) fn render_article_markdown(src: &str, page_id: Option<i64>, p: &Palet
     stack
 }
 
-// ── Borderless Notion/Obsidian Freeform Editor ──
-
 #[derive(Clone, Copy)]
 enum MdAction {
     Heading(usize),
@@ -1625,7 +1547,6 @@ fn editor_view(nb: &Notebook, ed: &Editor, p: &Palette, k: &Kit, layer: &mut Vec
         .on_press(|s: &mut State| s.notebook_save())
         .build(k);
 
-    // Single minimal category selector — borderless inline pill right on the top row.
     let mut topic_options: Vec<(String, TopicChoice)> = Vec::new();
     if ed.id.is_none() {
         let inferred = infer_topic(&ed.tags, &ed.title.text, &ed.body.text);
@@ -1717,7 +1638,6 @@ fn editor_view(nb: &Notebook, ed: &Editor, p: &Palette, k: &Kit, layer: &mut Vec
         .child(cancel.ml(4.0))
         .child(save);
 
-    // Borderless large Notion/Obsidian title directly on the page surface.
     let title_el = if ed.preview {
         let heading = if ed.title.text.trim().is_empty() { "Untitled".to_string() } else { ed.title.text.trim().to_string() };
         text(heading).font(style::TITLE).color(p.text).wrap()
@@ -1936,7 +1856,6 @@ fn smart_enter_edit(edit: &mut TextEdit) {
     if let Some((marker_len, next_prefix)) = continuation {
         let marker_end = indent_len + marker_len;
         if before_caret.len() >= marker_end {
-            // Pressing Enter on an empty list/quote line exits the list cleanly.
             if line[marker_end..].trim().is_empty() && start == line_range.end {
                 let mut updated = edit.text.clone();
                 updated.replace_range(line_range.start..line_range.end, "");
@@ -1986,7 +1905,6 @@ fn apply_md_action(edit: &mut TextEdit, action: MdAction) {
             let (start, end) = edit.range();
             let text_len = edit.text.len();
             if start < end {
-                // If already wrapped right around selection, unwrap cleanly.
                 let wrapped_around = start >= before.len()
                     && end + after.len() <= text_len
                     && &edit.text[start - before.len()..start] == before
@@ -2096,11 +2014,6 @@ fn apply_md_action(edit: &mut TextEdit, action: MdAction) {
     }
 }
 
-// ── Live Obsidian-Style Markdown Decorations ──
-
-/// Produces live styled [`Span`] decorations for raw Markdown inside the borderless editor:
-/// larger bold headings with faint `#`, inline bold/italic/code pills, syntax-highlighted fenced
-/// code blocks, callout headers, list/task markers, and underlined links.
 fn markdown_decorations(src: &str, p: &Palette, k: &Kit) -> Vec<Span> {
     let mut spans = Vec::new();
     let syntax_theme = SyntaxTheme::from_kit(k);
@@ -2149,13 +2062,11 @@ fn markdown_decorations(src: &str, p: &Palette, k: &Kit) -> Vec<Span> {
             continue;
         }
 
-        // Horizontal rule
         if matches!(trimmed, "---" | "***" | "___") {
             spans.push(Span::new(line_start, line_end).color(syntax_dim));
             continue;
         }
 
-        // ATX Headings (# .. ####)
         let hashes = line.bytes().take_while(|&b| b == b'#').count();
         if (1..=4).contains(&hashes) && line[hashes..].starts_with(' ') {
             let size = match hashes {
@@ -2166,12 +2077,11 @@ fn markdown_decorations(src: &str, p: &Palette, k: &Kit) -> Vec<Span> {
             };
             spans.push(Span::new(line_start, line_start + hashes + 1).size(size).color(syntax_dim));
             if line_start + hashes + 1 < line_end {
-                spans.push(Span::new(line_start + hashes + 1, line_end).size(size).weight(600.0).color(p.text));
+                spans.push(Span::new(line_start + hashes + 1, line_end).size(size).weight(style::MEDIUM).color(p.text));
             }
             continue;
         }
 
-        // Obsidian callout header: `> [!tip] Optional title`
         if parse_callout_header(line).is_some() {
             let tag_end = line.find(']').map(|idx| line_start + idx + 1).unwrap_or(line_end);
             spans.push(Span::new(line_start, tag_end).mono().color(syntax_dim));
@@ -2181,7 +2091,6 @@ fn markdown_decorations(src: &str, p: &Palette, k: &Kit) -> Vec<Span> {
             continue;
         }
 
-        // Blockquotes
         let indent = line.len() - trimmed.len();
         let mut content_offset = line_start + indent;
         if let Some(after_q) = trimmed.strip_prefix('>') {
@@ -2194,7 +2103,6 @@ fn markdown_decorations(src: &str, p: &Palette, k: &Kit) -> Vec<Span> {
             continue;
         }
 
-        // Task list or unordered/ordered list marker
         if trimmed.starts_with("- [ ] ") || trimmed.starts_with("- [x] ") || trimmed.starts_with("- [X] ") {
             let done = trimmed.as_bytes()[3] != b' ';
             let marker_end = content_offset + 6;
@@ -2218,7 +2126,6 @@ fn markdown_decorations(src: &str, p: &Palette, k: &Kit) -> Vec<Span> {
         }
     }
 
-    // Highlight an unclosed code fence while the user is actively typing inside it.
     if in_fence && fence_body_start < src.len() {
         let code_slice = &src[fence_body_start..];
         spans.push(Span::new(fence_body_start, src.len()).mono().size(13.0));
@@ -2235,7 +2142,6 @@ fn decorate_inline(text: &str, base: usize, p: &Palette, dim: Color, code_bg: Co
     let mut i = 0usize;
 
     while i < len {
-        // Inline code: `code`
         if bytes[i] == b'`'
             && let Some(rel) = text[i + 1..].find('`')
             && rel > 0
@@ -2248,7 +2154,6 @@ fn decorate_inline(text: &str, base: usize, p: &Palette, dim: Color, code_bg: Co
             continue;
         }
 
-        // Bold: **text**
         if i + 3 < len
             && bytes[i] == b'*'
             && bytes[i + 1] == b'*'
@@ -2263,7 +2168,6 @@ fn decorate_inline(text: &str, base: usize, p: &Palette, dim: Color, code_bg: Co
             continue;
         }
 
-        // Italic: *text*
         if i + 2 < len
             && bytes[i] == b'*'
             && bytes[i + 1] != b'*'
@@ -2279,7 +2183,6 @@ fn decorate_inline(text: &str, base: usize, p: &Palette, dim: Color, code_bg: Co
             continue;
         }
 
-        // Markdown link: [label](url)
         if bytes[i] == b'['
             && let Some(mid_rel) = text[i + 1..].find("](")
             && let Some(end_rel) = text[i + 1 + mid_rel + 2..].find(')')
@@ -2451,11 +2354,9 @@ mod tests {
         edit.set_selection(6, 11);
         apply_md_action(&mut edit, MdAction::Wrap("**", "**", "bold"));
         assert_eq!(edit.text, "hello **world**");
-        // Applying again unwraps cleanly.
         apply_md_action(&mut edit, MdAction::Wrap("**", "**", "bold"));
         assert_eq!(edit.text, "hello world");
 
-        // Heading toggle & level switch.
         edit.set_caret(0);
         apply_md_action(&mut edit, MdAction::Heading(2));
         assert_eq!(edit.text, "## hello world");
@@ -2464,7 +2365,6 @@ mod tests {
         apply_md_action(&mut edit, MdAction::Heading(1));
         assert_eq!(edit.text, "hello world");
 
-        // Smart enter continues checklist & exits on empty item.
         let mut list = TextEdit::new("- [ ] Ship carousels");
         list.set_caret(list.text.len());
         smart_enter_edit(&mut list);

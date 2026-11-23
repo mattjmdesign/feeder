@@ -1,8 +1,3 @@
-//! Feeder: every project as an orb, and behind each one a feed of what its agents last did.
-//!
-//! `cargo run -p feeder-app` opens the window on the real store. Headless runs read it too:
-//! `-- --snap home.png`. `--scene app-icon` draws the Dock icon (`scripts/mac-app.sh` uses it).
-
 mod agents;
 mod chrome;
 mod connect;
@@ -31,11 +26,15 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use std::process::{Child, Command};
 use std::sync::atomic::AtomicUsize;
+use std::sync::mpsc::{Receiver, TryRecvError};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
 use feeder_core::{FeedUpdate, ProjectSummary, Reply, Settings, Theme, now_ms, parse_attention};
-use rune::{AppSpec, Cx, El, Image, ImageCache, Player, PointerPress, Taskbar, TextEdit, Tx, Waker, WindowHandle, col, el};
+use rune::{
+    AppSpec, ClipboardContent, ClipboardImage, Cx, El, Image, ImageCache, Player, PointerPress, Taskbar, TextEdit, Tx, Waker, WindowHandle,
+    col, el,
+};
 use rune_kit::search::Fold;
 use rune_kit::shell::TOOLBAR_HEIGHT;
 use rune_kit::{ImageZoom, ToastEvent, ToastStack};
@@ -51,7 +50,6 @@ fn window_slot() -> &'static Mutex<Option<WindowHandle>> {
     WINDOW_HANDLE.get_or_init(|| Mutex::new(None))
 }
 
-/// The top-level views. The app opens on Home.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
 pub enum Tab {
     #[default]
@@ -83,17 +81,9 @@ pub enum HomeFilter {
 #[derive(Clone, Debug, PartialEq)]
 pub enum ToastKind {
     Info,
-    UndoArchive {
-        project_id: i64,
-        was_archived: bool,
-    },
-    UndoDismiss {
-        update_id: i64,
-    },
-    /// A Feed update went to Curator; the action opens its project's review.
-    Flagged {
-        project_id: Option<i64>,
-    },
+    UndoArchive { project_id: i64, was_archived: bool },
+    UndoDismiss { update_id: i64 },
+    Flagged { project_id: Option<i64> },
     Error,
 }
 
@@ -116,26 +106,19 @@ pub enum CopyTarget {
 
 pub struct State {
     pub tab: Tab,
-    /// The Notebook tab: shared lessons across projects.
     pub notebook: notebook::Notebook,
-    /// The project's Files view: its working tree as a map and a list.
     pub files: files::FilesState,
     curator_sign_in: curator_sign_in::SignIn,
     pub curator: curator_settings::Curator,
     window_visible: bool,
     pub projects: Vec<ProjectSummary>,
-    /// Every project's updates, newest first (the Feed tab).
     pub timeline: Vec<FeedUpdate>,
     pub timeline_limit: usize,
-    /// Two-way replies keyed by `update_id`.
     pub replies: HashMap<i64, Vec<Reply>>,
-    /// The most timeline posts asked of the watcher, shared with the scroll handler.
     timeline_asked: Arc<AtomicUsize>,
     pub loaded: bool,
-    /// The project whose feed is showing.
     pub open: Option<i64>,
     pub feed: Vec<FeedUpdate>,
-    /// Which project `feed` belongs to, so a stale feed never shows under another project.
     pub feed_for: Option<i64>,
     pub limit: usize,
     pub hovered: Option<i64>,
@@ -150,60 +133,39 @@ pub struct State {
     pub clock: f64,
     pub window_size: [f32; 2],
     pub error: Option<String>,
-    /// The nickname being typed for the open project.
     pub editing: Option<TextEdit>,
-    /// What a text field's keystrokes edit if they land after its editor closed (a key event
-    /// already queued that frame), so `on_edit` never has to panic.
     pub scratch_edit: TextEdit,
-    /// Pinned brief editing state for a project id.
     pub brief_editing: Option<i64>,
     pub brief_draft: TextEdit,
-    /// Inline update edit state.
     pub editing_update: Option<i64>,
     pub edit_update_body: TextEdit,
-    /// Inline reply composer state.
     pub replying_to: Option<i64>,
     pub reply_draft: TextEdit,
-    /// Draw only the app icon (the `app-icon` scene).
     pub icon: bool,
     pub settings: Settings,
     pub settings_open: bool,
     pub settings_page: chrome::SettingsPage,
-    /// Settings → Connected Tools: installed tools and whether each starts Feeder.
     pub agents: connect::Agents,
     #[cfg(feeder_sparkle)]
     pub updates: updater::Updates,
     pub menu_open: bool,
-    /// Whether archived projects are currently expanded on Home.
     pub show_archived: bool,
-    /// Context menu open for an orb tile on Home: `(project_id, pointer)`.
     pub orb_menu: Option<(i64, PointerPress)>,
-    /// Media id (`update_media.id`) open in the lightbox modal.
     pub lightbox: Option<i64>,
     pub lightbox_zoom: ImageZoom,
-    /// Secondary media id for Before/After swipe compare in lightbox.
     pub lightbox_compare: Option<i64>,
-    /// Split fraction `0.02..=0.98` for Before/After compare divider.
     pub lightbox_split: f32,
-    /// Active carousel slide index keyed by `update_id`.
     pub card_slide: HashMap<i64, usize>,
-    /// Quick Jump (`⌘K`) command palette state.
     pub palette_open: bool,
     pub palette_query: TextEdit,
     pub palette_index: usize,
-    /// Feed filter bar state.
     pub feed_search: TextEdit,
-    /// Full-history DB search state driven by `feed_search` or `palette_query`.
     pub search_query: String,
     pub search_snapshot_query: String,
     pub search_hits: Vec<FeedUpdate>,
-    /// Update id awaiting delete confirmation.
     pub delete_confirm: Option<i64>,
-    /// The Feed post whose ⋯ menu is open.
     pub post_menu: Option<i64>,
-    /// Unified `(target, copied_at_ms)` for transient "Copied" button labels.
     pub copy_feedback: Option<(CopyTarget, i64)>,
-    /// Bottom-right toast notifications (undo archive, copy image, watcher errors).
     pub toasts: ToastStack<ToastItem>,
     pub pending_url: Option<String>,
     pub pending_scroll: Option<String>,
@@ -211,20 +173,17 @@ pub struct State {
     watcher: Option<Watcher>,
     pub(crate) wake: Option<Waker>,
     pub(crate) images: Option<ImageCache>,
-    /// Decoded screenshots keyed by `media_id`.
     pub shots: HashMap<i64, Image>,
-    /// Visible row ranges reported by the virtualized Feed and Project Updates lists.
     pub feed_visible_rows: Option<std::ops::Range<usize>>,
     pub project_visible_rows: Option<std::ops::Range<usize>>,
-    /// Video players keyed by `media_id`.
     pub videos: HashMap<i64, Player>,
-    /// App icons for agents without a logo, by agent name.
     pub agent_icons: HashMap<String, Image>,
     shots_ready: usize,
     seen_max_update_id: i64,
     last_pulse_tick: f64,
     last_video_tick: f64,
     menubar_child: Option<Child>,
+    pub(crate) clipboard_image_rx: Option<Receiver<Result<ClipboardImage, String>>>,
 }
 
 impl Drop for State {
@@ -314,6 +273,7 @@ impl State {
             last_pulse_tick: 0.0,
             last_video_tick: 0.0,
             menubar_child: None,
+            clipboard_image_rx: None,
         }
     }
 
@@ -365,8 +325,6 @@ impl State {
         self.pending_scroll = None;
         self.project_visible_rows = None;
         self.limit = PAGE;
-        // Pre-seed synchronously from timeline updates so Frame 0 renders cards & cached shots
-        // immediately without waiting on the Watcher background round-trip.
         let seeded: Vec<FeedUpdate> = self.timeline.iter().filter(|u| u.project_id == id).cloned().collect();
         if !seeded.is_empty() || self.summary(id).is_some_and(|sum| sum.updates == 0) {
             self.feed = seeded;
@@ -419,7 +377,6 @@ impl State {
         self.set_card_slide(update_id, next);
     }
 
-    /// Shows slide `idx` and loads its image, which wasn't decoded while hidden.
     pub fn set_card_slide(&mut self, update_id: i64, idx: usize) {
         self.card_slide.insert(update_id, idx);
         media::sync(self);
@@ -462,7 +419,6 @@ impl State {
             return;
         }
         let Some(id) = self.lightbox else { return };
-        // Prefer comparing against another slide from the same update first (ideal for before/after pairs).
         let same_update_other =
             self.find_media(id).and_then(|(_, _, slides)| slides.into_iter().find(|s| s.id != id && s.is_image()).map(|s| s.id));
         let other = same_update_other.or_else(|| {
@@ -758,7 +714,6 @@ impl State {
         tx.focus_when_shown("rename", false);
     }
 
-    /// Saves the typed nickname; an empty one goes back to the folder's name.
     pub fn commit_rename(&mut self) {
         let (Some(id), Some(edit)) = (self.open, self.editing.take()) else { return };
         let typed = edit.text.trim().to_string();
@@ -778,7 +733,6 @@ impl State {
         self.editing = None;
     }
 
-    /// Saves off the UI thread.
     pub fn save_settings(&self) {
         if let Some(w) = &self.watcher {
             w.save_settings(self.settings);
@@ -841,7 +795,6 @@ impl State {
 
     pub fn select_tab(&mut self, tab: Tab, tx: &mut Tx) {
         if self.tab != tab || self.open.is_some() {
-            // Swap the whole page in one frame so the old page cannot cover the new one.
             tx.instant();
         }
         if self.open.is_some() {
@@ -982,7 +935,6 @@ impl State {
         self.feed.iter().chain(&self.timeline).chain(&self.search_hits).find(|u| u.id == id)
     }
 
-    /// Finds the update, 0-based slide index, and full slide list containing `media_id`.
     pub fn find_media(&self, media_id: i64) -> Option<(&FeedUpdate, usize, Vec<MediaSlide>)> {
         for u in self.feed.iter().chain(&self.timeline).chain(&self.search_hits) {
             let slides = media_slides(u);
@@ -1031,13 +983,11 @@ impl State {
 
     fn ask(&self) {
         if let Some(w) = &self.watcher {
-            // Git is read only while a project's Files view is showing.
             let files = self.window_visible && self.open.is_some() && self.files.view == files::ProjectView::Files;
             w.want(Want { project: self.open, limit: self.limit, files, visible: self.window_visible });
         }
     }
 
-    /// True only when a breathing orb pulse halo is actually drawn on screen.
     fn pulse_halo_visible(&self) -> bool {
         if !self.window_visible {
             return false;
@@ -1083,7 +1033,6 @@ fn view(s: &State, cx: &mut Cx<State>) -> El {
         let header = chrome::bar(s, &p, &k, inset, leading, trailing);
         let page = match s.open {
             Some(id) if s.files.view == files::ProjectView::Files => {
-                // The space under the bar, from the last frame's window size.
                 let [w, h] = cx.layout_size("shell").unwrap_or([1180.0, 760.0]);
                 files::view(s, id, &p, &k, [w, h - TOOLBAR_HEIGHT])
             }
@@ -1105,9 +1054,11 @@ fn view(s: &State, cx: &mut Cx<State>) -> El {
         .w_full()
         .h_full()
         .fill(p.bg)
-        .on_layout(|s: &mut State, r| {
-            if r[2] > 0.0 && r[3] > 0.0 {
+        .on_layout_tx(|s: &mut State, r, tx| {
+            if r[2] > 0.0 && r[3] > 0.0 && ((r[2] - s.window_size[0]).abs() > 0.5 || (r[3] - s.window_size[1]).abs() > 0.5) {
                 s.window_size = [r[2], r[3]];
+            } else {
+                tx.live_only();
             }
         })
         .child(shell)
@@ -1138,6 +1089,34 @@ fn poll(s: &mut State, clock: f64, tx: &mut Tx) -> bool {
     s.curator_sign_in.follow_accounts(s.settings_open && s.settings_page == chrome::SettingsPage::Curator, s.wake.as_ref());
     changed |= s.curator_sign_in.poll();
     changed |= s.curator.poll();
+    if let Some(rx) = &s.clipboard_image_rx {
+        match rx.try_recv() {
+            Ok(Ok(img)) => {
+                tx.copy_rich(ClipboardContent::new("").with_image(img));
+                s.mark_copied(CopyTarget::LightboxImage);
+                s.push_toast(
+                    "copy-image",
+                    ToastItem { title: "Copied screenshot to clipboard".into(), description: None, kind: ToastKind::Info },
+                    Some(2.5),
+                );
+                s.clipboard_image_rx = None;
+                changed = true;
+            }
+            Ok(Err(err)) => {
+                s.push_toast(
+                    "copy-image-err",
+                    ToastItem { title: "Couldn't copy image".into(), description: Some(err), kind: ToastKind::Error },
+                    Some(4.0),
+                );
+                s.clipboard_image_rx = None;
+                changed = true;
+            }
+            Err(TryRecvError::Empty) => {}
+            Err(TryRecvError::Disconnected) => {
+                s.clipboard_image_rx = None;
+            }
+        }
+    }
     if s.settings_open && s.settings_page == chrome::SettingsPage::Curator {
         let wake = s.wake.clone();
         for b in s.curator.prefs.enabled() {
@@ -1191,7 +1170,6 @@ fn poll(s: &mut State, clock: f64, tx: &mut Tx) -> bool {
     }
 
     if let Some(snap) = s.watcher.as_ref().and_then(Watcher::take) {
-        // The first load lands still, so launch draws one settled frame.
         let was_loaded = s.loaded;
         if !s.loaded {
             tx.instant();
@@ -1219,7 +1197,7 @@ fn poll(s: &mut State, clock: f64, tx: &mut Tx) -> bool {
         if let Some(pages) = snap.pages {
             s.notebook.set_pages(pages);
             if s.notebook.open.is_some_and(|id| s.notebook.page(id).is_none()) {
-                s.notebook.open = None; // deleted from another client
+                s.notebook.open = None;
             }
         }
         if let Some(mut g) = snap.gardener {
@@ -1286,7 +1264,7 @@ fn poll(s: &mut State, clock: f64, tx: &mut Tx) -> bool {
             && s.error.is_none()
             && s.summary(id).is_none()
         {
-            s.open = None; // removed from another client
+            s.open = None;
         }
         media::sync(s);
         if let Some(id) = s.lightbox
@@ -1337,10 +1315,8 @@ fn poll(s: &mut State, clock: f64, tx: &mut Tx) -> bool {
         s.last_badge = Some(unseen);
     }
 
-    // Keep decoded images and preloaded videos scoped to what the current view can display.
     media::sync(s);
 
-    // Gentle breathing halo animation only when a pulsing orb halo is actually visible.
     if rune::tooling::headless_run().is_none() && s.pulse_halo_visible() {
         if clock - s.last_pulse_tick >= 0.065 {
             s.last_pulse_tick = clock;
@@ -1349,7 +1325,6 @@ fn poll(s: &mut State, clock: f64, tx: &mut Tx) -> bool {
         tx.wake_after(Duration::from_millis(70));
     }
 
-    // A screenshot that finished decoding needs a commit to take its height.
     let ready = s.shots.values().chain(s.agent_icons.values()).filter(|i| i.is_ready()).count();
     if ready != s.shots_ready {
         s.shots_ready = ready;
@@ -1366,7 +1341,6 @@ fn poll(s: &mut State, clock: f64, tx: &mut Tx) -> bool {
             tx.wake_after(Duration::from_millis(remaining + 50));
         }
     }
-    // Keep "2m ago" honest.
     if now - s.now >= 30_000 {
         s.now = now;
         changed = true;
@@ -1390,11 +1364,8 @@ fn is_app_icon_scene() -> bool {
 
 #[cfg(target_os = "macos")]
 fn system_font_faces() -> &'static [&'static [u8]] {
-    // Register the faces Rune uses for "System Font" so it checks their glyph coverage
-    // before asking Core Text to resolve the same font as a fallback.
     let Ok(regular) = std::fs::read("/System/Library/Fonts/SFNS.ttf") else { return &[] };
     let Ok(italic) = std::fs::read("/System/Library/Fonts/SFNSItalic.ttf") else { return &[] };
-    // AppSpec borrows these bytes for the lifetime of the process.
     let faces: [&'static [u8]; 2] = [regular.leak(), italic.leak()];
     Box::leak(Box::new(faces))
 }
@@ -1423,7 +1394,6 @@ fn main() {
             ("notebook-gardener-working", |s| {
                 s.tab = Tab::Notebook;
                 s.notebook.shelf = notebook::Shelf::Gardener;
-                // The demo session cut off mid-search, so the live spinner shows.
                 let mut events = feeder_core::gardener::demo_events();
                 events.truncate(11);
                 events.push(feeder_core::gardener::Event::ToolStarted(feeder_core::gardener::ToolCall {
@@ -1462,8 +1432,6 @@ fn main() {
                 use feeder_core::gardener::{Event, ToolCall};
                 s.tab = Tab::Notebook;
                 s.notebook.shelf = notebook::Shelf::Gardener;
-                // A Review chat that revised page #1, for the inline diff. Needs a demo FEEDER_HOME
-                // where Curator revised that page.
                 let events = vec![
                     Event::Started,
                     Event::Text("Flag 2 says the busy timeout and writer rule are missing, so I'm adding them to the SQLite page.".into()),
@@ -1512,7 +1480,6 @@ fn main() {
                 use feeder_core::gardener::Event;
                 s.tab = Tab::Notebook;
                 s.notebook.shelf = notebook::Shelf::Gardener;
-                // Cut mid-sentence with an unclosed emphasis and link, as a stream arrives.
                 let partial = "Open every connection in **WAL mode** and set a busy timeout. See [SQLite returns SQLITE_BUSY](feeder://noteb";
                 let events = vec![Event::Started, Event::Text(partial.into())];
                 gardener::replay(&mut s.notebook.chat, feeder_core::gardener::Backend::ClaudeCode, events);
@@ -1575,7 +1542,6 @@ fn main() {
                 s.notebook.query = TextEdit::new("appcast signing key");
             }),
             ("notebook-page-linked", |s| {
-                // Demo note #1, which another demo note links to, for Linked from.
                 s.tab = Tab::Notebook;
                 s.notebook.open = Some(1);
             }),
@@ -1624,7 +1590,6 @@ fn main() {
         fonts: system_font_faces(),
         ..AppSpec::new("Feeder", (1180.0, 760.0), State::new, view)
     })
-    // Every view's bar is rune-kit's toolbar band, so the traffic lights centre in its height.
     .titlebar(rune::Titlebar::new(TOOLBAR_HEIGHT).traffic_lights(18.0, (TOOLBAR_HEIGHT - 14.0) / 2.0))
     .on_visibility(|s, visible, _| {
         s.window_visible = visible;
@@ -1774,11 +1739,9 @@ mod tests {
         s.feed_search = TextEdit::new("fts5");
         s.search_snapshot_query = "fts5".into();
         s.search_hits.push(sample_update(99, 1, "Done: fixed search.\n\nDecision needed: keep legacy?"));
-        // Older decision card should NOT show up under NeedsYou.
         s.search_hits.push(sample_update(50, 1, "Done: earlier.\n\nDecision needed: old question?"));
         let visible = s.filtered_timeline();
         assert_eq!(visible.len(), 2);
-        // Only the latest decision is open; the older card no longer needs you.
         let open: Vec<i64> = visible.iter().filter(|(u, _)| s.is_open_attention(u)).map(|(u, _)| u.id).collect();
         assert_eq!(open, vec![99]);
 
@@ -1786,13 +1749,11 @@ mod tests {
         assert!(s.filtered_timeline().is_empty());
         s.toggle_branch_filter("feat/other");
 
-        // Dismissing clears NeedsYou optimistically and pushes an Undo toast.
         s.dismiss_attention(99);
         assert!(!s.projects[0].needs_you);
         assert!(!s.is_open_attention(&s.search_hits[0]));
         assert_eq!(s.toasts.front().unwrap().options.kind, ToastKind::UndoDismiss { update_id: 99 });
 
-        // Undoing restores NeedsYou cleanly.
         s.undismiss_attention(99);
         assert!(s.projects[0].needs_you);
         assert!(s.is_open_attention(&s.search_hits[0]));

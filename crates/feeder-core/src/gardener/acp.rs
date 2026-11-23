@@ -1,5 +1,3 @@
-//! Restricted ACP sessions for OpenCode and Antigravity.
-
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::process::Command;
@@ -38,8 +36,6 @@ pub(super) fn command(
         Backend::OpenCode => {
             let config = opencode_config(mode, run.model.as_deref());
             std::fs::write(cwd.join("opencode.json"), config.to_string())?;
-            // Account data is kept in the private profile, but model runs use only this config.
-            // `opencode acp` already spawns its own private server and rejects `--standalone`.
             let config_dir = cwd.join("config");
             std::fs::create_dir_all(&config_dir)?;
             cmd.env("XDG_CONFIG_HOME", &config_dir)
@@ -132,7 +128,6 @@ fn configure_antigravity(data: &Path, mode: SessionMode, server: &Value) -> Resu
     let config = home.join("config");
     std::fs::create_dir_all(&config)?;
     let tools: serde_json::Map<String, Value> = mode.mcp_tools().iter().map(|&name| (name.into(), json!({ "eager": true }))).collect();
-    // Antigravity's file config supports eager tools, so it never needs to read schema files.
     let feeder_home = &server["env"][0]["value"];
     let mcp = json!({
         "mcpServers": { "feeder": {
@@ -150,8 +145,6 @@ pub(super) enum Action {
     Emit(Event),
 }
 
-/// The ACP session and its outstanding requests. Provider IDs stay small safe integers
-/// (below JS `Number.MAX_SAFE_INTEGER`) and live only for this process.
 #[derive(Default)]
 pub(super) struct State {
     session: Option<String>,
@@ -160,11 +153,8 @@ pub(super) struct State {
     pending_effort: Option<u64>,
     next: u64,
     tools: HashSet<String>,
-    /// Tool calls seen in `pending` state with empty `rawInput`, waiting for populated arguments.
     pending_tools: HashMap<String, &'static str>,
-    /// A model to switch to once the session exists (`session/set_config_option` or `session/set_model`).
     pub(super) model: Option<String>,
-    /// A thinking level to apply once the session exists (`session/set_config_option`).
     pub(super) effort: Option<String>,
 }
 
@@ -311,9 +301,6 @@ impl State {
         if !self.tools.contains(id) {
             let name = tool_name(update, mode).or_else(|| self.pending_tools.get(id).copied());
             if let Some(name) = name {
-                // OpenCode emits an initial `pending` tool_call with `rawInput: {}`, then sends
-                // the real arguments on the `in_progress` tool_call_update. Hold emission until
-                // arguments arrive or execution actually begins/finishes.
                 if status == "pending" && empty_input {
                     self.pending_tools.insert(id.to_string(), name);
                     return actions;
@@ -349,8 +336,6 @@ impl State {
 
 fn check_config_response(message: &Value) -> Result<Vec<Action>> {
     if let Some(error) = message.get("error") {
-        // Older providers that don't implement `set_config_option`/`set_model` return -32601;
-        // fall back to their default. Real validation errors (invalid model or effort) surface.
         if error["code"].as_i64() == Some(-32601) {
             return Ok(Vec::new());
         }
@@ -367,9 +352,6 @@ fn tool_name(call: &Value, mode: SessionMode) -> Option<&'static str> {
     })
 }
 
-/// Strictly verifies a `session/request_permission` tool call against Feeder's MCP server tools
-/// for `mode`. Unlike display matching in [`tool_name`], this never reads `title`, requires an
-/// explicit Feeder MCP server prefix, and refuses local file/shell/network tool kinds.
 fn allowed_feeder_permission(params: &Value, active_session: Option<&str>, mode: SessionMode) -> bool {
     if active_session.is_some() && params["sessionId"].as_str() != active_session {
         return false;
@@ -572,7 +554,6 @@ mod tests {
         assert_eq!(sent[0]["params"]["modelId"], "gemini-4-neon-high");
         assert_eq!(sent[1]["id"], 4);
         assert_eq!(sent[1]["method"], "session/prompt");
-        // Method not found on older ACP servers is ignored; invalid params errors surface.
         assert!(
             state
                 .receive(json!({ "id": 3, "error": { "code": -32601, "message": "not implemented" } }), mode, cwd, &tools, "hi")

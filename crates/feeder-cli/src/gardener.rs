@@ -1,5 +1,3 @@
-//! Notebook flags, Curator sessions, and local Curator chat history.
-
 use std::io::{BufRead, IsTerminal, Write};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
@@ -15,67 +13,67 @@ use serde_json::{Value, json};
 
 #[derive(Subcommand)]
 pub enum GardenerCmd {
-    /// Start Curator with an installed agent.
-    /// It streams what the agent does; type follow-ups after each answer, or press Enter to end.
+    #[command(
+        about = "Start Curator with an installed agent. It streams what the agent does; type follow-ups after each answer, or press Enter to end."
+    )]
     Run {
-        /// `claude`, `codex`, `opencode`, or `antigravity`. Defaults to your Curator default or the first installed CLI.
+        #[arg(help = "`claude`, `codex`, `opencode`, or `antigravity`. Defaults to your Curator default or the first installed CLI.")]
         #[arg(long = "with")]
         backend: Option<String>,
-        /// Override the model ID or alias for this session.
+        #[arg(help = "Override the model ID or alias for this session.")]
         #[arg(long)]
         model: Option<String>,
-        /// Override the thinking/reasoning effort level for this session (for example `low`, `medium`, `high`).
+        #[arg(help = "Override the thinking/reasoning effort level for this session (for example `low`, `medium`, `high`).")]
         #[arg(long)]
         effort: Option<String>,
-        /// Limit reads and edits to this project (name or ID).
+        #[arg(help = "Limit reads and edits to this project (name or ID).")]
         #[arg(long)]
         project: Option<String>,
-        /// Answer a question from the Notebook without making any changes.
+        #[arg(help = "Answer a question from the Notebook without making any changes.")]
         #[arg(long, requires = "message")]
         ask: bool,
-        /// Your first message. Defaults to reviewing open flags and recent updates.
+        #[arg(help = "Your first message. Defaults to reviewing open flags and recent updates.")]
         message: Vec<String>,
     },
-    /// Sign in through the provider's own CLI.
+    #[command(about = "Sign in through the provider's own CLI.")]
     Connect {
         #[arg(long = "with")]
         backend: String,
     },
-    /// Recent runs and which CLIs can run Curator.
+    #[command(about = "Recent runs and which CLIs can run Curator.")]
     Status {
         #[arg(long)]
         json: bool,
     },
-    /// List saved Curator chats, newest first.
+    #[command(about = "List saved Curator chats, newest first.")]
     Chats {
         #[arg(short = 'n', long, default_value_t = 20)]
         limit: usize,
         #[arg(long)]
         json: bool,
     },
-    /// Read a saved Curator chat by its run ID.
+    #[command(about = "Read a saved Curator chat by its run ID.")]
     Chat {
         id: i64,
         #[arg(long)]
         json: bool,
     },
-    /// Delete a saved chat while keeping its Notebook edits.
+    #[command(about = "Delete a saved chat while keeping its Notebook edits.")]
     DeleteChat { id: i64 },
-    /// Recent Notebook changes, with their reasons, newest first.
+    #[command(about = "Recent Notebook changes, with their reasons, newest first.")]
     Changes {
         #[arg(short = 'n', long, default_value_t = 20)]
         limit: usize,
-        /// Only the gardener's changes.
+        #[arg(help = "Only the gardener's changes.")]
         #[arg(long)]
         mine: bool,
         #[arg(long)]
         json: bool,
     },
-    /// Undo one change (see `feeder curator changes`).
+    #[command(about = "Undo one change (see `feeder curator changes`).")]
     Revert { id: i64 },
 }
 
-/// `feeder flag`: file a flag.
 pub fn flag(store: &Store, flag: NewFlag, author: &str, json: bool) -> Result<(), String> {
     let flag = store.flag_knowledge(flag, author).map_err(|e| e.to_string())?;
     print_flag(&flag, json);
@@ -90,7 +88,6 @@ pub(crate) fn print_flag(flag: &Flag, json: bool) {
     }
 }
 
-/// `feeder flags`: list flags, or dismiss one.
 pub fn flags(store: &Store, all: bool, dismiss: Option<i64>, reason: Option<String>, json: bool) -> Result<(), String> {
     if let Some(id) = dismiss {
         let note = reason.unwrap_or_default();
@@ -336,7 +333,6 @@ fn print_run(r: &Run) {
     }
 }
 
-/// Runs a session in the terminal: streams events, then reads follow-ups until an empty line.
 fn chat(backend: Backend, env: SessionEnv, label: &str, scope: Scope, mode: SessionMode, opening: ChatOpening<'_>) -> Result<(), String> {
     let _signals = StopSignals::install().map_err(|e| e.to_string())?;
     let (tx, rx) = mpsc::channel();
@@ -433,11 +429,8 @@ impl StopSignals {
         INTERRUPTED.store(false, Ordering::Relaxed);
         let mut guard = Self(Vec::new());
         for signal in [libc::SIGINT, libc::SIGTERM] {
-            // SAFETY: sigaction is a C structure with a valid all-zero representation. The
-            // installed handler only sets a lock-free atomic on Feeder's supported targets.
             let (mut action, mut previous): (libc::sigaction, libc::sigaction) = unsafe { std::mem::zeroed() };
             action.sa_sigaction = stop_signal as *const () as usize;
-            // SAFETY: both pointers are live and the handler matches the C signature.
             if unsafe {
                 libc::sigemptyset(&mut action.sa_mask);
                 libc::sigaction(signal, &action, &mut previous)
@@ -454,7 +447,6 @@ impl StopSignals {
 impl Drop for StopSignals {
     fn drop(&mut self) {
         for (signal, previous) in &self.0 {
-            // SAFETY: this is the action returned by sigaction in install.
             unsafe {
                 libc::sigaction(*signal, previous, std::ptr::null_mut());
             }

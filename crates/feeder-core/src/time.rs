@@ -4,7 +4,6 @@ pub fn now_ms() -> i64 {
     SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_millis() as i64).unwrap_or(0)
 }
 
-/// "just now", "4m", "2h", "1d", "3w", "5mo", "2y".
 pub fn relative_time(then_ms: i64, now_ms: i64) -> String {
     let s = ((now_ms - then_ms).max(0) / 1000) as u64;
     match s {
@@ -18,38 +17,31 @@ pub fn relative_time(then_ms: i64, now_ms: i64) -> String {
     }
 }
 
-/// `relative_time` as a phrase: "just now", "2h ago".
 pub fn ago(then_ms: i64, now_ms: i64) -> String {
     let t = relative_time(then_ms, now_ms);
     if t == "just now" { t } else { format!("{t} ago") }
 }
 
-/// Local calendar date parts: `(year, month 1..=12, day 1..=31, weekday 0=Sun..=6)`.
 fn local_ymd(ms: i64) -> (i32, u8, u8, u8) {
     let secs = ms.div_euclid(1000) as libc::time_t;
     #[cfg(unix)]
-    // SAFETY: `tm` is plain C data for which all zeroes is a valid value, and localtime_r only
-    // writes through the two pointers, both valid for the call.
     unsafe {
         let mut tm: libc::tm = std::mem::zeroed();
         if !libc::localtime_r(&secs, &mut tm).is_null() {
             return (tm.tm_year + 1900, (tm.tm_mon + 1).clamp(1, 12) as u8, tm.tm_mday.clamp(1, 31) as u8, tm.tm_wday.clamp(0, 6) as u8);
         }
     }
-    // Fallback to UTC civil date if localtime_r is unavailable.
     let days = secs.div_euclid(86_400);
     let (y, m, d) = civil_from_days(days);
     let wday = (days + 4).rem_euclid(7) as u8;
     (y, m, d, wday)
 }
 
-/// Days since 1970-01-01 in the local calendar, for grouping updates by day.
 pub fn day_key(ms: i64) -> i64 {
     let (y, m, d, _) = local_ymd(ms);
     days_from_civil(y, m, d)
 }
 
-/// A calm day header: "Today", "Yesterday", "Mon, Nov 16", or "Nov 16, 2025".
 pub fn day_label(then_ms: i64, now_ms: i64) -> String {
     let (ty, tm, td, tw) = local_ymd(then_ms);
     let (ny, nm, nd, _) = local_ymd(now_ms);
@@ -67,11 +59,11 @@ pub fn day_label(then_ms: i64, now_ms: i64) -> String {
 }
 
 fn days_from_civil(y: i32, m: u8, d: u8) -> i64 {
-    let y = y as i64 - i64::from(m <= 2);
+    let y = i64::from(y) - i64::from(m <= 2);
     let era = if y >= 0 { y } else { y - 399 } / 400;
     let yoe = y - era * 400;
-    let m = m as i64;
-    let doy = (153 * (m + if m > 2 { -3 } else { 9 }) + 2) / 5 + d as i64 - 1;
+    let m = i64::from(m);
+    let doy = (153 * (m + if m > 2 { -3 } else { 9 }) + 2) / 5 + i64::from(d) - 1;
     let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
     era * 146_097 + doe - 719_468
 }

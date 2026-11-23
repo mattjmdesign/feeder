@@ -6,15 +6,6 @@ import { ToolLogo } from './ToolLogo'
 import { useSiteTheme } from './theme'
 import './demos.css'
 
-// How an agent and Feeder talk over MCP. Beats, once in view: you ask the
-// agent to pick up where the last session stopped; it calls get_feed and gets
-// the last update and your reply; it works; it calls post_update, and the new
-// update lands in Feeder as a card beside the terminal. The card is the
-// payoff and holds.
-//
-// Real strings: the prompt, the two tool calls and what they return, the
-// posted update. The terminal is the hero; the card straddles its right edge.
-
 type S = { step: number }
 
 const initial: S = { step: 0 }

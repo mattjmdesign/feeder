@@ -14,6 +14,7 @@ cargo fmt --all
 cargo clippy --locked --workspace --all-targets -- -D warnings
 FEEDER_SPARKLE_DIR="$(scripts/fetch-sparkle.sh)" cargo clippy --locked -p feeder-app --all-targets -- -D warnings
 cargo test --locked --workspace
+scripts/no-comments.sh
 xcrun swiftc -typecheck crates/feeder-menubar/FeederMenuBar.swift   # if you touched the menu bar item
 pnpm --dir site build                                               # if you touched site/
 scripts/changelog.sh --check                                        # if you touched release-notes/
@@ -35,19 +36,24 @@ pnpm --dir site dev
 
 | Path | What it is |
 | --- | --- |
-| `crates/feeder-core` | The store (SQLite), the Notebook and agent setup (`setup` edits each tool's MCP config) |
-| `crates/feeder-core/src/gardener` | The Notebook gardener: runs the person's own `claude` or `codex` as a live session wired only to `feeder mcp --gardener` |
-| `crates/feeder-cli` | The `feeder` command and the MCP server (`feeder mcp`) |
-| `crates/feeder-app` | The window, in [Rune](https://github.com/anomalyco/rune). `updater.m` wraps Sparkle, `notify.m` posts notifications |
+| `crates/feeder-core` | The store (SQLite), Notebook, knowledge flags/changes, git worktree/file preview, and agent setup (`setup` edits each tool's MCP config) |
+| `crates/feeder-core/src/gardener` | Curator backend: runs the person's own `claude`, `codex`, `opencode`, or `antigravity` in isolated profiles wired to `feeder mcp --gardener`, plus auth checks, prefs, and chat history |
+| `crates/feeder-cli` | The `feeder` command, MCP server (`feeder mcp`), Curator CLI (`feeder curator`), and optional local HTTP companion (`feeder serve`) |
+| `crates/feeder-app` | The window, in [Rune](https://github.com/anomalyco/rune). Includes Home, Feed, Project Updates/Files, Notebook, Curator (`gardener.rs`, `curator_settings.rs`, `curator_sign_in.rs`), scoped media loading (`media.rs`), `updater.m` (Sparkle), and `notify.m` (UserNotifications) |
 | `crates/feeder-app/src/style.rs` | Colours, type roles and corner radii. Use these; don't write sizes or weights inline |
 | `crates/feeder-app/src/main.rs` | App state, the poll loop and the snapshot scenes |
 | `crates/feeder-menubar` | The menu bar item: one Swift file, compiled by `scripts/mac-app.sh` |
 | `site/` | The Astro website. Pushing `site/**` to `main` deploys it to GitHub Pages (`.github/workflows/pages.yml`) |
 | `site/src/demo` | The animated product demos on the site, built on the Stageshow kit in `site/src/stageshow/kit` |
 | `release-notes/<version>.md` | What's new in each version. `CHANGELOG.md` is generated from these |
-| `scripts/` | `release.sh`, `mac-app.sh`, `changelog.sh`, the disk image window (`dmg/`), licenses and site helpers |
+| `scripts/` | `release.sh`, `mac-app.sh`, `changelog.sh`, `no-comments.sh`, the disk image window (`dmg/`), licenses and site helpers |
 
 ## Rules you'd otherwise get wrong
+
+### Code comments
+
+- **Never write comments in code.** No `//`, `///`, `//!`, `/* ... */`, `#` comments in scripts or config, or `<!-- ... -->` in templates. Write clear names and small functions instead, put CLI help strings in `clap` `#[command(about = ...)]` / `#[arg(help = ...)]` attributes, and put project docs in Markdown files (`AGENTS.md`, `README.md`).
+- `scripts/no-comments.sh` enforces this across all owned code files (only `#!` shebangs, vendored `site/src/stageshow/`, and generated `assets/ThirdPartyLicenses.html` are exempt).
 
 ### Privacy
 
@@ -97,9 +103,7 @@ The development Mac's disk fills up fast. These aren't optional.
 - **No release builds to check things.** `cargo build --release`, `cargo test --release` and
   `cargo bench` each add a second full build. Release builds happen only in `scripts/release.sh`
   and `mac-app.sh --package`.
-- **Keep `[profile.dev.package."*"] debug = false`** in `Cargo.toml`. Without it dependency debug
-  info took 13 GB. A clean build, test and lint run leaves `target/` near 2 GB, and `mac-app.sh`
-  clears `target/` past 8 GB.
+- **Keep `[profile.dev.package."*"] debug = false` and `opt-level = 3`** in `Cargo.toml`. Without `debug = false`, dependency debug info took 13 GB; `opt-level = 3` keeps Rune layout and image decoding responsive in debug builds. A clean build, test and lint run leaves `target/` near 2 GB, and `mac-app.sh` clears `target/` past 8 GB.
 - **No build matrices.** No `--all-features`, extra targets or nightly toolchains. Feeder builds
   for `aarch64-apple-darwin` on the toolchain in `rust-toolchain.toml`. After changing that file,
   run `rustup toolchain uninstall <old version>` unless another project pins it.
@@ -114,8 +118,8 @@ The development Mac's disk fills up fast. These aren't optional.
 ### Dependencies
 
 - Rune is pinned to a git commit in `Cargo.toml`. Bump it together with every `[patch]` entry that
-  shares its `rev`. Its features are trimmed to `accessibility`, `metal-backend` and `svg`; don't
-  turn its defaults back on.
+  shares its `rev`. Its `rune` features are trimmed to `accessibility`, `metal-backend` and `svg`
+  (don't turn its defaults back on); `rune-kit` enables `markdown` and `mermaid`.
 - `serde_json` in `feeder-core` keeps `preserve_order`, so `setup` keeps the key order of the
   config files it edits.
 - After `cargo update` or a version bump, run every check and commit `Cargo.lock`.
@@ -136,13 +140,15 @@ target/debug/feeder-app --snap "$TMPDIR/home.png" --size 1180x760 --scale 2 --fr
 target/debug/feeder-app --snap "$TMPDIR/nb.png" --scene notebook --size 1180x760 --scale 2 --frames 20 --theme dark
 ```
 
-- Home is the default; other scenes are `feed`, `notebook`, `notebook-page`, `notebook-new`,
-  `settings` and `app-icon` (see `scenes` in `main.rs`).
-- `--frames` gives background work, such as the Settings tool scan, time to land.
+- Home is the default; other scenes include `feed`, `notebook`, `notebook-page`, `notebook-new`,
+  `notebook-gardener`, `notebook-curator-revision`, `notebook-curator-diagram`, `settings`,
+  `settings-curator`, `curator-picker`, and `app-icon` (see `scenes` in `crates/feeder-app/src/main.rs`).
+- Rune's built-in headless CLI flags (`--snap`, `--frames`, `--script`, `--realtime`, `--trace`)
+  drive snapshots and scripted navigation without opening a window. `--frames` gives background
+  work, such as the Settings tool scan, time to land; `--realtime` waits for background loading;
+  `--trace` logs frame timings.
 - Check light and dark. Look at the image; a snapshot that renders isn't proof the layout is
   right.
-- Replay navigation with `--script` on scratch data. Add `--realtime` for background loading and
-  `--trace` for frame timings. These runs open no window.
 - Use a live window for native-only checks such as title-bar controls. Keep live tests in the
   background when the Mac is in use.
 

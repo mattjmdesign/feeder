@@ -1,8 +1,4 @@
 #!/usr/bin/env bash
-# Builds CHANGELOG.md from release-notes/<version>.md, newest first, so the two never disagree.
-# Write a version's notes in release-notes/, then run this.
-#   scripts/changelog.sh          rewrite CHANGELOG.md
-#   scripts/changelog.sh --check  exit 1 if CHANGELOG.md is out of date (release.sh runs this)
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
@@ -16,7 +12,6 @@ render() {
     echo
     echo "## $version"
     echo
-    # The notes open with a "## What's new" heading; the version heading replaces it.
     sed '/^## /d' "$notes" | sed '/./,$!d'
   done
 }

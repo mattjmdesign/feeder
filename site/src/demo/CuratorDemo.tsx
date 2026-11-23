@@ -8,14 +8,6 @@ import { Check } from '../stageshow/kit/parts/Check'
 import { useSiteTheme } from './theme'
 import './curator-demo.css'
 
-// Curator turning a flagged Feed update into a Notebook note. Beats, once in view:
-// 1. Curator is open with one flagged update waiting; the cursor presses Review Now.
-// 2. The review card closes; Curator reads the flagged update, then searches the Notebook.
-// 3. Its answer streams in: nothing covered this, so it wrote a note.
-// 4. The new note lands as a card citing the update it came from, with Revert. Holds on payoff.
-//
-// Real strings: the flag card, the two steps, the answer, the note title and its source.
-
 const ANSWER =
   'Atlas API now counts rate limits per API key instead of per IP. Nothing in the Notebook covered it, so I added a note your agents will find next time.'
 const WORDS = ANSWER.split(' ').length

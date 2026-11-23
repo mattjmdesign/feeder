@@ -3,6 +3,12 @@
 What changed in each version of Feeder, newest first. Each section is copied from
 `release-notes/<version>.md` by `scripts/changelog.sh`; edit those files, not this one.
 
+## 0.5.6
+
+- **Faster launch and smoother scrolling.** Updated Rune UI for parallel macOS startup work and persistent icon mask caching across launches. Project update feeds now virtualize rows lazily like the main Feed, and layout callbacks skip unnecessary redraws when the window size hasn't changed.
+- **Responsive image copy and cleaner orb transitions.** Copying non-PNG screenshots from the lightbox now runs off the UI thread so the window stays responsive. Opening a pulsing project from Home no longer clips its glow into a square during the transition.
+- **Polish and reliability fixes.** Matched heading weight in the live Markdown editor to the app's type scale, fixed Title Case on Restart to Update, removed panic-prone unwraps in the Files view, added defensive guards for macOS notifications, and updated the About window privacy copy to cover Curator.
+
 ## 0.5.5
 
 - **Curator for your Notebook.** Ask about anything in your Notebook or review flagged updates into durable notes with reviewable, revertible diffs. Pick your connected provider (Claude Code, Codex, OpenCode, or Antigravity), switch models or thinking levels mid-chat without losing the thread, and sign in directly from the app when a provider needs auth. Every model in the picker shows its service's logo on the left.

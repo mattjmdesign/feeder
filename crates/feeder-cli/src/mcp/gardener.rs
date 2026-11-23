@@ -1,8 +1,3 @@
-//! The gardener's MCP tools (`feeder mcp --gardener`): read flags, Feed traces and the notebook,
-//! and change the notebook only through [`Store::curate`], which enforces the gardener's rules
-//! (cite a source, only add to hand-written pages, never delete). Every server started for the
-//! same session shares its scope and edit limit.
-
 use feeder_core::gardener::{Scope, SessionMode};
 use feeder_core::{Curation, FlagStatus, Kind, PageDraft, PageFilter, Provenance, Store, ago, now_ms};
 use serde_json::{Value, json};
@@ -10,12 +5,10 @@ use serde_json::{Value, json};
 use super::{Server, ToolOutput, str_arg};
 use crate::notebook::page_json;
 
-/// The tools this module answers, by name.
 pub(super) fn tool_names(mode: SessionMode) -> &'static [&'static str] {
     mode.mcp_tools()
 }
 
-/// How many traces `read_traces` returns at most, and how much of each body.
 const MAX_TRACES: usize = 40;
 const TRACE_CHARS: usize = 1_200;
 

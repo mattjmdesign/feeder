@@ -9,16 +9,6 @@ import { ToolLogo, type ToolKey } from './ToolLogo'
 import { useSiteTheme } from './theme'
 import './demos.css'
 
-// Feeder's Home at a glance: one orb per project. Beats, once in view: an
-// agent starts on Orbit, so its orb gets a breathing ring, a Working line
-// and the Working count rolls to 1; then Lumen's agent stops on a decision,
-// so Lumen gets a Needs you tag and that count rolls to 1. Both hold, which
-// is the frame a glance should leave you with: what's moving and what's
-// waiting on you.
-//
-// Real strings: the project names, the two statuses, the filter labels.
-// Times and agents on the quiet projects are placeholder.
-
 type S = { working: boolean; needs: boolean }
 
 const initial: S = { working: false, needs: false }

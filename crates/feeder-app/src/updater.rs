@@ -31,14 +31,15 @@ pub fn bind(wake: Waker) {
 }
 
 pub fn start() {
-    // SAFETY: Rune runs on_window on the AppKit thread after installing the app menu.
     unsafe { feeder_start_updater(wake) }
 }
 
 extern "C" fn wake() {
-    if let Some(waker) = WAKE.get() {
-        waker();
-    }
+    let _ = std::panic::catch_unwind(|| {
+        if let Some(waker) = WAKE.get() {
+            waker();
+        }
+    });
 }
 
 #[repr(u32)]
@@ -107,9 +108,6 @@ pub struct Updates {
 }
 
 pub fn poll(s: &mut State) -> bool {
-    // SAFETY: the AppKit thread owns the driver and its UTF-8 strings, each null or
-    // NUL-terminated. They're copied here, before returning to the run loop, where Sparkle may
-    // replace them.
     let (native, [version, notes, message]) = unsafe {
         let native = feeder_update_snapshot();
         let copy = |s: *const c_char| if s.is_null() { String::new() } else { CStr::from_ptr(s).to_string_lossy().into_owned() };
@@ -229,7 +227,7 @@ pub fn view(s: &State, p: &style::Palette, k: &Kit, layer: &mut Vec<El>) {
     }
     let action = match update.phase {
         Phase::Available => Some("Download"),
-        Phase::Ready => Some("Restart to update"),
+        Phase::Ready => Some("Restart to Update"),
         _ => None,
     };
     if let Some(label) = action {
@@ -238,7 +236,6 @@ pub fn view(s: &State, p: &style::Palette, k: &Kit, layer: &mut Vec<El>) {
                 Button::new(label)
                     .variant(ButtonVariant::Contrast)
                     .on_press(|_: &mut State| {
-                        // SAFETY: Rune dispatches this control on the same main thread as Sparkle.
                         unsafe { feeder_update_advance() };
                     })
                     .build(k),

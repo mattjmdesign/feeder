@@ -1,9 +1,4 @@
 #!/usr/bin/env bash
-# Builds Feeder.app (release), installs it to ~/Applications and opens it.
-# Also installs the `feeder` CLI to ~/.cargo/bin so agents and the MCP server can use it.
-#   scripts/mac-app.sh            build, install, (re)launch (refuses to replace a release build)
-#   scripts/mac-app.sh --no-open  build and install only
-#   scripts/mac-app.sh --package  build a drag-to-install disk image in dist/
 set -euo pipefail
 
 cd "$(dirname "$0")/.."
@@ -17,8 +12,6 @@ if [[ $# -gt 1 ]]; then
 fi
 MODE="${1:-}"
 
-# target/ only grows: incremental caches and every dependency version ever built. Past 8 GB,
-# clear it (keeping the pinned Sparkle download); the next build takes a few minutes longer.
 if [[ -d target ]] && (($(du -sk target | cut -f1) > 8 * 1024 * 1024)); then
   echo "› target/ is over 8 GB; clearing it"
   find target -mindepth 1 -maxdepth 1 ! -name sparkle ! -name CACHEDIR.TAG -exec rm -rf {} +
@@ -36,8 +29,6 @@ case "$RUST_TARGET" in
 esac
 RELEASE_DIR="target/$RUST_TARGET/release"
 DEST="$HOME/Applications/$APP_NAME.app"
-# A release build (it has an update feed) updates itself; a local build has none, so installing
-# one over it strands this Mac off the updater. Develop with `cargo run -p feeder-app` instead.
 if [[ "$MODE" != "--package" && -z "${FEEDER_REPLACE_RELEASE:-}" ]] \
   && /usr/libexec/PlistBuddy -c 'Print :SUFeedURL' "$DEST/Contents/Info.plist" >/dev/null 2>&1; then
   echo "$DEST is a release build that updates itself; a local build would replace it and its updater." >&2
@@ -74,7 +65,6 @@ trap 'rm -rf "$WORK"' EXIT
 STAGE="$WORK/$APP_NAME.app"
 
 echo "› building (release)"
-# Rust diagnostics otherwise embed absolute paths from the build Mac in the binaries.
 FLAG_SEPARATOR=$'\x1f'
 RELEASE_RUSTFLAGS="${CARGO_ENCODED_RUSTFLAGS-${RUSTFLAGS:-}}"
 if [[ -z "${CARGO_ENCODED_RUSTFLAGS+x}" ]]; then
@@ -90,7 +80,6 @@ if LC_ALL=C /usr/bin/grep -aFq -e "$HOME/" -e "$PWD/" "$RELEASE_DIR/feeder-app" 
 fi
 
 echo "› rendering the icon"
-# Release builds leave out Rune's headless tooling; the debug build draws the icon.
 env -u FEEDER_SPARKLE_DIR cargo build --locked --target-dir target -p feeder-app
 ICONSET="$WORK/AppIcon.iconset"
 mkdir -p "$ICONSET"
@@ -107,7 +96,6 @@ mkdir -p "$STAGE/Contents/MacOS" "$STAGE/Contents/Resources" "$STAGE/Contents/He
 cp "$RELEASE_DIR/feeder-app" "$STAGE/Contents/MacOS/$APP_NAME"
 cp "$RELEASE_DIR/feeder" "$STAGE/Contents/Helpers/feeder"
 cp "$ICONSET/../AppIcon.icns" "$STAGE/Contents/Resources/AppIcon.icns"
-# The About window shows Credits.html under the version; licenses ship beside it.
 cp assets/Credits.html "$STAGE/Contents/Resources/Credits.html"
 cp assets/ThirdPartyLicenses.html "$STAGE/Contents/Resources/ThirdPartyLicenses.html"
 echo "› building menu bar companion"
@@ -149,7 +137,6 @@ if [[ -n "$SPARKLE_DIR" ]]; then
   plutil -insert SUFeedURL -string "$UPDATE_FEED" "$INFO"
   plutil -insert SUPublicEDKey -string "$UPDATE_KEY" "$INFO"
   plutil -insert SUEnableAutomaticChecks -bool YES "$INFO"
-  # Hourly, Sparkle's shortest interval, so a release reaches every copy within the hour.
   plutil -insert SUScheduledCheckInterval -integer 3600 "$INFO"
   plutil -insert SUAllowsAutomaticUpdates -bool NO "$INFO"
   plutil -insert SUVerifyUpdateBeforeExtraction -bool YES "$INFO"
@@ -165,7 +152,6 @@ if [[ -n "$SPARKLE_DIR" ]]; then
   FRAMEWORK="$STAGE/Contents/Frameworks/Sparkle.framework"
   mkdir -p "$(dirname "$FRAMEWORK")"
   ditto "$SPARKLE_DIR/Sparkle.framework" "$FRAMEWORK"
-  # Feeder runs outside the App Sandbox and does not use Sparkle's sandbox XPC services.
   rm -rf "$FRAMEWORK/Versions/Current/XPCServices"
   rm -f "$FRAMEWORK/XPCServices"
   codesign "${SIGN_ARGS[@]}" --preserve-metadata=entitlements "$FRAMEWORK/Versions/Current/Autoupdate"
@@ -185,8 +171,6 @@ if [[ "$MODE" == "--package" ]]; then
 
   DMG="$WORK/$ARCHIVE.dmg"
   if command -v uvx >/dev/null; then
-    # The styled window: app, arrow, Applications. dmgbuild writes Finder's layout itself, so
-    # no Finder scripting (or permission prompt) is involved.
     uvx --quiet --from 'dmgbuild==1.6.5' dmgbuild -s scripts/dmg/settings.py \
       -D app="$STAGE" -D background=scripts/dmg/background.tiff -D volume_icon="$STAGE/Contents/Resources/AppIcon.icns" \
       "$APP_NAME" "$DMG" >/dev/null
@@ -201,8 +185,6 @@ if [[ "$MODE" == "--package" ]]; then
   if [[ -n "$NOTARY_PROFILE" ]]; then
     echo "› signing and notarizing $ARCHIVE.dmg"
     codesign --force --sign "$SIGN_IDENTITY" --timestamp --identifier "$BUNDLE_ID.dmg" "$DMG"
-    # Out of the temp folder before Apple sees it: a first notarization can take an hour, and
-    # if this script stops meanwhile, `notarytool wait <id>` then `stapler staple` finish it.
     mv -f "$DMG" "dist/$ARCHIVE.dmg"
     DMG="dist/$ARCHIVE.dmg"
     xcrun notarytool submit "$DMG" --wait --keychain-profile "$NOTARY_PROFILE"

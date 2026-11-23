@@ -1,9 +1,3 @@
-//! The local store: one SQLite database in WAL mode, shared by the CLI, the MCP server and the
-//! desktop app, plus a `media/` folder holding copies of attached screenshots.
-//!
-//! `FEEDER_HOME` moves the whole store (tests, a second profile); the default is the platform's
-//! data folder (`~/Library/Application Support/feeder` on macOS).
-
 use std::collections::HashMap;
 use std::fs::File;
 use std::io::{Read, Seek, SeekFrom};
@@ -29,13 +23,11 @@ pub enum MediaKind {
     Video,
 }
 
-/// One stored media attachment (screenshot or short clip) belonging to a [`FeedUpdate`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MediaAttachment {
     pub id: i64,
     pub update_id: i64,
     pub position: usize,
-    /// Absolute path of the stored media copy inside `<FEEDER_HOME>/media/`.
     pub path: PathBuf,
     pub width: Option<u32>,
     pub height: Option<u32>,
@@ -67,7 +59,6 @@ pub fn media_kind_for_path(path: &Path) -> Option<MediaKind> {
     }
 }
 
-/// Reads `(width, height)` in pixels from a PNG, JPEG, GIF, or WebP file header without decoding pixels.
 pub fn image_dimensions(path: &Path) -> Option<(u32, u32)> {
     let file = File::open(path).ok()?;
     image_dimensions_from_reader(file)
@@ -175,12 +166,10 @@ pub struct Project {
 }
 
 impl Project {
-    /// The folder the project lives in (its git repository), whatever it's been renamed to.
     pub fn folder(&self) -> Option<String> {
         self.path.as_ref()?.file_name().map(|n| n.to_string_lossy().into_owned())
     }
 
-    /// Whether the name differs enough from the folder that the folder is worth showing.
     pub fn renamed(&self) -> bool {
         self.folder().is_some_and(|f| slugify(&f) != slugify(&self.name))
     }
@@ -226,7 +215,6 @@ pub struct ProjectSummary {
     pub last_update_id: Option<i64>,
     pub last_at: Option<i64>,
     pub last_agent: Option<String>,
-    /// The host app the latest update came from, when the agent has its own name.
     pub last_via: Option<String>,
     pub last_body: Option<String>,
     pub needs_you: bool,
@@ -236,7 +224,6 @@ pub struct ProjectSummary {
 }
 
 impl ProjectSummary {
-    /// Whether this active project has an update newer than the last time the user opened it.
     pub fn unseen(&self) -> bool {
         !self.project.archived && self.last_at.is_some_and(|at| self.project.seen_at.is_none_or(|seen| at > seen))
     }
@@ -248,31 +235,21 @@ pub struct FeedUpdate {
     pub project_id: i64,
     pub agent: String,
     pub body: String,
-    /// Absolute path of the primary (first) stored media copy, for compatibility with single-image callers.
     pub screenshot: Option<PathBuf>,
-    /// Intrinsic pixel dimensions of the primary image, if known.
     pub media_w: Option<u32>,
     pub media_h: Option<u32>,
-    /// Ordered list of all media attachments (1..=8) for carousel & lightbox rendering.
     pub media: Vec<MediaAttachment>,
     pub branch: Option<String>,
     pub created_at: i64,
     pub diff_stat: Option<String>,
     pub commit_sha: Option<String>,
-    /// When the user explicitly dismissed a `Needs you` flag on this update.
     pub attention_dismissed_at: Option<i64>,
-    /// The app the agent posted from (OpenBot, T3 Code…), when it isn't the agent's own name.
-    /// Lets a custom-named agent wear its host's icon.
     pub via: Option<String>,
 }
 
 impl FeedUpdate {
     pub fn media_kind(&self) -> Option<MediaKind> {
         self.media.first().and_then(MediaAttachment::kind).or_else(|| self.screenshot.as_deref().and_then(media_kind_for_path))
-    }
-
-    pub fn has_media(&self) -> bool {
-        !self.media.is_empty() || self.screenshot.is_some()
     }
 
     pub fn has_image(&self) -> bool {
@@ -288,11 +265,8 @@ impl FeedUpdate {
 pub struct NewUpdate {
     pub agent: String,
     pub body: String,
-    /// A single screenshot or short video clip to attach (combined with `screenshots`).
     pub screenshot: Option<PathBuf>,
-    /// Ordered screenshots or short video clips to attach as a carousel (up to `MAX_MEDIA_PER_UPDATE`).
     pub screenshots: Vec<PathBuf>,
-    /// Git branch (or detached short SHA) where the update was posted.
     pub branch: Option<String>,
     pub diff_stat: Option<String>,
     pub commit_sha: Option<String>,
@@ -409,12 +383,10 @@ impl Store {
         &self.dir
     }
 
-    /// Changes whenever another connection commits, so a watcher can poll it cheaply.
     pub fn data_version(&self) -> Result<i64> {
         Ok(self.conn.query_row("PRAGMA data_version", [], |r| r.get(0))?)
     }
 
-    /// Cheap fingerprint of notebook state so watchers can skip reloading pages on feed-only changes.
     pub fn notebook_stamp(&self) -> Result<(i64, i64, i64, i64)> {
         Ok(self.conn.query_row(
             "SELECT COUNT(*), COALESCE(MAX(updated_at), 0), COALESCE(SUM(helped), 0), COALESCE(SUM(standing = 'archived'), 0) FROM notebook_pages",
@@ -423,7 +395,6 @@ impl Store {
         )?)
     }
 
-    /// Every project, pinned first, then most recently active.
     pub fn projects(&self) -> Result<Vec<ProjectSummary>> {
         let now = now_ms();
         let mut pulse_map: HashMap<i64, Pulse> = HashMap::new();
@@ -483,7 +454,6 @@ impl Store {
         self.one(&format!("SELECT {PROJECT_COLS} FROM projects WHERE id = ?1"), params![id])
     }
 
-    /// Finds a project by slug, name (any case) or id.
     pub fn find_project(&self, query: &str) -> Result<Option<Project>> {
         let trimmed = query.trim();
         if trimmed.is_empty() {
@@ -509,8 +479,6 @@ impl Store {
         }
     }
 
-    /// The project named `name`, created if it's new. A path given is remembered when the
-    /// project has none yet.
     pub fn project_named(&self, name: &str, path: Option<&Path>) -> Result<Project> {
         let name = name.trim();
         if name.is_empty() {
@@ -529,8 +497,6 @@ impl Store {
         self.create_project(name, path)
     }
 
-    /// The project at a detected folder: the one registered there, else one of that name with no
-    /// folder yet, else a new one (with a numbered slug if the name is taken by another folder).
     pub fn project_at(&self, detected: &DetectedProject) -> Result<Project> {
         if let Some(p) = self.project_at_path(&detected.path)? {
             return Ok(p);
@@ -544,7 +510,6 @@ impl Store {
         self.create_project(&detected.name, Some(&detected.path))
     }
 
-    /// What `project_at` would return, without creating anything.
     pub fn find_detected(&self, detected: &DetectedProject) -> Result<Option<Project>> {
         if let Some(p) = self.project_at_path(&detected.path)? {
             return Ok(Some(p));
@@ -593,8 +558,6 @@ impl Store {
         })
     }
 
-    /// Gives a project a new display name. An empty name goes back to the folder's name. The
-    /// slug and folder stay, so the project is still found by its old name and its folder.
     pub fn rename_project(&self, id: i64, name: &str) -> Result<()> {
         let project = self.project(id)?.ok_or_else(|| Error::NotFound(format!("no project {id}")))?;
         let folder = project.folder();
@@ -606,7 +569,6 @@ impl Store {
         Ok(())
     }
 
-    /// Sets or clears a project's pinned brief (`Goal / Focus / Commands`).
     pub fn set_project_brief(&self, id: i64, brief: Option<&str>) -> Result<()> {
         let cleaned = brief.map(str::trim).filter(|s| !s.is_empty());
         if let Some(b) = cleaned {
@@ -623,8 +585,6 @@ impl Store {
         Ok(())
     }
 
-    /// Archives or restores a project. Archived projects stay in the store with all their updates
-    /// and screenshots, hidden from the active Home shelf and global Feed.
     pub fn set_archived(&self, id: i64, archived: bool) -> Result<()> {
         let changed = self.conn.execute("UPDATE projects SET archived = ?1 WHERE id = ?2", params![i64::from(archived), id])?;
         if changed == 0 {
@@ -633,7 +593,6 @@ impl Store {
         Ok(())
     }
 
-    /// Pins or unpins a project so it stays anchored first on Home.
     pub fn set_pinned(&self, id: i64, pinned: bool) -> Result<()> {
         let changed = self.conn.execute("UPDATE projects SET pinned = ?1 WHERE id = ?2", params![i64::from(pinned), id])?;
         if changed == 0 {
@@ -642,7 +601,6 @@ impl Store {
         Ok(())
     }
 
-    /// Marks a project as seen through the newest update (or now).
     pub fn mark_seen(&self, id: i64) -> Result<()> {
         let now = now_ms();
         self.conn.execute(
@@ -654,7 +612,6 @@ impl Store {
         Ok(())
     }
 
-    /// Marks every active project as seen through its newest update (or now).
     pub fn mark_all_seen(&self) -> Result<()> {
         let now = now_ms();
         self.conn.execute(
@@ -666,8 +623,6 @@ impl Store {
         Ok(())
     }
 
-    /// Dismisses a `Needs you` flag on a single update so the user can clear it after handling it
-    /// directly in their editor or agent without posting a dummy reply.
     pub fn dismiss_attention(&self, update_id: i64) -> Result<()> {
         let changed = self.conn.execute(
             "UPDATE updates SET attention_dismissed_at = COALESCE(attention_dismissed_at, ?1) WHERE id = ?2",
@@ -679,7 +634,6 @@ impl Store {
         Ok(())
     }
 
-    /// Restores a previously dismissed `Needs you` flag on a single update (used by Undo).
     pub fn undismiss_attention(&self, update_id: i64) -> Result<()> {
         let changed = self.conn.execute("UPDATE updates SET attention_dismissed_at = NULL WHERE id = ?1", params![update_id])?;
         if changed == 0 {
@@ -688,7 +642,6 @@ impl Store {
         Ok(())
     }
 
-    /// Dismisses a `Needs you` flag on the latest update of `project_id`, returning `true` if one existed.
     pub fn dismiss_project_attention(&self, project_id: i64) -> Result<bool> {
         let latest_id: Option<i64> = self
             .conn
@@ -703,7 +656,6 @@ impl Store {
         Ok(true)
     }
 
-    /// Deletes a single update and removes all of its stored media files if any.
     pub fn delete_update(&self, id: i64) -> Result<()> {
         let shot: Option<Option<String>> =
             self.conn.query_row("SELECT screenshot FROM updates WHERE id = ?1", params![id], |r| r.get(0)).optional()?;
@@ -729,7 +681,6 @@ impl Store {
         Ok(())
     }
 
-    /// Deletes a project, its updates and all their stored screenshots/clips.
     pub fn remove_project(&self, id: i64) -> Result<()> {
         for u in self.feed(id, usize::MAX, None)? {
             let mut seen = std::collections::HashSet::new();
@@ -747,7 +698,6 @@ impl Store {
         Ok(())
     }
 
-    /// Adds an update to a project's feed. The note is checked against the update rules first.
     pub fn post(&self, project_id: i64, update: NewUpdate) -> Result<FeedUpdate> {
         let body = validate_body(&update.body)?;
         reject_secret(&body)?;
@@ -759,7 +709,6 @@ impl Store {
         let project = self.project(project_id)?.ok_or_else(|| Error::NotFound(format!("no project {project_id}")))?;
         let created_at = now_ms();
 
-        // Collect all requested media paths (`screenshot` first if set, followed by `screenshots`).
         let mut sources: Vec<PathBuf> = Vec::new();
         if let Some(src) = update.screenshot {
             sources.push(src);
@@ -769,7 +718,6 @@ impl Store {
             return Err(Error::Invalid(format!("an update can attach at most {MAX_MEDIA_PER_UPDATE} media files (got {})", sources.len())));
         }
 
-        // Copy and inspect all media files before opening any SQLite write transaction.
         let mut stored_items: Vec<(String, Option<u32>, Option<u32>)> = Vec::with_capacity(sources.len());
         for src in &sources {
             match self.store_media(&project, src, created_at) {
@@ -794,8 +742,6 @@ impl Store {
         let primary_rel = stored_items.first().map(|(rel, _, _)| rel.clone());
         let (media_w, media_h) = stored_items.first().map(|(_, w, h)| (*w, *h)).unwrap_or((None, None));
 
-        // The host app the post came from, when the agent goes by its own name (an OpenBot agent
-        // called "Rust Dev"), so the Feed can show the host's icon.
         let via = crate::agent::host_from_env().filter(|host| !host.eq_ignore_ascii_case(agent));
         let tx_res: rusqlite::Result<(i64, Vec<MediaAttachment>)> = (|| {
             let tx = self.conn.unchecked_transaction()?;
@@ -847,7 +793,6 @@ impl Store {
                 return Err(e.into());
             }
         };
-        // Clear any active pulse for this project/agent once the update lands.
         let _ = self.clear_pulse(project_id, agent);
         Ok(FeedUpdate {
             id: update_id,
@@ -867,7 +812,6 @@ impl Store {
         })
     }
 
-    /// Fetches one update by id.
     pub fn update(&self, id: i64) -> Result<Option<FeedUpdate>> {
         let mut stmt = self.conn.prepare(&format!("SELECT {UPDATE_COLS} FROM updates WHERE id = ?1"))?;
         let mut found = stmt.query_row(params![id], |r| self.update_row(r)).optional()?;
@@ -877,17 +821,6 @@ impl Store {
         Ok(found)
     }
 
-    /// Fetches one media attachment by its id.
-    pub fn media_item(&self, id: i64) -> Result<Option<MediaAttachment>> {
-        Ok(self
-            .conn
-            .query_row("SELECT id, update_id, position, path, width, height, caption FROM update_media WHERE id = ?1", params![id], |r| {
-                self.media_row(r)
-            })
-            .optional()?)
-    }
-
-    /// Checks whether a commit SHA has already been recorded for `project_id` (hook deduplication).
     pub fn has_commit(&self, project_id: i64, commit_sha: &str) -> Result<bool> {
         let exists: bool = self.conn.query_row(
             "SELECT EXISTS(SELECT 1 FROM updates WHERE project_id = ?1 AND commit_sha = ?2)",
@@ -897,7 +830,6 @@ impl Store {
         Ok(exists)
     }
 
-    /// Replaces the text body of an existing update after validating it.
     pub fn edit_update(&self, id: i64, body: &str) -> Result<FeedUpdate> {
         let body = validate_body(body)?;
         reject_secret(&body)?;
@@ -908,7 +840,6 @@ impl Store {
         self.update(id)?.ok_or_else(|| Error::NotFound(format!("no update {id}")))
     }
 
-    /// A project's updates, newest first. `before` (an update id) pages further back.
     pub fn feed(&self, project_id: i64, limit: usize, before: Option<i64>) -> Result<Vec<FeedUpdate>> {
         let limit = i64::try_from(limit).unwrap_or(i64::MAX);
         let mut stmt = self.conn.prepare(&format!(
@@ -922,7 +853,6 @@ impl Store {
         Ok(updates)
     }
 
-    /// Every active project's updates in one stream, newest first.
     pub fn timeline(&self, limit: usize) -> Result<Vec<FeedUpdate>> {
         let limit = i64::try_from(limit).unwrap_or(i64::MAX);
         let mut stmt = self.conn.prepare(&format!(
@@ -938,8 +868,6 @@ impl Store {
         Ok(updates)
     }
 
-    /// Searches update bodies, agent names, and branches via FTS5 (with SQLite substring
-    /// fallback for mid-word or symbol queries), newest first.
     pub fn search_updates(&self, query: &str, project_id: Option<i64>, include_archived: bool, limit: usize) -> Result<Vec<FeedUpdate>> {
         let needle = query.trim().to_lowercase();
         if needle.is_empty() || limit == 0 {
@@ -986,7 +914,6 @@ impl Store {
         Ok(hits)
     }
 
-    /// Adds a reply under an update card (human answer/decision or agent follow-up).
     pub fn add_reply(&self, update_id: i64, author: &str, from_human: bool, body: &str) -> Result<Reply> {
         let body = body.trim();
         if body.is_empty() {
@@ -1019,7 +946,6 @@ impl Store {
         })
     }
 
-    /// Fetches replies belonging to the given update IDs, oldest first per thread.
     pub fn replies_for_updates(&self, update_ids: &[i64]) -> Result<Vec<Reply>> {
         const CHUNK: usize = 500;
         if update_ids.is_empty() {
@@ -1045,7 +971,6 @@ impl Store {
         Ok(out)
     }
 
-    /// Returns human replies that have not yet been read by an agent (for a project or across all).
     pub fn unread_human_replies(&self, project_id: Option<i64>) -> Result<Vec<Reply>> {
         let mut stmt = self.conn.prepare(
             "SELECT r.id, r.update_id, r.project_id, r.author, r.from_human, r.body, r.created_at, r.read_at
@@ -1060,7 +985,6 @@ impl Store {
         Ok(rows.collect::<rusqlite::Result<_>>()?)
     }
 
-    /// Marks specific reply IDs as read by an agent.
     pub fn mark_replies_read(&self, ids: &[i64]) -> Result<()> {
         const CHUNK: usize = 500;
         if ids.is_empty() {
@@ -1080,7 +1004,6 @@ impl Store {
         Ok(())
     }
 
-    /// Marks all unread human replies for `project_id` as read.
     pub fn mark_project_replies_read(&self, project_id: i64) -> Result<()> {
         self.conn.execute(
             "UPDATE replies SET read_at = ?1 WHERE project_id = ?2 AND from_human = 1 AND read_at IS NULL",
@@ -1089,7 +1012,6 @@ impl Store {
         Ok(())
     }
 
-    /// Sets or refreshes a live activity pulse for `(project_id, agent)`.
     pub fn set_pulse(&self, project_id: i64, agent: &str, branch: Option<&str>, status: &str, ttl_ms: i64) -> Result<Pulse> {
         if self.project(project_id)?.is_none() {
             return Err(Error::NotFound(format!("no project {project_id}")));
@@ -1114,15 +1036,9 @@ impl Store {
         Ok(Pulse { project_id, agent: agent.to_string(), branch, status: status.to_string(), updated_at, expires_at })
     }
 
-    /// Clears a live activity pulse for `(project_id, agent)`.
     pub fn clear_pulse(&self, project_id: i64, agent: &str) -> Result<()> {
         self.conn.execute("DELETE FROM pulses WHERE project_id = ?1 AND agent = ?2", params![project_id, agent])?;
         Ok(())
-    }
-
-    /// Active (unexpired) pulses across all projects, newest first.
-    pub fn active_pulses(&self) -> Result<Vec<Pulse>> {
-        self.active_pulses_at(now_ms())
     }
 
     fn active_pulses_at(&self, now: i64) -> Result<Vec<Pulse>> {
@@ -1144,7 +1060,6 @@ impl Store {
         Ok(rows.collect::<rusqlite::Result<_>>()?)
     }
 
-    /// A project's to-do items in creation/list order.
     pub fn todos(&self, project_id: i64) -> Result<Vec<TodoItem>> {
         let mut stmt = self.conn.prepare(
             "SELECT id, project_id, title, done, position, created_at, completed_at
@@ -1156,7 +1071,6 @@ impl Store {
         Ok(rows.collect::<rusqlite::Result<_>>()?)
     }
 
-    /// Fetches one to-do item by id.
     pub fn todo(&self, id: i64) -> Result<Option<TodoItem>> {
         Ok(self
             .conn
@@ -1169,7 +1083,6 @@ impl Store {
             .optional()?)
     }
 
-    /// Appends a new to-do item to a project's optional checklist.
     pub fn add_todo(&self, project_id: i64, title: &str) -> Result<TodoItem> {
         if self.project(project_id)?.is_none() {
             return Err(Error::NotFound(format!("no project {project_id}")));
@@ -1187,7 +1100,6 @@ impl Store {
         Ok(TodoItem { id: self.conn.last_insert_rowid(), project_id, title, done: false, position, created_at, completed_at: None })
     }
 
-    /// Marks a to-do item done or open again.
     pub fn set_todo_done(&self, id: i64, done: bool) -> Result<TodoItem> {
         let completed_at = done.then(now_ms);
         let changed =
@@ -1198,7 +1110,6 @@ impl Store {
         self.todo(id)?.ok_or_else(|| Error::NotFound(format!("no to-do {id}")))
     }
 
-    /// Updates a to-do item's title.
     pub fn rename_todo(&self, id: i64, title: &str) -> Result<TodoItem> {
         let title = normalize_todo_title(title)?;
         let changed = self.conn.execute("UPDATE todos SET title = ?1 WHERE id = ?2", params![title, id])?;
@@ -1208,7 +1119,6 @@ impl Store {
         self.todo(id)?.ok_or_else(|| Error::NotFound(format!("no to-do {id}")))
     }
 
-    /// Deletes a single to-do item by id.
     pub fn delete_todo(&self, id: i64) -> Result<()> {
         let changed = self.conn.execute("DELETE FROM todos WHERE id = ?1", params![id])?;
         if changed == 0 {
@@ -1217,12 +1127,10 @@ impl Store {
         Ok(())
     }
 
-    /// Removes completed to-do items for a project and returns how many were removed.
     pub fn clear_completed_todos(&self, project_id: i64) -> Result<usize> {
         Ok(self.conn.execute("DELETE FROM todos WHERE project_id = ?1 AND done = 1", params![project_id])?)
     }
 
-    /// Removes every to-do item for a project and returns how many were removed.
     pub fn clear_project_todos(&self, project_id: i64) -> Result<usize> {
         Ok(self.conn.execute("DELETE FROM todos WHERE project_id = ?1", params![project_id])?)
     }
@@ -1361,7 +1269,6 @@ fn matches_media_magic(path: &Path, ext: &str) -> bool {
     }
 }
 
-/// Formats a query into a safe FTS5 prefix expression (`"tok1"* "tok2"*`).
 fn fts_query(query: &str) -> Option<String> {
     let terms: Vec<String> =
         query.split(|c: char| !c.is_alphanumeric()).filter(|t| !t.is_empty()).map(|t| format!("\"{}\"*", t.replace('"', "\"\""))).collect();
@@ -1429,7 +1336,6 @@ fn migrate_updates(conn: &Connection, dir: &Path) -> Result<()> {
             }
         }
     }
-    // Backfill legacy single-screenshot updates into `update_media` so every update reads uniformly.
     conn.execute(
         "INSERT INTO update_media (update_id, position, path, width, height, caption)
          SELECT u.id, 0, u.screenshot, u.media_w, u.media_h, NULL
@@ -1735,7 +1641,6 @@ mod tests {
         assert_eq!(hits.len(), 1);
         assert_eq!(hits[0].id, u1.id);
 
-        // Prefix, branch, and mid-word substring searches all work.
         assert_eq!(s.search_updates("feat/stripe", None, false, 10).unwrap()[0].id, u1.id);
         assert_eq!(s.search_updates("ebhook", None, false, 10).unwrap()[0].id, u1.id);
 
@@ -1759,19 +1664,16 @@ mod tests {
         let (s, dir) = temp_store("new-features");
         let p = s.project_named("Orbit", None).unwrap();
 
-        // Project brief CRUD
         s.set_project_brief(p.id, Some("Goal: Ship v2\nFocus: Billing\nTest: cargo test")).unwrap();
         assert_eq!(s.project(p.id).unwrap().unwrap().brief.as_deref(), Some("Goal: Ship v2\nFocus: Billing\nTest: cargo test"));
         s.set_project_brief(p.id, Some("   ")).unwrap();
         assert_eq!(s.project(p.id).unwrap().unwrap().brief, None);
 
-        // Pulse + clearing on post
         let pulse = s.set_pulse(p.id, "Codex", Some("feat/pulse"), "Wiring replies", 60_000).unwrap();
         assert_eq!(pulse.status, "Wiring replies");
         let sum = &s.projects().unwrap()[0];
         assert!(sum.active_pulse.is_some());
 
-        // Posting a Decision needed update flags needs_you and clears matching pulse
         let clip = dir.join("demo.mp4");
         std::fs::write(&clip, b"\x00\x00\x00\x18ftypmp42\x00\x00\x00\x00").unwrap();
         let u = s
@@ -1795,7 +1697,6 @@ mod tests {
         assert!(sum.active_pulse.is_none());
         assert!(sum.needs_you);
 
-        // Human reply clears needs_you and registers as unread for agent
         let reply = s.add_reply(u.id, "You", true, "Yes, 120s is great.").unwrap();
         assert_eq!(reply.read_at, None);
         let sum = &s.projects().unwrap()[0];
@@ -1815,30 +1716,20 @@ mod tests {
     fn image_dimensions_parses_png_gif_jpeg_and_webp_headers() {
         use std::io::Cursor;
 
-        // PNG 1280x720
         let mut png = Vec::from(&b"\x89PNG\r\n\x1a\n\x00\x00\x00\x0dIHDR"[..]);
         png.extend_from_slice(&1280u32.to_be_bytes());
         png.extend_from_slice(&720u32.to_be_bytes());
         assert_eq!(image_dimensions_from_reader(Cursor::new(&png)), Some((1280, 720)));
 
-        // GIF89a 320x240
         let mut gif = Vec::from(&b"GIF89a"[..]);
         gif.extend_from_slice(&320u16.to_le_bytes());
         gif.extend_from_slice(&240u16.to_le_bytes());
         assert_eq!(image_dimensions_from_reader(Cursor::new(&gif)), Some((320, 240)));
 
-        // JPEG SOF0 800x600 preceded by APP0
-        let jpeg = [
-            0xff, 0xd8, // SOI
-            0xff, 0xe0, 0x00, 0x04, 0x00, 0x00, // APP0 (len 4)
-            0xff, 0xc0, 0x00, 0x0b, 0x08, // SOF0, len 11, precision 8
-            0x02, 0x58, // height = 600
-            0x03, 0x20, // width = 800
-            0x03, 0x01, 0x11, 0x00,
-        ];
+        let jpeg =
+            [0xff, 0xd8, 0xff, 0xe0, 0x00, 0x04, 0x00, 0x00, 0xff, 0xc0, 0x00, 0x0b, 0x08, 0x02, 0x58, 0x03, 0x20, 0x03, 0x01, 0x11, 0x00];
         assert_eq!(image_dimensions_from_reader(Cursor::new(&jpeg)), Some((800, 600)));
 
-        // WebP VP8L 640x480
         let bits: u32 = (640 - 1) | ((480 - 1) << 14);
         let mut webp = Vec::from(&b"RIFF\x00\x00\x00\x00WEBPVP8L\x00\x00\x00\x00\x2f"[..]);
         webp.extend_from_slice(&bits.to_le_bytes());
@@ -2033,11 +1924,9 @@ mod tests {
         let stored_paths: Vec<PathBuf> = reloaded[0].media.iter().map(|m| m.path.clone()).collect();
         assert!(stored_paths.iter().all(|path| path.exists()));
 
-        // Exceeding MAX_MEDIA_PER_UPDATE is rejected cleanly.
         let too_many: Vec<PathBuf> = (0..=MAX_MEDIA_PER_UPDATE).map(|_| p1.clone()).collect();
         assert!(s.post(p.id, NewUpdate { screenshots: too_many, ..note("too many") }).is_err());
 
-        // Deleting the update removes all stored copies.
         s.delete_update(posted.id).unwrap();
         assert!(stored_paths.iter().all(|path| !path.exists()));
 

@@ -1,5 +1,3 @@
-//! Starts the provider's official browser sign-in flow using the same environment as a Curator run.
-
 use std::io::{self, BufRead, BufReader, Read, Write};
 use std::os::unix::process::CommandExt;
 use std::path::Path;
@@ -17,12 +15,6 @@ const LOGIN_TIMEOUT: Duration = Duration::from_secs(300);
 const CHECK_INTERVAL: Duration = Duration::from_millis(100);
 
 impl Backend {
-    /// Lets the installed provider sign in through its own browser flow. Claude Code, Codex, and
-    /// Antigravity all run browser sign-in directly; OpenCode requires a terminal picker.
-    ///
-    /// # Errors
-    /// Returns an error if the program is missing, the attempt fails, or it is interrupted.
-    /// Call on a worker thread. Codex's authorization URL is passed to `open` after validation.
     pub fn connect_in_browser(self, data_dir: &Path, cancel: &AtomicBool, open: impl FnOnce(&str) -> io::Result<()>) -> Result<()> {
         let bin = self.binary().ok_or_else(|| Error::NotFound(format!("{} isn't installed", self.label())))?;
         let mut cmd = profile::command(self, &bin, data_dir)?;
@@ -35,8 +27,6 @@ impl Backend {
             }
             Self::ClaudeCode => {
                 cmd.args(["auth", "login", "--claudeai"]);
-                // Hold stdin open rather than sending immediate EOF to the optional code prompt,
-                // and keep stderr bounded so a real failure surfaces instead of a generic error.
                 let mut child =
                     LoginChild::new(cmd.process_group(0).stdin(Stdio::piped()).stdout(Stdio::null()).stderr(Stdio::piped()).spawn()?);
                 let _stdin = child.child.stdin.take();

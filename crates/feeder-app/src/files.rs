@@ -1,9 +1,3 @@
-//! Files: a project's working tree as a mind map and a file list, with uncommitted changes
-//! opened out and the newest edit marked. Read-only: the watcher reads git and file times every
-//! two seconds while this view is open (`feeder_core::read_working_tree`); nothing is written and
-//! no agent is involved. Git says where and when files changed, not who changed them, so the
-//! view says "last edit", never "editing now".
-
 mod preview;
 
 use std::cell::{Cell, RefCell};
@@ -16,7 +10,6 @@ use rune_kit::{Button, ButtonVariant, FileNode, FileTree, Kit, Tree, TreeItem, T
 use crate::State;
 use crate::style::{self, Palette};
 
-/// Which of a project's two views is showing.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum ProjectView {
     #[default]
@@ -24,11 +17,8 @@ pub enum ProjectView {
     Files,
 }
 
-/// Changed files a folder lists before the rest fold into "N more changed".
 const MAX_CHANGED: usize = 8;
-/// An edit this recent counts as recent work (green); older is shown neutral.
 const RECENT_MS: i64 = 10 * 60 * 1000;
-/// Labels longer than this are shortened; the full path stays in the VoiceOver label.
 const MAX_LABEL: usize = 26;
 const SLOT: f32 = 40.0;
 const NODE_H: f32 = 30.0;
@@ -38,7 +28,6 @@ const PILL_GAP: f32 = 8.0;
 const MIN_ZOOM: f32 = 0.3;
 const MAX_ZOOM: f32 = 2.0;
 const ZOOM_STEP: f32 = 1.25;
-/// The file list's width beside the map.
 const LIST_W: f32 = 280.0;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -65,24 +54,18 @@ struct Camera {
     zoom: f32,
 }
 
-/// Everything the Files view keeps between frames. One per window; it follows the open project.
 #[derive(Default)]
 pub struct FilesState {
     pub view: ProjectView,
     preview: preview::Preview,
-    /// The last good read and which project it belongs to.
     tree_data: Option<(i64, WorkingTree)>,
     entries: BTreeMap<String, Entry>,
     latest: Option<String>,
     list: TreeModel<FileNode<Entry>>,
-    /// Folders opened on the map; "" is the root.
     open: BTreeSet<String>,
-    /// Folders whose unchanged files are listed instead of folded into a count.
     show_files: BTreeSet<String>,
-    /// The list follows the newest edit until the person picks a file.
     follow: bool,
     pending_reveal: bool,
-    /// The last refresh failed; what's shown is the read before it.
     stale: bool,
     camera: Cell<Option<Camera>>,
     anchor: RefCell<Option<(String, [f32; 2])>>,
@@ -105,7 +88,6 @@ impl FilesState {
         }
     }
 
-    /// Takes a fresh read from the watcher. A failed read keeps the last good one on screen.
     pub fn apply(&mut self, project: i64, wt: WorkingTree) {
         let same_project = self.tree_data.as_ref().is_some_and(|(id, _)| *id == project);
         if let TreeStatus::Failed(_) = wt.status
@@ -142,8 +124,6 @@ impl FilesState {
             })
             .map(|(path, _)| path.as_str())
             .collect();
-        // Rebuild Rune's tree only when the set of paths changes. Save timestamps and
-        // line counts can update the existing rows without losing their UI state.
         if !same_project || !entries.keys().eq(self.entries.keys()) {
             let expanded: BTreeSet<&str> = if same_project {
                 self.entries.keys().flat_map(|path| ancestors(path)).filter(|a| self.list.is_expanded(a)).collect()
@@ -198,7 +178,6 @@ impl FilesState {
         self.invalidate_layout();
     }
 
-    /// Scrolls the list to the newest edit after a rebuild (needs a `Tx`, so it runs from poll).
     pub fn poll(&mut self, tx: &mut Tx, images: Option<&rune::ImageCache>) -> bool {
         if self.pending_reveal {
             self.pending_reveal = false;
@@ -209,7 +188,6 @@ impl FilesState {
         self.preview.poll(images)
     }
 
-    /// The read for `project`, if the watcher has delivered one.
     fn data(&self, project: i64) -> Option<&WorkingTree> {
         self.tree_data.as_ref().filter(|(id, _)| *id == project).map(|(_, wt)| wt)
     }
@@ -222,7 +200,6 @@ impl FilesState {
         self.latest.as_ref().and_then(|l| self.entries.get(l)).and_then(|e| e.modified)
     }
 
-    /// The newest edit is recent, on a fresh read.
     fn recent(&self, now: i64) -> bool {
         !self.stale && self.latest_at().is_some_and(|t| now - t < RECENT_MS)
     }
@@ -250,8 +227,6 @@ fn ancestors(path: &str) -> impl Iterator<Item = &str> {
     path.match_indices('/').map(|(end, _)| &path[..end])
 }
 
-// ---------------------------------------------------------------- labels
-
 fn short(label: &str) -> String {
     let n = label.chars().count();
     if n <= MAX_LABEL {
@@ -263,8 +238,6 @@ fn short(label: &str) -> String {
     format!("{head}…{tail}")
 }
 
-/// One shortening rule for list and map: a path keeps its first folder and as much of its end as
-/// fits (`packages/…/navigation/sidebar`); a name keeps both ends.
 fn short_path(label: &str) -> String {
     if label.chars().count() <= MAX_LABEL || !label.contains('/') {
         return short(label);
@@ -289,8 +262,6 @@ fn counts(e: &Entry) -> String {
         (a, r) => format!("+{a} −{r}"),
     }
 }
-
-// ---------------------------------------------------------------- map layout
 
 #[derive(Default)]
 struct Dir {
@@ -364,12 +335,11 @@ impl MapNode {
     }
 
     fn width(&self) -> f32 {
-        let mut width = 2.0 * PILL_PAD + 2.0; // padding and both borders
+        let mut width = 2.0 * PILL_PAD + 2.0;
         for (i, (content, font)) in self.parts().into_iter().flatten().enumerate() {
             if i != 0 {
                 width += PILL_GAP;
             }
-            // Round each run up to allow for pixel snapping at the display scale.
             width += text::measure(content, &[], font, None).0.ceil();
         }
         width.max(56.0)
@@ -397,10 +367,12 @@ impl Layout<'_> {
     }
 
     fn dir(&mut self, dir: &Dir, path: &str, name: &str, depth: usize) -> usize {
-        // A folder holding only one folder joins it (`site/src/pages`), as the list does.
         let (mut dir, mut path, mut name) = (dir, path.to_owned(), name.to_owned());
-        while depth > 0 && dir.files.is_empty() && dir.dirs.len() == 1 {
-            let (n, d) = dir.dirs.iter().next().unwrap();
+        while depth > 0
+            && dir.files.is_empty()
+            && dir.dirs.len() == 1
+            && let Some((n, d)) = dir.dirs.iter().next()
+        {
             path = format!("{path}/{n}");
             name = format!("{name}/{n}");
             dir = d;
@@ -445,7 +417,6 @@ impl Layout<'_> {
         }
         let show_all = fs.show_files.contains(&path);
         let (mut folded_changed, mut listed_changed) = (0, 0);
-        // The newest edits list first, so a long list folds its oldest.
         let folded = if show_all { 0 } else { dir.files.iter().filter(|(_, entry)| entry.change.is_none()).count() };
         let mut files: Vec<_> = dir.files.iter().filter(|(_, entry)| show_all || entry.change.is_some()).collect();
         let newest = fs.latest.as_deref().and_then(|p| {
@@ -532,12 +503,10 @@ impl Layout<'_> {
             });
             kids.push(id);
         }
-        if kids.is_empty() {
-            self.nodes[me].y = self.leaf_y();
+        if let (Some(&first), Some(&last)) = (kids.first(), kids.last()) {
+            self.nodes[me].y = (self.nodes[first].y + self.nodes[last].y) / 2.0;
         } else {
-            let first = self.nodes[kids[0]].y;
-            let last = self.nodes[*kids.last().unwrap()].y;
-            self.nodes[me].y = (first + last) / 2.0;
+            self.nodes[me].y = self.leaf_y();
         }
         self.nodes[me].children = kids;
         me
@@ -599,8 +568,6 @@ fn map_stage(layout: &MapLayout, p: &Palette, recent: bool) -> El {
     let [width, height] = layout.size;
     let nodes = &layout.nodes;
     let col_x = &layout.columns;
-    // Lines carry the structure, so even the quietest stays at text_3 (above 3:1); weight, not
-    // faintness, sets the hierarchy.
     let mut lines = Shape::new();
     let mut active = Shape::new();
     for n in nodes {
@@ -634,7 +601,6 @@ fn map_node(n: &MapNode, position: [f32; 2], p: &Palette, recent: bool) -> El {
     let deleted = n.kind == Kind::File(Some(Change::Deleted));
     let (fg, border, fill) = match n.kind {
         Kind::Root => (p.text, p.text_3, p.card),
-        // Green only for a recent edit; an older "latest" keeps a normal border and its tag.
         _ if n.latest && recent => (p.text, p.live, p.live.alpha(0.10)),
         _ if n.latest => (p.text, p.text_3, p.card),
         _ if deleted => (p.text_3, p.hairline, p.bg),
@@ -668,7 +634,6 @@ fn map_node(n: &MapNode, position: [f32; 2], p: &Palette, recent: bool) -> El {
     let r = r.key(key);
     let r = if matches!(n.kind, Kind::Folder { .. } | Kind::File(_)) { r.help(n.full.clone()) } else { r };
     match n.kind {
-        // The root only labels the map; folders and files act.
         Kind::Root => r.label(format!("{}, {}", n.full, n.meta)),
         Kind::Folder { open } => {
             r.label(format!("{}, folder, {}", n.full, n.meta)).role("button").expanded(open).on_press(move |s: &mut State| {
@@ -694,7 +659,6 @@ fn map_node(n: &MapNode, position: [f32; 2], p: &Palette, recent: bool) -> El {
             if deleted {
                 r
             } else {
-                // Pressing a file shows it in the list and stops following the newest edit.
                 r.role("button").on_press_tx(move |s: &mut State, tx: &mut Tx| {
                     s.files.follow = false;
                     s.files.list.reveal(&id, tx);
@@ -708,10 +672,6 @@ fn map_node(n: &MapNode, position: [f32; 2], p: &Palette, recent: bool) -> El {
     }
 }
 
-// ---------------------------------------------------------------- camera
-
-/// Where the map sits before the person moves it: the whole map when it fits with 12 pt text or
-/// larger, otherwise actual size with the newest edit in view.
 fn auto_camera(m: &MapLayout, view: [f32; 2]) -> Camera {
     let [w, h] = m.size;
     let fit = ((view[0] - 64.0) / w).min((view[1] - 112.0) / h).min(1.0);
@@ -722,13 +682,11 @@ fn auto_camera(m: &MapLayout, view: [f32; 2]) -> Camera {
     Camera { x: (view[0] - 48.0 - lx).min(32.0), y: (view[1] / 2.0 - ly).min(32.0), zoom: 1.0 }
 }
 
-/// The whole map, centred, clear of the legend and zoom bar (the Fit button and ⌘9).
 fn fit_camera(size: [f32; 2], view: [f32; 2]) -> Camera {
     let zoom = ((view[0] - 64.0) / size[0]).min((view[1] - 112.0) / size[1]).clamp(MIN_ZOOM, MAX_ZOOM);
     Camera { x: (view[0] - size[0] * zoom) / 2.0, y: (view[1] - 48.0 - size[1] * zoom) / 2.0, zoom }
 }
 
-/// Keeps at least 80 pt of the map on screen so it can't be lost off an edge.
 fn clamp_camera(c: Camera, size: [f32; 2], view: [f32; 2]) -> Camera {
     let keep = 80.0_f32;
     let axis = |position: f32, size: f32, viewport: f32| {
@@ -738,14 +696,12 @@ fn clamp_camera(c: Camera, size: [f32; 2], view: [f32; 2]) -> Camera {
     Camera { x: axis(c.x, size[0] * c.zoom, view[0]), y: axis(c.y, size[1] * c.zoom, view[1]), zoom: c.zoom }
 }
 
-/// Zooms to `zoom` keeping the map point under `at` (viewport points) where it is.
 fn zoom_about(c: Camera, zoom: f32, at: [f32; 2]) -> Camera {
     let zoom = zoom.clamp(MIN_ZOOM, MAX_ZOOM);
     let k = zoom / c.zoom;
     Camera { x: at[0] - (at[0] - c.x) * k, y: at[1] - (at[1] - c.y) * k, zoom }
 }
 
-/// ⌘+ / ⌘− zoom about the middle, ⌘0 actual size, ⌘9 the whole map. Only while Files shows.
 pub fn on_key(s: &mut State, e: &KeyEvent) -> bool {
     let fs = &mut s.files;
     if s.open.is_none() || fs.view != ProjectView::Files {
@@ -776,15 +732,10 @@ pub fn on_key(s: &mut State, e: &KeyEvent) -> bool {
     true
 }
 
-// ---------------------------------------------------------------- views
-
-/// The pannable, zoomable viewport around the map, with its zoom bar and legend.
 fn map_canvas(fs: &FilesState, now: i64, p: &Palette, k: &Kit, m: &MapLayout, view: [f32; 2]) -> El {
     let size = m.size;
     let [mw, mh] = size;
     let mut cam = fs.camera.get().or(fs.last_cam.get()).unwrap_or_else(|| auto_camera(m, view));
-    // Keep the clicked folder under the pointer as its children take up more room.
-    // Edges and their nodes use the same new geometry in the same frame.
     if let Some((id, [x, y])) = fs.anchor.borrow_mut().take() {
         if let Some(node) = m.nodes.iter().find(|n| n.id == id) {
             cam.x += (x - m.columns[node.depth]) * cam.zoom;
@@ -800,7 +751,6 @@ fn map_canvas(fs: &FilesState, now: i64, p: &Palette, k: &Kit, m: &MapLayout, vi
     let centre = [view[0] / 2.0, view[1] / 2.0];
     let recent = fs.recent(now);
     let stage = rune::memo("files-map-stage", (m.revision, p.bg == style::palette(true).bg, recent), || map_stage(m, p, recent));
-    // `scale` draws about the centre and keeps the layout size, so offset back to the top-left.
     let placed = stage.scale(cam.zoom).absolute(cam.x - (mw - mw * cam.zoom) / 2.0, cam.y - (mh - mh * cam.zoom) / 2.0);
 
     let set = move |to: Camera| move |s: &mut State| s.files.camera.set(Some(clamp_camera(to, size, view)));
@@ -818,7 +768,6 @@ fn map_canvas(fs: &FilesState, now: i64, p: &Palette, k: &Kit, m: &MapLayout, vi
                 .on_press(set(zoom_about(cam, cam.zoom / ZOOM_STEP, centre)))
                 .build(k),
         )
-        // The percentage is the Actual Size button, so it isn't shown twice.
         .child(
             Button::new(format!("{:.0}%", cam.zoom * 100.0))
                 .variant(ButtonVariant::Ghost)
@@ -858,14 +807,12 @@ fn map_canvas(fs: &FilesState, now: i64, p: &Palette, k: &Kit, m: &MapLayout, vi
             s.files.camera.set(Some(clamp_camera(zoom_about(c, c.zoom * (1.0 + e.delta), [e.x, e.y]), size, view)));
             true
         })
-        // A two-finger double tap switches between the whole map and actual size.
         .on_smart_magnify(move |s: &mut State, x: f32, y: f32, _tx: &mut Tx| {
             let c = s.files.last_cam.get().unwrap_or(cam);
             let next = if (c.zoom - 1.0).abs() < 0.01 { fit } else { zoom_about(c, 1.0, [x, y]) };
             s.files.camera.set(Some(clamp_camera(next, size, view)));
             true
         })
-        // Dragging the background moves the map.
         .on_drag(move |s: &mut State, d: &mut Drag, _tx: &mut Tx| match d.phase {
             Phase::Down => {
                 let c = s.files.last_cam.get().unwrap_or(cam);
@@ -889,7 +836,6 @@ fn map_canvas(fs: &FilesState, now: i64, p: &Palette, k: &Kit, m: &MapLayout, vi
     viewport
 }
 
-/// The markers on screen; nothing when nothing has changed.
 fn legend(p: &Palette, kinds: &[Change]) -> El {
     let chip = |mark: &str, c: Color, label: &str| {
         row()
@@ -928,7 +874,6 @@ fn file_list(s: &State, p: &Palette, k: &Kit) -> El {
         .name("Files")
         .style(TreeStyle::from_kit(k).guides_on_hover(0.55))
         .row(move |n: &FileNode<Entry>, r: &TreeRow| {
-            // Let the tree fit the name to its measured width and retain the full tooltip.
             let mut item = TreeItem::new(&n.name).icon(n.icon(r.expanded == Some(true)));
             match &n.data {
                 Some(e) if e.change == Some(Change::Deleted) => item = item.label_color(pal.text_3).badge("Deleted"),
@@ -956,7 +901,6 @@ fn file_list(s: &State, p: &Palette, k: &Kit) -> El {
         .min_h(0.0)
 }
 
-/// One centred message with at most one action, for states with nothing to map.
 fn notice(p: &Palette, title: &str, detail: Option<String>, action: Option<El>) -> El {
     let mut c = col().gap(8.0).items_center().child(text(title.to_owned()).font(style::NAME).color(p.text));
     if let Some(d) = detail {
@@ -968,7 +912,6 @@ fn notice(p: &Palette, title: &str, detail: Option<String>, action: Option<El>) 
     col().grow(1.0).center().child(c)
 }
 
-/// The skeleton while the first read runs, in the loaded view's two panels.
 fn loading(p: &Palette) -> El {
     let pill = |w: f32| el().size(w, NODE_H).radius(NODE_H / 2.0).fill(p.hairline);
     let line = |w: f32| el().size(w, 12.0).radius(6.0).fill(p.hairline);
@@ -997,7 +940,6 @@ fn loading(p: &Palette) -> El {
         .child(col().grow(1.0).fill(p.card).radius(12.0).border(1.0, p.hairline).center().child(map))
 }
 
-/// The status line under the project's title: what's known, not that someone is working.
 pub fn status_line(s: &State, id: i64) -> Option<String> {
     let fs = &s.files;
     let wt = fs.data(id)?;
@@ -1026,7 +968,6 @@ fn short_commit(subject: &str) -> String {
     if subject.chars().count() > 60 { format!("{}…", subject.chars().take(59).collect::<String>()) } else { subject.to_owned() }
 }
 
-/// The Files view for project `id`, filling `size` (the space under the project's header).
 pub fn view(s: &State, id: i64, p: &Palette, k: &Kit, size: [f32; 2]) -> El {
     let fs = &s.files;
     let name = s.summary(id).map_or("", |sm| sm.project.name.as_str());
@@ -1043,7 +984,6 @@ pub fn view(s: &State, id: i64, p: &Palette, k: &Kit, size: [f32; 2]) -> El {
             pane(notice(p, "No folder linked", Some("Post an update from this repository to link its folder.".into()), None))
         }
         TreeStatus::Missing => pane(notice(p, "Folder not found", wt.root.as_deref().map(style::home_relative), None)),
-        // Without git there's nothing to compare against, but the folder is still worth showing.
         TreeStatus::Ready | TreeStatus::NotGit if fs.preview.is_open() => {
             let preview_pane = col()
                 .key("files-pane")
@@ -1066,8 +1006,6 @@ pub fn view(s: &State, id: i64, p: &Palette, k: &Kit, size: [f32; 2]) -> El {
         ))),
         TreeStatus::Failed(_) => pane(notice(p, "Couldn't read this folder", wt.root.as_deref().map(style::home_relative), None)),
         TreeStatus::Ready => {
-            // Inner size of the map pane: the list, the gap and the pane's padding come off.
-            // The status line and the stale notice each take a 16 pt line plus the 8 pt gap.
             let lines = f32::from(u8::from(status.is_some()) + u8::from(fs.stale)) * 24.0;
             let view = [(size[0] - list_w - 8.0 - 16.0 - 16.0).max(1.0), (size[1] - 8.0 - 16.0 - lines).max(1.0)];
             let m = fs.map_layout(name);

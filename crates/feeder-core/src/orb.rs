@@ -1,23 +1,13 @@
-//! Each project's orb: a palette and a pattern chosen once, when the project is first seen, and
-//! stored with it. New orbs pick the hue farthest from every orb already on the shelf and the
-//! pattern used least, so no two read alike. The desktop app turns this into gradients.
-
 use serde::{Deserialize, Serialize};
 
 #[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq, Hash)]
 #[serde(rename_all = "snake_case")]
 pub enum Pattern {
-    /// Soft clouds of colour drifting over a deep base.
     Nebula,
-    /// Bands of light swept across the sphere at an angle.
     Aurora,
-    /// Pale, iridescent, mostly highlight.
     Pearl,
-    /// A dark body with a bright core and a glowing ring.
     Eclipse,
-    /// Two hues meeting along a soft horizon.
     Tide,
-    /// Hot centre burning out to a dark rim.
     Ember,
 }
 
@@ -28,25 +18,21 @@ impl Pattern {
 #[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq)]
 pub struct Orb {
     pub seed: u64,
-    /// Primary, secondary and tertiary hues in OKLCH degrees.
     pub hues: [f32; 3],
-    /// OKLCH chroma of the strongest colour, 0.08..0.24.
     pub chroma: f32,
-    /// Angle in radians that bands, horizons and highlights follow.
     pub angle: f32,
     pub pattern: Pattern,
 }
 
 impl Orb {
-    /// A new orb, as unlike `existing` as the palette allows, with clean analogous harmony.
     pub fn generate(existing: &[Orb]) -> Orb {
         let mut rng = fastrand::Rng::new();
         let hue = pick_hue(existing, &mut rng);
         let (d2, d3) = match rng.u8(0..4) {
-            0 => (rng.f32() * 14.0 + 18.0, rng.f32() * 16.0 + 36.0),       // warm step forward
-            1 => (-(rng.f32() * 14.0 + 18.0), -(rng.f32() * 16.0 + 36.0)), // cool step back
-            2 => (rng.f32() * 16.0 + 16.0, -(rng.f32() * 16.0 + 16.0)),    // balanced flank
-            _ => (rng.f32() * 12.0 + 24.0, rng.f32() * 12.0 + 10.0),       // tight tonal pair
+            0 => (rng.f32() * 14.0 + 18.0, rng.f32() * 16.0 + 36.0),
+            1 => (-(rng.f32() * 14.0 + 18.0), -(rng.f32() * 16.0 + 36.0)),
+            2 => (rng.f32() * 16.0 + 16.0, -(rng.f32() * 16.0 + 16.0)),
+            _ => (rng.f32() * 12.0 + 24.0, rng.f32() * 12.0 + 10.0),
         };
         let pattern = pick_pattern(existing, &mut rng);
         Orb {
@@ -58,7 +44,6 @@ impl Orb {
         }
     }
 
-    /// Deterministic values in 0..1 drawn from the orb's seed, for blob positions and sizes.
     pub fn noise(&self, i: u64) -> f32 {
         let mut z = self.seed.wrapping_add(i.wrapping_mul(0x9E37_79B9_7F4A_7C15));
         z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
@@ -84,7 +69,6 @@ fn pick_hue(existing: &[Orb], rng: &mut fastrand::Rng) -> f32 {
     }
     candidates
         .map(|h| {
-            // Closest primary counts most; the other two hues of each orb count a little.
             let score = existing
                 .iter()
                 .map(|o| hue_distance(h, o.hues[0]).min(hue_distance(h, o.hues[1]) + 25.0).min(hue_distance(h, o.hues[2]) + 25.0))

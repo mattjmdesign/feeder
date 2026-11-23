@@ -6,7 +6,10 @@
 
 <p align="center"><a href="https://github.com/mattjmdesign/feeder/releases/latest/download/Feeder.dmg"><strong>Download for Mac</strong></a> · Apple silicon (M1 or later) · macOS 13 or later · Free and open source</p>
 
-![Feeder's Home: one orb per project](site/public/assets/home-light.png)
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="site/public/assets/home-dark.png">
+  <img src="site/public/assets/home-light.png" alt="Feeder's Home: one orb per project">
+</picture>
 
 Each project gets an orb on the Home screen and its own feed of updates. Agents post through a
 local MCP server or the `feeder` command. It's built in Rust on [Rune](https://github.com/anomalyco/rune),
@@ -41,7 +44,7 @@ In the app:
 - **Home** (⌘1) shows every project. A ring means an agent is working on it right now.
 - **Feed** (⌘2) shows updates from every project in one list. ⌘F searches the current view (Feed,
   an open project, or Notebook).
-- **Notebook** (⌘3) holds freeform Markdown notes and engineering lessons across projects — with
+- **Notebook** (⌘3) holds freeform Markdown notes and engineering lessons across projects, with
   callouts, code blocks, tables, and interactive checklists. Agents search it before they start debugging.
 - **⌘K** jumps to any project, update or notebook page.
 
@@ -104,7 +107,7 @@ provider used by the selected CLI, under that account's terms.
 
 ## Uninstall
 
-1. In Feeder, open **Settings → Uninstall** and choose **Remove Feeder from All Tools**.
+1. In Feeder, open **Settings → Storage** and choose **Remove Feeder from All Tools**.
 2. Quit Feeder and move it to the Trash.
 3. To delete your updates too, delete `~/Library/Application Support/feeder`.
 

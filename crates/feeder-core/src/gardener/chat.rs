@@ -1,5 +1,3 @@
-//! Local Curator transcripts with a separate recording budget per run.
-
 use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior, params};
 use serde::{Deserialize, Serialize};
 
@@ -14,15 +12,10 @@ const END_RESERVE_BYTES: i64 = 64;
 const REDACTED: &str = "[redacted]";
 const OMITTED: &str = "[message exceeds saved history limit]";
 
-/// What the person chose to send in the first turn.
 #[derive(Clone, Copy, Debug)]
 pub enum ChatOpening<'a> {
-    /// A message typed by the person.
     Message(&'a str),
-    /// A built-in action. Only the title is saved in the transcript's metadata.
     Job { title: &'a str, prompt: &'a str },
-    /// The person's next message in a saved chat whose session has ended. The new run takes over
-    /// the saved transcript and title, so the history keeps one thread.
     Continue { from: i64, message: &'a str },
 }
 
@@ -36,12 +29,9 @@ impl<'a> ChatOpening<'a> {
     }
 }
 
-/// Most of an earlier chat a continuation hands to the new session, in characters.
 const RECAP_CHARS: usize = 12_000;
 
-/// The opening prompt for a continued chat: the conversation so far, newest kept when it's long,
-/// then the new message. The provider's own session has ended, so this is its only memory.
-pub fn continuation_prompt(earlier: &[StoredEvent], message: &str) -> String {
+pub(super) fn continuation_prompt(earlier: &[StoredEvent], message: &str) -> String {
     let mut turns: Vec<String> = Vec::new();
     let mut reply = String::new();
     let flush = |reply: &mut String, turns: &mut Vec<String>| {
@@ -76,7 +66,6 @@ pub fn continuation_prompt(earlier: &[StoredEvent], message: &str) -> String {
     )
 }
 
-/// A saved chat's entry in the history list.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ChatSummary {
     pub run_id: i64,
@@ -85,11 +74,9 @@ pub struct ChatSummary {
     pub scope: Scope,
     pub title: String,
     pub edits: i64,
-    /// Whether the chat hit its saved history limit.
     pub truncated: bool,
 }
 
-/// One ordered transcript entry, separate from the live session controls.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "kind", content = "value", rename_all = "snake_case")]
 pub enum StoredEvent {
@@ -105,10 +92,6 @@ enum TranscriptRow {
 }
 
 impl Store {
-    /// Lists saved chats newest first, including partial chats from interrupted sessions.
-    ///
-    /// # Errors
-    /// Returns an error if the database cannot be read.
     pub fn curator_chats(&self, limit: usize) -> Result<Vec<ChatSummary>> {
         let limit = i64::try_from(limit).unwrap_or(i64::MAX);
         let mut stmt = self.conn.prepare(
@@ -134,10 +117,6 @@ impl Store {
         Ok(rows.collect::<rusqlite::Result<_>>()?)
     }
 
-    /// Loads the committed transcript for replay, in stream order.
-    ///
-    /// # Errors
-    /// Returns an error if the chat is missing, deleted, or could not be read.
     pub fn curator_chat_events(&self, run_id: i64) -> Result<Vec<StoredEvent>> {
         let mut stmt = self.conn.prepare(
             "SELECT e.payload FROM curator_chats current
@@ -163,10 +142,6 @@ impl Store {
         Ok(events)
     }
 
-    /// Deletes a chat and clears its saved summary and error. Keeps the run and its Notebook edits.
-    ///
-    /// # Errors
-    /// Returns an error for an unknown run, an active session, or a database failure.
     pub fn delete_curator_chat(&self, run_id: i64) -> Result<()> {
         let tx = Transaction::new_unchecked(&self.conn, TransactionBehavior::Immediate)?;
         if self.running_gardener()?.is_some_and(|run| run.id == run_id) {
@@ -232,8 +207,6 @@ pub(super) fn create(conn: &Connection, run_id: i64, opening: ChatOpening<'_>) -
     Ok(())
 }
 
-/// Archives earlier transcript segments under the new run. Each run gets its own save budget,
-/// and the latest run is the only thread shown in history.
 fn carry_over(conn: &Connection, from: i64, run_id: i64, message: &str) -> Result<()> {
     let moved = conn.execute(
         "INSERT INTO curator_chats (run_id, title)
@@ -277,7 +250,6 @@ fn append(conn: &Connection, run_id: i64, events: &[StoredEvent]) -> Result<bool
     Ok(position.is_some())
 }
 
-/// Event writes share the session's SQLite connection, in the order they are recorded.
 pub(super) struct Recorder {
     store: Store,
     run_id: i64,
@@ -375,7 +347,6 @@ impl Deltas {
         if self.omitted {
             return vec![StoredEvent::Event(event(OMITTED.into()))];
         }
-        // Check the full text before saving any delta. A key can span multiple frames.
         if sensitive(&self.parts.concat()) {
             return vec![StoredEvent::Event(event(REDACTED.into()))];
         }

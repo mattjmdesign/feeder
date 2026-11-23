@@ -10,14 +10,6 @@ import { ToolLogo } from './ToolLogo'
 import { useSiteTheme } from './theme'
 import './demos.css'
 
-// Answering an agent from the feed. One update card, cropped from the Feed:
-// its last block is a decision, so it carries Needs you. Beats, once in view:
-// the cursor clicks the reply field, types the answer, presses Send; the
-// reply opens into the card's thread above the field and the tag turns to
-// Replied on the same pill. The next agent session reads that reply.
-//
-// Real strings: the project, the agent, the decision, the reply, the tag.
-
 const ANSWER = 'Ship CSV now. PDF can wait.'
 
 type S = { focused: boolean; draft: string; sent: boolean }

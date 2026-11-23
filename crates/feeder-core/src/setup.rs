@@ -1,12 +1,3 @@
-//! Connects Feeder's MCP server to the agent tools on this Mac and installs its skills where
-//! tools load skills. `feeder setup` and the app's Settings both run this.
-//!
-//! Every entry it writes is a local stdio server (`command` + `args`), never a URL: the tool starts
-//! `feeder mcp` as a child process and talks to it over stdin and stdout. Nothing listens on a port.
-//! JSON configs are edited in place, keeping their other keys and order; a file that isn't plain
-//! JSON (comments) is left alone and the snippet is printed instead. Each file is copied to
-//! `<file>.feeder-backup` before its first change.
-
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -68,25 +59,12 @@ fn home() -> PathBuf {
     dirs::home_dir().unwrap_or_else(|| PathBuf::from("."))
 }
 
-/// Where each tool keeps its MCP servers, and the shape of the entry.
 enum Config {
-    /// Registered through the tool's own CLI (`claude mcp add`), optionally against another
-    /// config dir.
-    ClaudeCli {
-        config_dir: Option<PathBuf>,
-    },
-    Json {
-        path: PathBuf,
-        key: &'static str,
-        opencode: bool,
-    },
-    CodexToml {
-        path: PathBuf,
-    },
+    ClaudeCli { config_dir: Option<PathBuf> },
+    Json { path: PathBuf, key: &'static str, opencode: bool },
+    CodexToml { path: PathBuf },
 }
 
-/// T3 Code runs Claude Code with its own config dirs (`~/.claude-<profile>-t3`), and Codex with
-/// the shared `~/.codex`.
 fn t3_config_dirs() -> Vec<PathBuf> {
     let Ok(entries) = std::fs::read_dir(home()) else { return vec![] };
     let mut dirs: Vec<PathBuf> = entries
@@ -119,7 +97,6 @@ fn configs(tool: Tool) -> Vec<Config> {
     }
 }
 
-/// Whether the tool looks installed: its CLI is on PATH, its app exists or its config folder does.
 pub fn detected(tool: Tool) -> bool {
     let h = home();
     let app = app_path(tool).is_some();
@@ -135,7 +112,6 @@ pub fn detected(tool: Tool) -> bool {
 }
 
 impl Tool {
-    /// The app bundles the tool installs as, most likely first.
     pub fn app_names(self) -> &'static [&'static str] {
         match self {
             Tool::ClaudeCode => &[],
@@ -149,7 +125,6 @@ impl Tool {
     }
 }
 
-/// The tool's installed app, in /Applications or ~/Applications, for its icon.
 pub fn app_path(tool: Tool) -> Option<PathBuf> {
     let h = home();
     tool.app_names().iter().flat_map(|name| [Path::new("/Applications").join(name), h.join("Applications").join(name)]).find(|p| p.exists())
@@ -158,7 +133,6 @@ pub fn app_path(tool: Tool) -> Option<PathBuf> {
 pub(crate) fn which(cmd: &str) -> Option<PathBuf> {
     let path = std::env::var_os("PATH");
     let dirs = path.iter().flat_map(std::env::split_paths);
-    // GUI apps and some shells don't put these on PATH.
     let fallback =
         [home().join(".local/bin"), home().join(".cargo/bin"), PathBuf::from("/opt/homebrew/bin"), PathBuf::from("/usr/local/bin")];
     find_executable(cmd, dirs.chain(fallback))
@@ -171,14 +145,10 @@ fn find_executable(cmd: &str, dirs: impl IntoIterator<Item = PathBuf>) -> Option
         if !meta.is_file() || meta.permissions().mode() & 0o111 == 0 {
             return None;
         }
-        // Curator launches the CLI from a different working directory.
         std::path::absolute(candidate).ok()
     })
 }
 
-/// The `feeder` the tools should start: an absolute path, since GUI apps don't see your shell's
-/// PATH. From the app it is the CLI bundled beside it (`Contents/Helpers/feeder`); a build inside
-/// a cargo `target/` folder points at the installed copy instead.
 pub fn feeder_binary() -> PathBuf {
     let installed = home().join(".cargo/bin/feeder");
     let exe = std::env::current_exe().and_then(|p| p.canonicalize());
@@ -204,12 +174,10 @@ fn codex_block(bin: &Path) -> String {
     format!("[mcp_servers.feeder]\ncommand = {:?}\nargs = [\"mcp\"]\n", bin.display().to_string())
 }
 
-/// An `mcpServers` block that starts `bin`, for tools `setup` doesn't know: most read this shape.
 pub fn mcp_json(bin: &Path) -> String {
     serde_json::to_string_pretty(&json!({ "mcpServers": { "feeder": entry(bin, false) } })).unwrap_or_default()
 }
 
-/// The config each tool needs, for `feeder setup --print`.
 pub fn snippet(tool: Tool, bin: &Path) -> String {
     let mut out = String::new();
     for c in configs(tool) {
@@ -228,19 +196,13 @@ pub fn snippet(tool: Tool, bin: &Path) -> String {
     out
 }
 
-/// Whether a tool's configs start this Feeder.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Status {
-    /// Every config the tool reads has a `feeder` server that runs `bin`.
     Connected,
-    /// Some config has a `feeder` server, but one runs another copy (or one config lacks it).
     Outdated,
-    /// No config has a `feeder` server.
     Missing,
 }
 
-/// Reads the tool's configs without changing them. Claude Code's are read from its
-/// `.claude.json`, so no `claude` process starts.
 pub fn status(tool: Tool, bin: &Path) -> Status {
     let found: Vec<Option<bool>> = configs(tool).into_iter().map(|c| configured_command(c).map(|cmd| same_file(&cmd, bin))).collect();
     if found.iter().all(|f| *f == Some(true)) {
@@ -252,7 +214,6 @@ pub fn status(tool: Tool, bin: &Path) -> Status {
     }
 }
 
-/// The command a config's `feeder` server runs, if it has one.
 fn configured_command(config: Config) -> Option<PathBuf> {
     let read_json = |path: &Path| serde_json::from_str::<Value>(&std::fs::read_to_string(path).ok()?).ok();
     match config {
@@ -279,7 +240,6 @@ fn configured_command(config: Config) -> Option<PathBuf> {
     }
 }
 
-/// Whether two paths name one file: `~/.cargo/bin/feeder` links to the app's copy.
 fn same_file(a: &Path, b: &Path) -> bool {
     a == b || matches!((a.canonicalize(), b.canonicalize()), (Ok(x), Ok(y)) if x == y)
 }
@@ -288,7 +248,6 @@ pub enum Outcome {
     Added,
     Updated,
     Removed,
-    /// Already as asked: connected to this Feeder, or (disconnecting) never connected.
     Already,
     Skipped(String),
 }
@@ -377,7 +336,6 @@ fn apply(config: Config, bin: &Path) -> (String, Outcome) {
     }
 }
 
-/// `text` without the `[name]` table (up to the next table header), or None when it has none.
 fn remove_toml_table(text: &str, name: &str) -> Option<String> {
     let header = format!("[{name}]");
     let mut out = String::new();
@@ -447,7 +405,6 @@ fn write_private_new(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
     file.sync_all()
 }
 
-/// Writes the `feeder-update` and `feeder-notebook` skills into every skills folder these tools read that exists.
 pub fn install_skills() -> Vec<PathBuf> {
     let skills = [("feeder-update", crate::skill_markdown()), ("feeder-notebook", crate::notebook_skill_markdown())];
     skill_roots()
@@ -462,7 +419,6 @@ pub fn install_skills() -> Vec<PathBuf> {
         .collect()
 }
 
-/// Deletes the skills `install_skills` wrote, from every folder it writes to.
 pub fn remove_skills() -> Vec<PathBuf> {
     skill_roots()
         .into_iter()
@@ -471,7 +427,6 @@ pub fn remove_skills() -> Vec<PathBuf> {
         .collect()
 }
 
-/// Removes Feeder's server from every config `tool` reads; the inverse of [`connect`].
 pub fn disconnect(tool: Tool) -> Vec<(String, Outcome)> {
     configs(tool).into_iter().map(unapply).collect()
 }
@@ -522,7 +477,6 @@ fn unapply(config: Config) -> (String, Outcome) {
     }
 }
 
-/// Every skills folder the tools read.
 fn skill_roots() -> Vec<PathBuf> {
     let h = home();
     let mut roots = vec![

@@ -1,7 +1,3 @@
-//! Agent tool marks from Simple Icons (CC0), one 24×24 path each, drawn in their element's colour.
-//! Generated from the published SVGs; edit by re-fetching them. Tools without one here (T3 Code)
-//! show their installed app's own icon instead; Feeder ships no other artwork.
-
 use rune::Icon;
 
 pub static CLAUDE: Icon = Icon {
@@ -40,12 +36,9 @@ pub static ZED: Icon = Icon {
     body: r#"<path fill="currentColor" d="M2.25 1.5a.75.75 0 0 0-.75.75v16.5H0V2.25A2.25 2.25 0 0 1 2.25 0h20.095c1.002 0 1.504 1.212.795 1.92L10.764 14.298h3.486V12.75h1.5v1.922a1.125 1.125 0 0 1-1.125 1.125H9.264l-2.578 2.578h11.689V9h1.5v9.375a1.5 1.5 0 0 1-1.5 1.5H5.185L2.562 22.5H21.75a.75.75 0 0 0 .75-.75V5.25H24v16.5A2.25 2.25 0 0 1 21.75 24H1.655C.653 24 .151 22.788.86 22.08L13.19 9.75H9.75v1.5h-1.5V9.375A1.125 1.125 0 0 1 9.375 8.25h5.314l2.625-2.625H5.625V15h-1.5V5.625a1.5 1.5 0 0 1 1.5-1.5h13.19L21.438 1.5z"/>"#,
 };
 
-/// OpenCode's mark (Simple Icons, CC0).
 pub static OPENCODE: Icon =
     Icon { name: "opencode", view: 24.0, body: r#"<path fill="currentColor" d="M22 24H2V0h20zM17 4.8H7v14.4h10z"/>"# };
 
-/// Antigravity's arch, the outline of Google's own mark (antigravity.google/favicon.svg) without its
-/// colour wash, refit to 24×24 so it sits level with the others.
 pub static ANTIGRAVITY: Icon = Icon {
     name: "antigravity",
     view: 24.0,

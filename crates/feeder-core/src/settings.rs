@@ -1,5 +1,3 @@
-//! The desktop app's preferences, kept beside the store as `settings.json`.
-
 use std::path::Path;
 
 use serde::{Deserialize, Serialize};
@@ -31,7 +29,6 @@ impl OrbSize {
         }
     }
 
-    /// How many orbs share a row when the window has room: 8, 6 or 4.
     pub fn columns(self) -> usize {
         match self {
             OrbSize::Small => 8,
@@ -40,7 +37,6 @@ impl OrbSize {
         }
     }
 
-    /// Each orb's column (orb plus room for its name) and the gap between columns, in points.
     pub fn column(self) -> (f32, f32) {
         match self {
             OrbSize::Small => (108.0, 18.0),
@@ -49,7 +45,6 @@ impl OrbSize {
         }
     }
 
-    /// The row's width at full strength: a wider window centres it, a narrower one wraps it.
     pub fn row_width(self) -> f32 {
         let (w, gap) = self.column();
         let n = self.columns() as f32;
@@ -60,10 +55,8 @@ impl OrbSize {
 #[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum Order {
-    /// Most recently active first.
     #[default]
     Recent,
-    /// A to Z by name.
     Name,
 }
 
@@ -77,11 +70,8 @@ pub struct Settings {
     pub theme: Theme,
     pub orb_size: OrbSize,
     pub order: Order,
-    /// Under a nickname, show the folder it stands for.
     pub show_folders: bool,
-    /// Show a macOS banner when an agent posts a new update.
     pub notify_updates: bool,
-    /// Show Feeder in the macOS menu bar while running.
     #[serde(default = "default_true")]
     pub menubar: bool,
 }
@@ -100,12 +90,10 @@ impl Default for Settings {
 }
 
 impl Settings {
-    /// The saved settings, or the defaults when there are none (or they don't parse).
     pub fn load(dir: &Path) -> Settings {
         std::fs::read_to_string(dir.join("settings.json")).ok().and_then(|s| serde_json::from_str(&s).ok()).unwrap_or_default()
     }
 
-    /// Writes through a temporary file, so a crash never leaves half a file.
     pub fn save(&self, dir: &Path) -> std::io::Result<()> {
         use std::io::Write;
         std::fs::create_dir_all(dir)?;
@@ -132,7 +120,6 @@ mod tests {
 
     #[test]
     fn every_size_fits_its_row_in_the_default_window() {
-        // 1180 pt window less 32 pt of padding each side.
         for size in [OrbSize::Small, OrbSize::Medium, OrbSize::Large] {
             assert!(size.row_width() <= 1180.0 - 64.0, "{size:?}: {}", size.row_width());
             assert!(size.column().0 >= size.points(), "{size:?}");

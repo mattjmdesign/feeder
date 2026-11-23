@@ -1,9 +1,3 @@
-//! A live gardener session: the person's CLI as a child process, its stream turned into
-//! [`Event`]s, follow-up messages, and Stop.
-//!
-//! Claude Code runs as one long-lived process that reads user messages on stdin. Codex runs one
-//! process per turn and resumes the same thread for each follow-up.
-
 use std::io::{BufRead, BufReader, Read, Write};
 use std::os::unix::fs::DirBuilderExt;
 use std::os::unix::process::CommandExt;
@@ -24,54 +18,37 @@ use super::prefs::{self, RunConfig};
 use super::{Backend, Scope, SessionMode, clip, profile};
 use crate::{Error, Result, Store, data_dir, setup};
 
-/// Something the session did, in the order it happened.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", content = "data", rename_all = "snake_case")]
 pub enum Event {
-    /// The CLI is up and connected to the gardener's tools.
     Started,
-    /// A piece of the agent's reasoning, as the CLI shares it.
     Thinking(String),
-    /// A piece of the agent's reply. Consecutive pieces belong to the same paragraph.
     Text(String),
     ToolStarted(ToolCall),
-    ToolFinished {
-        id: String,
-        output: String,
-        failed: bool,
-    },
-    /// The agent finished answering; the person can write again.
+    ToolFinished { id: String, output: String, failed: bool },
     TurnFinished,
-    /// The CLI isn't signed in. The person signs in with [`Backend::sign_in_command`].
     NeedsSignIn,
     Failed(String),
-    /// The session is over, by Stop or because the CLI exited.
     Ended,
 }
 
-/// One call to a gardener tool.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct ToolCall {
     pub id: String,
-    /// The tool's own name, such as `write_page`.
     pub name: String,
     pub input: Value,
 }
 
 impl ToolCall {
-    /// A text argument, if the call has it.
     pub fn text_arg(&self, key: &str) -> Option<&str> {
         self.input.get(key).and_then(Value::as_str)
     }
 
-    /// A whole-number argument, if the call has it.
     pub fn int_arg(&self, key: &str) -> Option<i64> {
         self.input.get(key).and_then(Value::as_i64)
     }
 }
 
-/// A made-up session for screenshots and the app's snapshot scene, on the demo data from
-/// `scripts/site/demo-data.sh`. It is never shown as real activity.
 pub fn demo_events() -> Vec<Event> {
     let call = |id: &str, name: &str, input: Value| Event::ToolStarted(ToolCall { id: id.into(), name: name.into(), input });
     let done = |id: &str, output: &str| Event::ToolFinished { id: id.into(), output: output.into(), failed: false };
@@ -94,26 +71,20 @@ pub fn demo_events() -> Vec<Event> {
     ]
 }
 
-/// Where a session finds Feeder: the CLI that serves the gardener's tools, and the store.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SessionEnv {
     pub feeder: PathBuf,
     pub data_dir: PathBuf,
-    /// The model and thinking level the CLI runs with.
     pub run: RunConfig,
 }
 
 impl SessionEnv {
-    /// This Mac's Feeder: the CLI beside the running binary (a development build) or the one
-    /// [`setup::feeder_binary`] picks (the app's bundled copy), and the active data folder.
     pub fn detect() -> SessionEnv {
         let sibling = std::env::current_exe().ok().and_then(|exe| Some(exe.parent()?.join("feeder"))).filter(|p| p.is_file());
         SessionEnv { feeder: sibling.unwrap_or_else(setup::feeder_binary), data_dir: data_dir(), run: RunConfig::default() }
     }
 }
 
-/// Codex features that give the model a tool of its own. A session turns all of them off, so
-/// its only tools are the gardener's.
 const CODEX_DISABLED_FEATURES: &[&str] = &[
     "shell_tool",
     "unified_exec",
@@ -131,13 +102,11 @@ const CODEX_DISABLED_FEATURES: &[&str] = &[
     "skill_mcp_dependency_install",
 ];
 
-/// How much stderr to keep for an error message.
 const STDERR_CHARS: usize = 400;
 const ACP_FRAME_BYTES: u64 = 2 * 1024 * 1024;
 
 type Sink = Box<dyn Fn(Event) + Send + Sync>;
 
-/// A running session. Dropping it stops the session.
 pub struct Session {
     backend: Backend,
     inner: Arc<Inner>,
@@ -151,13 +120,11 @@ struct Inner {
     run_id: i64,
     scratch: Scratch,
     child: Mutex<Option<Child>>,
-    /// Claude Code's stdin, kept open for follow-up messages.
     stdin: Mutex<Option<ChildStdin>>,
     state: Mutex<StreamState>,
     acp: Mutex<acp::State>,
     recording: Mutex<Recorder>,
     send_lock: Mutex<()>,
-    /// The agent's latest reply, for the run log's summary.
     last_reply: Mutex<String>,
     stopping: AtomicBool,
     ended: AtomicBool,
@@ -172,20 +139,10 @@ struct ChildPipes {
 type ProcessMonitor = JoinHandle<std::io::Result<Option<ExitStatus>>>;
 
 impl Session {
-    /// Starts a session with `opening` as the person's first message. Events arrive on `sink`
-    /// from a background thread.
-    ///
-    /// # Errors
-    /// [`Error::NotFound`] when the backend isn't installed, [`Error::Invalid`] when a session is
-    /// already running, and I/O errors when the CLI can't start.
     pub fn start(backend: Backend, env: SessionEnv, opening: &str, sink: impl Fn(Event) + Send + Sync + 'static) -> Result<Session> {
         Self::start_scoped(backend, env, Scope::Notebook, opening, sink)
     }
 
-    /// Starts a session whose tools can only access the given scope.
-    ///
-    /// # Errors
-    /// Returns an error for an unavailable provider or project, an active session, or a failed launch.
     pub fn start_scoped(
         backend: Backend,
         env: SessionEnv,
@@ -196,10 +153,6 @@ impl Session {
         Self::start_curator(backend, env, scope, SessionMode::Review, opening, sink)
     }
 
-    /// Starts Curator with a fixed scope and set of Notebook permissions.
-    ///
-    /// # Errors
-    /// Returns an error for an unavailable provider or project, an active session, or a failed launch.
     pub fn start_curator(
         backend: Backend,
         env: SessionEnv,
@@ -211,11 +164,6 @@ impl Session {
         Self::start_curator_chat(backend, env, scope, mode, ChatOpening::Message(opening), sink)
     }
 
-    /// Starts a saved Curator chat with a typed message or a named job.
-    ///
-    /// # Errors
-    /// Returns an error for an unavailable provider or project, an active session, or failure
-    /// to save or start the chat.
     pub fn start_curator_chat(
         backend: Backend,
         env: SessionEnv,
@@ -228,7 +176,6 @@ impl Session {
         let bin = backend.binary().ok_or_else(|| Error::NotFound(format!("{} isn't installed", backend.label())))?;
         let scratch = Scratch::new()?;
         let store = Store::open(&env.data_dir)?;
-        // A continued chat's session starts fresh, so it reads the saved conversation first.
         let prompt = match opening {
             ChatOpening::Continue { from, message } => super::chat::continuation_prompt(&store.curator_chat_events(from)?, message),
             _ => opening.prompt().to_string(),
@@ -276,10 +223,6 @@ impl Session {
         self.backend
     }
 
-    /// Saves and sends the person's follow-up. Call it after [`Event::TurnFinished`].
-    ///
-    /// # Errors
-    /// Returns an error when the session has ended, the message cannot be saved, or submission fails.
     pub fn send(&self, text: &str) -> Result<()> {
         let _send = lock(&self.inner.send_lock);
         if self.inner.stopping.load(Ordering::Acquire) || self.inner.ended.load(Ordering::SeqCst) {
@@ -313,12 +256,10 @@ impl Session {
         sent
     }
 
-    /// The stored session ID for looking up its committed changes.
     pub fn run_id(&self) -> i64 {
         self.inner.run_id
     }
 
-    /// Ends the session now, stopping the CLI mid-turn if need be.
     pub fn stop(&self) {
         self.inner.stopping.store(true, Ordering::Release);
         self.inner.terminate();
@@ -455,7 +396,6 @@ impl Inner {
         let mut cmd = profile::command(self.backend, bin, &self.env.data_dir)?;
         cmd.current_dir(self.scratch.path())
             .args(["-p", "--input-format", "stream-json", "--output-format", "stream-json", "--verbose", "--include-partial-messages"])
-            // No built-in tools, only the gardener's server, none of the person's settings or hooks.
             .args(["--restricted", "--tools", "", "--strict-mcp-config", "--allowedTools", "mcp__feeder", "--setting-sources", ""])
             .args(["--settings", r#"{"disableAllHooks":true}"#])
             .args(["--no-session-persistence", "--append-system-prompt", self.mode.instructions()])
@@ -493,7 +433,6 @@ impl Inner {
         for &feature in CODEX_DISABLED_FEATURES {
             cmd.args(["--disable", feature]);
         }
-        // One inline table replaces the person's own MCP servers for this run.
         let server = format!(
             "mcp_servers={{feeder={{command={},args=[\"mcp\",\"--gardener\",\"--gardener-run\",\"{}\"],env={{FEEDER_HOME={}}},default_tools_approval_mode=\"approve\"}}}}",
             toml_string(&helper.to_string_lossy()),
@@ -526,7 +465,6 @@ impl Inner {
         Ok(())
     }
 
-    /// Reads the child's stream on a thread and forwards events until it exits.
     fn watch(self: &Arc<Self>, pipes: ChildPipes, monitor: ProcessMonitor, parse: fn(&str, &mut StreamState) -> Vec<Event>) -> Result<()> {
         let inner = Arc::clone(self);
         let spawned = std::thread::Builder::new().name("feeder-gardener-stream".into()).spawn(move || {
@@ -558,7 +496,6 @@ impl Inner {
             }
             let crashed = !status.is_ok_and(|status| status.is_some_and(|s| s.success()));
             match inner.backend {
-                // Claude Code exiting ends the session.
                 Backend::ClaudeCode => {
                     let already_reported = needs_sign_in || stream_error.is_some();
                     let error = if needs_sign_in {
@@ -573,7 +510,6 @@ impl Inner {
                     }
                     inner.end(error.as_deref());
                 }
-                // Codex exits after every turn; only a turn that never finished is a failure.
                 Backend::Codex if crashed || !turn_done => {
                     let already_reported = needs_sign_in || stream_error.is_some();
                     let error = if needs_sign_in {
@@ -683,16 +619,13 @@ impl Inner {
                 *slot = None;
             }
         }
-        // A writer may be blocked in the pipe. Kill the reader before trying to close it.
         *lock(&self.stdin) = None;
     }
 
-    /// Logs the end and tells the view, once.
     fn end(&self, error: Option<&str>) {
         if self.ended.swap(true, Ordering::SeqCst) {
             return;
         }
-        // The process may exit before the stream thread lets go of `Inner`, so don't wait for Drop.
         let _ = std::fs::remove_dir_all(self.scratch.path());
         let failed = {
             let mut recording = lock(&self.recording);
@@ -711,13 +644,9 @@ fn process_status(monitor: ProcessMonitor) -> std::io::Result<Option<ExitStatus>
 }
 
 pub(super) fn child_exited(id: u32) -> std::io::Result<bool> {
-    // SAFETY: zero is valid for siginfo_t and provides a zero pid when no child is ready.
     let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
-    // SAFETY: `info` is writable, id belongs to an owned child, and WNOWAIT leaves the leader
-    // unreaped so its process group can be signalled before its PID becomes reusable.
     let result = unsafe { libc::waitid(libc::P_PID, id, &mut info, libc::WEXITED | libc::WNOHANG | libc::WNOWAIT) };
     if result == 0 {
-        // SAFETY: waitid populates this field on exit and leaves the zero pid for no result.
         return Ok(unsafe { info.si_pid() } != 0);
     }
     let error = std::io::Error::last_os_error();
@@ -728,8 +657,6 @@ pub(super) fn terminate_child(child: &mut Child) -> std::io::Result<ExitStatus> 
     if let Ok(group) = libc::pid_t::try_from(child.id())
         && group > 0
     {
-        // SAFETY: every launched provider leads its own group; the caller exclusively owns the
-        // Child and has not yet reaped it, so the group ID cannot be reused before kill.
         unsafe { libc::kill(-group, libc::SIGKILL) };
     }
     let _ = child.kill();
@@ -749,7 +676,6 @@ fn stderr_tail(mut reader: impl Read) -> String {
     String::from_utf8_lossy(&tail).into_owned()
 }
 
-/// Lock poisoning means a stream thread panicked; the session can't continue sensibly.
 fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
     m.lock().expect("gardener session lock poisoned")
 }
@@ -777,7 +703,6 @@ fn last_lines(stderr: &str) -> String {
     non_empty_last_lines(stderr).unwrap_or_else(|| "the CLI stopped unexpectedly".into())
 }
 
-/// A TOML basic string, for paths in Codex's `-c` overrides.
 fn toml_string(s: &str) -> String {
     let escaped: String = s
         .chars()
@@ -790,10 +715,8 @@ fn toml_string(s: &str) -> String {
     format!("\"{escaped}\"")
 }
 
-/// An empty folder the CLI runs in, so it can't pick up a project's instructions. Removed on drop.
 struct Scratch(PathBuf);
 
-/// The prefix of every scratch folder, followed by the owning process id.
 const SCRATCH_PREFIX: &str = "feeder-gardener-";
 
 impl Scratch {
@@ -809,7 +732,6 @@ impl Scratch {
     }
 }
 
-/// Removes scratch folders whose process is gone (an app force-quit mid-session).
 fn sweep_orphans() {
     let Ok(entries) = std::fs::read_dir(std::env::temp_dir()) else { return };
     for entry in entries.flatten() {

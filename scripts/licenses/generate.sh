@@ -1,6 +1,4 @@
 #!/usr/bin/env bash
-# Writes assets/ThirdPartyLicenses.html: every Rust dependency's license (cargo-about), plus
-# Sparkle's. Rerun after changing dependencies. Needs `cargo install cargo-about --features cli`.
 set -euo pipefail
 cd "$(dirname "$0")/../.."
 out=assets/ThirdPartyLicenses.html

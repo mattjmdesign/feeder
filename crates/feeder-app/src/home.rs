@@ -1,5 +1,3 @@
-//! The shelf: every project as an orb, nothing else in the way.
-
 use feeder_core::{Order, ProjectSummary, ago, extract_block};
 use rune::tok::motion;
 use rune::{Cursor, El, ScrollSpec, Spring, Transition, Tx, col, el, row, text};
@@ -216,13 +214,12 @@ fn tile(s: &State, summary: &ProjectSummary, p: &Palette, k: &Kit, reduced_motio
             .child(text(ago(at, s.now)).font(style::META).color(if hovered || selected { p.text_2 } else { p.text_3 })),
         _ => row().child(text("No updates yet").font(style::META).color(p.text_3)),
     };
-    let orb_el = orb::orb(&summary.project.orb, size);
-    let mut sphere = el()
-        .key(format!("orb-{id}"))
-        .matched(format!("orb-{id}"))
-        .size(size, size)
-        .scale(if hovered || selected { 1.06 } else { 1.0 })
-        .motion(Spring::new(0.42, 0.28));
+    let mut orb_el = orb::orb(&summary.project.orb, size);
+    if archived {
+        orb_el = orb_el.opacity(0.68);
+    }
+    let orb_el = orb_el.key(format!("orb-{id}")).matched(format!("orb-{id}")).motion(Spring::new(0.42, 0.28));
+    let mut sphere = el().size(size, size).scale(if hovered || selected { 1.06 } else { 1.0 }).motion(Spring::new(0.42, 0.28));
     if summary.active_pulse.is_some() && !archived {
         let phase = if reduced_motion { 0.65 } else { ((s.clock * 1.4).sin() as f32) * 0.5 + 0.5 };
         sphere = sphere.child(orb::pulse_halo(&summary.project.orb, size, phase));
@@ -235,7 +232,7 @@ fn tile(s: &State, summary: &ProjectSummary, p: &Palette, k: &Kit, reduced_motio
                 .border(1.5, orb::accent(&summary.project.orb).alpha(0.65)),
         );
     }
-    sphere = sphere.child(if archived { orb_el.opacity(0.68) } else { orb_el });
+    sphere = sphere.child(orb_el);
 
     let mut name_row = row().center_y().gap(6.0).max_w(width - 4.0);
     if summary.needs_you && !archived {
@@ -250,7 +247,6 @@ fn tile(s: &State, summary: &ProjectSummary, p: &Palette, k: &Kit, reduced_motio
     }
 
     let mut words = col().items_center().gap(5.0).child(name_row).child(meta);
-    // Status in words, two lines at most: the orb is the project's face, the text says what's up.
     let status_text =
         |line: String, color| text(line).font(style::META).color(color).align(rune::Align::Center).max_lines(2).max_w(width - 4.0);
     if !archived && let Some(pulse) = &summary.active_pulse {
@@ -312,7 +308,6 @@ fn tile(s: &State, summary: &ProjectSummary, p: &Palette, k: &Kit, reduced_motio
         .build(k, layer)
 }
 
-/// The question or blocker behind a project's "Needs you", from its latest update.
 pub fn needs_you_question(sum: &ProjectSummary) -> Option<String> {
     sum.last_body
         .as_deref()

@@ -20,7 +20,6 @@ final class MenuBarController: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private var parentPid: pid_t?
     private var cachedRows: [ProjectRow] = []
 
-    // Owned exclusively by `dbQueue`.
     private let dbQueue = DispatchQueue(label: "com.feeder.menubar.db", qos: .utility)
     private var dbHandle: OpaquePointer?
     private var dbHandlePath: String?
@@ -38,8 +37,6 @@ final class MenuBarController: NSObject, NSApplicationDelegate, NSMenuDelegate {
         menu = NSMenu()
         menu.delegate = self
         statusItem.menu = menu
-        // Drawn before the first read, so the item never shows up blank when the database is
-        // missing, locked or mid-migration.
         updateBadge()
 
         scheduleRefresh(force: true)
@@ -200,7 +197,6 @@ final class MenuBarController: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
             var stmt: OpaquePointer?
             guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK else {
-                // Schema may have changed or db was replaced; reconnect next tick.
                 self.closeDb()
                 return
             }
@@ -276,8 +272,6 @@ final class MenuBarController: NSObject, NSApplicationDelegate, NSMenuDelegate {
         let label = (["Feeder"] + status).joined(separator: " · ")
         btn.setAccessibilityLabel(label)
         btn.toolTip = label
-        // Only a decision earns the dot: unread updates are almost always there, and a dot that
-        // never clears stops meaning anything.
         btn.image = needsCount > 0 ? Self.attentionIcon : Self.idleIcon
         btn.imagePosition = .imageOnly
     }
@@ -285,8 +279,6 @@ final class MenuBarController: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private static let idleIcon = statusIcon(attention: false)
     private static let attentionIcon = statusIcon(attention: true)
 
-    /// Three marbles, after the app icon. With `attention`, a dot sits in the top-right corner,
-    /// cut clear of the marbles so it reads at menu bar size.
     private static func statusIcon(attention: Bool) -> NSImage {
         let image = NSImage(size: NSSize(width: 18, height: 18), flipped: false) { _ in
             NSColor.black.setFill()
@@ -326,7 +318,6 @@ final class MenuBarController: NSObject, NSApplicationDelegate, NSMenuDelegate {
         return item
     }
 
-    /// A project row: the name, then a quieter note (what it's doing or who posted last).
     private func projectItem(_ p: ProjectRow, note: String?, dot: NSImage) -> NSMenuItem {
         let item = NSMenuItem(title: p.name, action: #selector(openProjectItem(_:)), keyEquivalent: "")
         if let note, !note.isEmpty {
@@ -354,7 +345,6 @@ final class MenuBarController: NSObject, NSApplicationDelegate, NSMenuDelegate {
             hint.isEnabled = false
             menu.addItem(hint)
         } else {
-            // Each project appears once, under the most pressing thing about it.
             let needs = cachedRows.filter { $0.needsYou }
             let working = cachedRows.filter { !$0.needsYou && $0.pulseStatus != nil }
             let rest = cachedRows.filter { !$0.needsYou && $0.pulseStatus == nil }

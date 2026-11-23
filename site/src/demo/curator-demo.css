@@ -1,4 +1,3 @@
-/* Curator: a flagged Feed update reviewed into a cited, revertible Notebook note */
 .cd2 {
   .ss-stage {
     overflow: hidden;
@@ -31,7 +30,6 @@
     font-size: 12px;
   }
 
-  /* Curator's entry in the app's top right: its own orb, a pill that stands apart from the tabs */
   .cd2-pill {
     display: inline-flex;
     align-items: center;
@@ -134,18 +132,15 @@
     background: var(--ss-surface);
   }
 
-  /* The window bleeds off the right edge; content stays inside the visible 342px */
   .ss-stage[data-layout='compact'] .cd2-main {
     padding: 16px 74px 36px 16px;
   }
 
-  /* Older lines scroll up under a soft fade, the way a chat does */
   .ss-stage[data-layout='compact'] .cd2-thread-col {
     overflow: hidden;
     mask-image: linear-gradient(to bottom, transparent 0, #000 56px);
   }
 
-  /* Inset to the flag card's content, so step icons and the flag's dot share one column */
   .cd2-thread-col {
     padding-left: 15px;
     padding-bottom: 18px;

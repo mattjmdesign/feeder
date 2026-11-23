@@ -1,7 +1,3 @@
-//! Which subscriptions power Curator, their nicknames, and the model and thinking level each runs
-//! with: Settings → Curator and the picker in Curator's composer. Signing a CLI in only makes it
-//! available; Curator runs on it after it's turned on here.
-
 use std::collections::HashMap;
 use std::sync::mpsc::{self, Receiver, Sender};
 
@@ -14,16 +10,11 @@ use rune_kit::{
 use crate::style::{self, Palette};
 use crate::{State, agents};
 
-/// The CLI's default model or thinking level.
-/// The CLI picks the model (its own default for that account).
 const MODEL_DEFAULT: &str = "Account default";
-/// The model picks its thinking level.
 const DEFAULT: &str = "Default";
-/// Wide enough to show full `provider/model-name` strings like `opencode-go/deepseek-v4.1-flash`.
 const MODEL_FIELD_W: f32 = 320.0;
 const MODEL_MENU_W: f32 = 400.0;
 const PICKER_MENU_W: f32 = 380.0;
-/// Show a search box inside the composer popover once a provider offers more than a handful of models.
 const PICKER_SEARCH_MIN: usize = 7;
 
 pub enum Models {
@@ -38,7 +29,6 @@ pub struct Curator {
     tx: Sender<(Backend, Result<Vec<ModelInfo>, String>)>,
     rx: Receiver<(Backend, Result<Vec<ModelInfo>, String>)>,
     nicknames: HashMap<Backend, TextEdit>,
-    /// The open dropdown in Settings → Curator, by key.
     pub open_select: Option<String>,
     pub picker_open: bool,
     model_search: TextEdit,
@@ -80,7 +70,6 @@ impl Curator {
         self.save();
     }
 
-    /// Lists the subscription's models once, off the UI thread.
     pub fn want_models(&mut self, backend: Backend, wake: Option<&Waker>) {
         if matches!(self.models.get(&backend), Some(Models::Loading | Models::Ready(_))) {
             return;
@@ -100,8 +89,6 @@ impl Curator {
         }
     }
 
-    /// Sample choices for snapshot scenes: Claude Code on as "Work" with its models listed.
-    /// Nothing is saved.
     pub fn demo(&mut self) {
         let mut prefs = CuratorPrefs::default();
         prefs.set_enabled(Backend::ClaudeCode, true);
@@ -120,8 +107,6 @@ impl Curator {
         self.models.insert(Backend::Codex, Models::Loading);
     }
 
-    /// Like [`Self::demo`] with OpenCode on, listing the models its own cache knows, which come
-    /// from several services. Nothing is saved.
     pub fn demo_opencode(&mut self) {
         self.demo();
         self.prefs.set_enabled(Backend::OpenCode, true);
@@ -151,7 +136,6 @@ impl Curator {
         }
     }
 
-    /// The chosen model's thinking levels; empty when it has none or none is chosen.
     fn efforts(&self, backend: Backend) -> Vec<String> {
         self.model_info(backend).map(|m| m.efforts.clone()).unwrap_or_default()
     }
@@ -161,7 +145,6 @@ impl Curator {
         Some(self.model_info(backend).map_or(id, |m| m.label.clone()))
     }
 
-    /// Turns on or off for Curator. Loads its models when it turns on.
     pub fn set_enabled(&mut self, backend: Backend, on: bool, wake: Option<&Waker>) {
         self.edit(|p| p.set_enabled(backend, on));
         if on {
@@ -177,7 +160,6 @@ impl Curator {
         self.edit(|p| {
             p.edit(backend, |pr| {
                 pr.model = id;
-                // A level the new model doesn't offer falls back to its default.
                 if pr.effort.as_ref().is_some_and(|e| !efforts.as_ref().is_some_and(|l| l.contains(e))) {
                     pr.effort = None;
                 }
@@ -205,22 +187,17 @@ impl Curator {
     }
 }
 
-/// Opens Settings on the Curator page.
 pub fn open_settings(s: &mut State) {
     s.settings_page = crate::chrome::SettingsPage::Curator;
     s.settings_open = true;
 }
 
-/// The provider a new chat runs on: the chosen one if it's still on and installed, else the
-/// default, else the first turned on. `None` until one is turned on.
 pub fn selected(s: &State) -> Option<Backend> {
     let installed = &s.notebook.gardener.backends;
     let prefs = &s.curator.prefs;
     let on = |b: &Backend| prefs.is_enabled(*b) && installed.contains(b);
     s.notebook.curator_backend.filter(on).or_else(|| prefs.default_backend().filter(on)).or_else(|| prefs.enabled().into_iter().find(on))
 }
-
-// ---------- Settings → Curator ----------
 
 pub fn pane(s: &State, p: &Palette, k: &Kit, layer: &mut Vec<El>) -> El {
     let installed = &s.notebook.gardener.backends;
@@ -314,7 +291,6 @@ fn subscription(s: &State, backend: Backend, p: &Palette, k: &Kit, layer: &mut V
     card
 }
 
-/// A turned-on subscription's nickname, model, and thinking level.
 fn details(s: &State, backend: Backend, p: &Palette, k: &Kit, layer: &mut Vec<El>) -> El {
     let c = &s.curator;
     let nick_edit = c.nicknames.get(&backend).cloned().unwrap_or_else(|| TextEdit::new(""));
@@ -523,7 +499,6 @@ fn model_select(s: &State, backend: Backend, p: &Palette, k: &Kit, layer: &mut V
     }
 }
 
-/// Up to four levels fit a segmented control; more (Codex lists six) use a dropdown.
 fn effort_control(s: &State, backend: Backend, efforts: &[String], field_w: Option<f32>, k: &Kit, layer: &mut Vec<El>) -> El {
     let current = s.curator.prefs.get(backend).effort;
     let mut labels = vec![DEFAULT.to_string()];
@@ -559,14 +534,9 @@ fn effort_control(s: &State, backend: Backend, efforts: &[String], field_w: Opti
     sel.build(k, layer)
 }
 
-// ---------- Composer picker ----------
-
-/// The chip beside Send: the subscription's mark, then its model and thinking level. Opens a
-/// popover to switch subscription, model, and thinking. Changes apply to the next message.
 pub fn picker(s: &State, current: Backend, p: &Palette, k: &Kit, layer: &mut Vec<El>) -> El {
     let c = &s.curator;
     let prefs = &c.prefs;
-    // Which subscription first, so work and personal read apart at a glance.
     let mut summary = prefs.name(current);
     if let Some(model) = c.model_label(current) {
         summary = format!("{summary} · {model}");
@@ -787,15 +757,12 @@ fn option_row_base(p: &Palette, label: String, checked: bool, mark: Option<El>) 
     r.child(text(label.clone()).font(if checked { style::CONTROL } else { style::BODY }).color(p.text).truncate().grow(1.0)).label(label)
 }
 
-/// The model picker's leading mark size, matching the 14 pt check column.
 const MODEL_MARK: f32 = 14.0;
 
-/// A model row's logo: the service the model comes from, else its subscription's.
 fn model_mark(s: &State, model: &str, backend: Backend, p: &Palette) -> El {
     agents::model_mark(model, backend.label(), p, MODEL_MARK, s.agent_icon(backend.label()))
 }
 
-/// "Account default" runs whatever the subscription picks, so it wears the subscription's logo.
 fn sub_mark(s: &State, backend: Backend, p: &Palette) -> El {
     agents::mark(backend.label(), p, MODEL_MARK, s.agent_icon(backend.label()))
 }
@@ -804,9 +771,6 @@ fn divider(p: &Palette) -> El {
     el().w_full().h(1.0).fill(p.hairline).my(4.0)
 }
 
-// ---------- Shared Settings pieces ----------
-
-/// A page title, with one line under it only when the page needs it explained.
 pub fn header(p: &Palette, title: &str, lede: &str) -> El {
     let mut c = col().w_full().gap(6.0).child(text(title.to_string()).font(style::DISPLAY).color(p.text));
     if !lede.is_empty() {
@@ -815,7 +779,6 @@ pub fn header(p: &Palette, title: &str, lede: &str) -> El {
     c
 }
 
-/// A titled, bordered list; rows are separated by hairlines.
 pub fn group(p: &Palette, title: Option<&str>, rows: Vec<El>) -> El {
     let mut list = col().w_full().radius(12.0).border(1.0, p.hairline).clip_rounded(12.0);
     let count = rows.len();
@@ -840,7 +803,6 @@ pub fn labeled(p: &Palette, label: &str, hint: Option<&str>, control: El) -> El 
     row().w_full().gap(16.0).center_y().px(16.0).py(10.0).child(words).child(control)
 }
 
-/// A label and control without row padding, for the settings inside a subscription.
 fn field(p: &Palette, label: &str, control: El) -> El {
     row().w_full().gap(16.0).center_y().child(text(label.to_string()).font(style::BODY).color(p.text_2).grow(1.0)).child(control)
 }

@@ -1,7 +1,3 @@
-//! How agents should write an update. One text, served everywhere an agent might look: the MCP
-//! server's instructions and `update` prompt, `feeder guide`, `feeder post --help` and the skill
-//! `feeder setup` installs.
-
 pub const GUIDE: &str = r#"# Writing a Feeder update
 
 Feeder is the user's local project update centre: one feed per project, plus one stream across all of them.
@@ -63,9 +59,7 @@ CLI (from the project folder):
 MCP: call `post_update` with `summary` (and `screenshots` or `screenshot_path` when visible).
 "#;
 
-/// How agents should use the Notebook. Served by the MCP server, `feeder notebook guide`, and
-/// the `feeder-notebook` skill.
-pub const NOTEBOOK_GUIDE: &str = r###"# Feeder's notebook: a shared Markdown knowledge library across projects
+pub const NOTEBOOK_GUIDE: &str = r#"# Feeder's notebook: a shared Markdown knowledge library across projects
 
 The notebook is one shared, searchable library of freeform Markdown articles across every project
 and every agent: non-obvious bug fixes, approaches that failed, reusable patterns, architecture
@@ -97,16 +91,14 @@ Keep status updates in the Feed. Leave out secrets, tokens, keys, and customer d
 
 Curator reviews flags and maintains the shared notes. As a working agent, never create, edit,
 archive, or restore shared notes. Flag the change and keep working.
-"###;
+"#;
 
-/// The skill that teaches agents to search the Notebook and flag gaps for Curator.
 pub fn notebook_skill_markdown() -> String {
     format!(
         "---\nname: feeder-notebook\ndescription: Search Feeder's shared Notebook before non-trivial debugging or choosing an unfamiliar approach. Flag missing, wrong, or outdated knowledge for Curator, with a verified suggestion when available.\n---\n\n{NOTEBOOK_GUIDE}"
     )
 }
 
-/// The skill `feeder setup` installs for agents that load skills (Claude Code, Codex, OpenCode…).
 pub fn skill_markdown() -> String {
     format!(
         "---\nname: feeder-update\ndescription: Post or read a project update in Feeder, the user's local project update centre. Use when finishing a meaningful piece of work, when the user asks for a status/handoff/Feeder update, or when resuming a project (read recent updates first). Format posts in three short blocks (Done, Why & benefit, Next & why) and attach one or more real screenshots/clips when changes are visible.\n---\n\n{GUIDE}"

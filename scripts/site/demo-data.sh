@@ -1,7 +1,4 @@
 #!/usr/bin/env bash
-# Fills a scratch Feeder data folder with made-up projects, updates and notebook pages, for the
-# website's screenshots. Never point it at real data.
-#   scripts/site/demo-data.sh <empty folder>
 set -euo pipefail
 home="${1:?usage: demo-data.sh <empty folder>}"
 cd "$(dirname "$0")/../.."

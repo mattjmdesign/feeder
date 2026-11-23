@@ -1,14 +1,12 @@
-# dmgbuild settings for Feeder's disk image: one window, the app on the left, an arrow, and
-# Applications on the right. mac-app.sh passes `app`, `background` and `volume_icon` with -D.
 import os.path
 
-app = defines["app"]  # noqa: F821 (dmgbuild provides `defines`)
+app = defines["app"]
 format = "ULFO"
 filesystem = "HFS+"
 files = [app]
 symlinks = {"Applications": "/Applications"}
-icon = defines["volume_icon"]  # noqa: F821
-background = defines["background"]  # noqa: F821
+icon = defines["volume_icon"]
+background = defines["background"]
 
 window_rect = ((200, 160), (600, 380))
 default_view = "icon-view"

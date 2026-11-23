@@ -10,13 +10,6 @@ import { ToolLogo } from './ToolLogo'
 import { useSiteTheme } from './theme'
 import './feed-demo.css'
 
-// Feeder's Feed with multi-image carousels. Beats:
-// 1. A Working pulse opens at the top of the feed with a spinner.
-// 2. The agent posts an update carrying 3 screenshots as an interactive carousel.
-// 3. The cursor glides to the next arrow and steps through slides 1/3 -> 2/3 -> 3/3
-//    while the counter pill and indicator dots update in sync.
-// 4. Holds on slide 3, then resets cleanly for the next loop.
-
 type S = { working: boolean; posted: boolean; slide: number }
 
 const initial: S = { working: false, posted: false, slide: 0 }

@@ -1,5 +1,4 @@
-//! One project's feed: the orb & brief up top, then every update newest first along a
-//! timeline, plus inline edit, two-way replies, and video playback.
+use std::rc::Rc;
 
 use feeder_core::{AttentionKind, FeedUpdate, Orb, ProjectSummary, ago, day_key, day_label, parse_attention};
 use rune::{
@@ -47,10 +46,7 @@ pub fn bar_chrome(s: &State, id: i64, p: &Palette, k: &Kit) -> (El, Option<El>) 
         return (back, None);
     };
     let archived = summary.project.archived;
-    // Show in Finder and Pin are on the project's orb menu on Home, so the header doesn't repeat
-    // them; Copy Context covers what the old resume prompt did.
     let mut actions = row().gap(4.0).center_y();
-    // Updates is what agents said; Files is what changed on disk.
     let views = [ProjectView::Updates, ProjectView::Files];
     actions = actions.child(
         SegmentedControl::new(&["Updates", "Files"], views.iter().position(|v| *v == s.files.view))
@@ -187,13 +183,17 @@ pub fn view(s: &State, id: i64, p: &Palette, k: &Kit, reduced_motion: bool) -> E
             .child(el().px(7.0).py(1.5).radius(6.0).border(1.0, p.hairline).child(text("Archived").font(style::META).color(p.text_3)));
     }
 
-    let orb_el = orb::orb(&summary.project.orb, ORB);
-    let mut orb_box = el().key(format!("orb-{id}")).matched(format!("orb-{id}")).size(ORB, ORB).mb(14.0).motion(Spring::new(0.5, 0.18));
+    let mut orb_el = orb::orb(&summary.project.orb, ORB);
+    if archived {
+        orb_el = orb_el.opacity(0.68);
+    }
+    let orb_el = orb_el.key(format!("orb-{id}")).matched(format!("orb-{id}")).motion(Spring::new(0.5, 0.18));
+    let mut orb_box = el().size(ORB, ORB).mb(14.0);
     if summary.active_pulse.is_some() && !archived {
         let phase = if reduced_motion { 0.65 } else { ((s.clock * 1.4).sin() as f32) * 0.5 + 0.5 };
         orb_box = orb_box.child(orb::pulse_halo(&summary.project.orb, ORB, phase));
     }
-    orb_box = orb_box.child(if archived { orb_el.opacity(0.68) } else { orb_el });
+    orb_box = orb_box.child(orb_el);
 
     let mut intro =
         col().key("intro").w_full().items_center().gap(8.0).pb(24.0).child(orb_box).child(title(s, p, &summary.project.name)).child(meta);
@@ -202,7 +202,6 @@ pub fn view(s: &State, id: i64, p: &Palette, k: &Kit, reduced_motion: bool) -> E
     }
     intro = intro_extras(s, p, k, summary, intro);
 
-    let md = markdown_style(p, k);
     let mut timeline = col().key("timeline").w_full();
     if s.feed_for == Some(id) {
         let search_active = s.project_search_open || !s.project_search.text.is_empty();
@@ -212,26 +211,54 @@ pub fn view(s: &State, id: i64, p: &Palette, k: &Kit, reduced_motion: bool) -> E
 
         let visible = visible_feed(s);
         {
+            struct PostRow {
+                id: i64,
+                key: String,
+                starts_day: bool,
+                last_in_day: bool,
+            }
+
             let n = visible.len();
             if n > 0 {
-                let mut rows = col().key("project-posts").w_full().growth(GrowthSpec::default()).virtualize(260.0).on_visible_rows(
-                    |s: &mut State, range| {
+                let mut prev_day: Option<i64> = None;
+                let post_rows: Rc<[PostRow]> = visible
+                    .iter()
+                    .enumerate()
+                    .map(|(i, u)| {
+                        let dk = day_key(u.created_at);
+                        let starts_day = prev_day.replace(dk) != Some(dk);
+                        let same_next = visible.get(i + 1).is_some_and(|next| day_key(next.created_at) == dk);
+                        PostRow { id: u.id, key: format!("u-{}", u.id), starts_day, last_in_day: !same_next }
+                    })
+                    .collect();
+                let keys = post_rows.clone();
+                let (row_p, row_k) = (*p, k.clone());
+                let row_md = markdown_style(&row_p, &row_k);
+                let project_id = id;
+                let rows = col()
+                    .key("project-posts")
+                    .w_full()
+                    .growth(GrowthSpec::default())
+                    .virtual_rows(
+                        post_rows.len(),
+                        260.0,
+                        move |_: &State, i| keys[i].key.clone().into(),
+                        move |s: &State, i| {
+                            let row = &post_rows[i];
+                            let Some(u) = s.feed.iter().find(|u| u.id == row.id) else { return el() };
+                            let Some(summary) = s.summary(project_id) else { return el() };
+                            let mut row_el = col().w_full();
+                            if row.starts_day {
+                                row_el = row_el.child(day_divider(day_label(u.created_at, s.now), &row_p, i > 0));
+                            }
+                            row_el.child(entry(s, (&row_p, &row_k, &row_md), u, &summary.project.orb, i == 0, row.last_in_day))
+                        },
+                    )
+                    .on_visible_rows(|s: &mut State, range| {
                         s.project_visible_rows = Some(range);
                         crate::media::sync(s);
                         false
-                    },
-                );
-                let mut prev_day: Option<i64> = None;
-                for (i, u) in visible.iter().enumerate() {
-                    let dk = day_key(u.created_at);
-                    let mut row_el = col().key(format!("u-{}", u.id)).w_full();
-                    if prev_day != Some(dk) {
-                        row_el = row_el.child(day_divider(day_label(u.created_at, s.now), p, i > 0));
-                        prev_day = Some(dk);
-                    }
-                    let same_next = visible.get(i + 1).is_some_and(|next| day_key(next.created_at) == dk);
-                    rows = rows.child(row_el.child(entry(s, (p, k, &md), u, &summary.project.orb, i == 0, !same_next)));
-                }
+                    });
                 timeline = timeline.child(rows);
             } else {
                 let empty_msg = if !s.project_search.text.trim().is_empty() {
@@ -458,7 +485,6 @@ fn project_toolbar(s: &State, p: &Palette) -> El {
     bar
 }
 
-/// The day a run of updates was posted: the date alone, no rule.
 pub fn day_divider(label: String, p: &Palette, spaced: bool) -> El {
     row()
         .w_full()
@@ -477,8 +503,6 @@ fn handoff_markdown(summary: &ProjectSummary, feed: &[FeedUpdate], now: i64) -> 
     out
 }
 
-/// The project's name, or the field renaming it. The path under it never changes, so a nickname
-/// always traces back to its repository.
 fn title(s: &State, p: &Palette, name: &str) -> El {
     let Some(edit) = &s.editing else {
         return text(name.to_string())
@@ -584,14 +608,9 @@ pub fn attention_badge(p: &Palette, kind: Option<AttentionKind>) -> El {
         .center_y()
         .fill(p.amber.alpha(0.14))
         .child(el().size(5.0, 5.0).radius(2.5).fill(p.amber))
-        // Amber stays in the dot and tint; the label uses body ink so it holds 4.5:1 on the tint.
         .child(text(label).font(style::META).color(p.text))
 }
 
-/// Renders the attention status for a card:
-/// - open (latest update, unanswered, not dismissed): amber badge + one-click Dismiss button
-/// - answered by a human reply: quiet muted "Answered" pill
-/// - dismissed or superseded by a newer update: nothing
 pub fn card_attention_tags(s: &State, p: &Palette, u: &FeedUpdate) -> Vec<El> {
     let Some(kind) = parse_attention(&u.body) else {
         return vec![];
@@ -655,8 +674,6 @@ pub fn card_actions(s: &State, p: &Palette, u: &FeedUpdate) -> El {
     row().gap(2.0).center_y().child(copy_btn).child(edit_btn).child(reply_btn).child(flag_btn).child(delete_btn)
 }
 
-/// While this update's flag waits for Curator: a quiet "Flagged" pill that opens the review.
-/// Once Curator writes the note, `notebook_link` takes over, so the card always shows where it is.
 pub fn flag_pill(s: &State, p: &Palette, u: &FeedUpdate) -> Option<El> {
     if !s.open_flag_for_update(u.id) {
         return None;
@@ -681,7 +698,6 @@ pub fn flag_pill(s: &State, p: &Palette, u: &FeedUpdate) -> Option<El> {
     )
 }
 
-/// A quiet link to the Notebook page written from this Feed update, when one exists.
 pub fn notebook_link(s: &State, p: &Palette, update_id: i64) -> Option<El> {
     let change = s.notebook.gardener.changes.iter().find(|c| !c.is_reverted() && c.source_updates.contains(&update_id))?;
     let page_id = change.page_id;
@@ -819,7 +835,6 @@ pub fn edit_or_body(s: &State, p: &Palette, k: &Kit, md: &MarkdownStyle, u: &Fee
     memo(format!("f-body-{uid}"), (p.dark, strong, &u.body), || body(p, md, u, strong))
 }
 
-/// An update's text: each paragraph under its label, as Markdown.
 pub fn body(p: &Palette, md: &MarkdownStyle, u: &FeedUpdate, strong: bool) -> El {
     let mut body = col().w_full().gap(11.0);
     for (i, section) in prose::sections(&u.body).into_iter().enumerate() {
@@ -938,9 +953,6 @@ pub fn replies_section(s: &State, p: &Palette, k: &Kit, u: &FeedUpdate) -> Optio
     Some(box_el)
 }
 
-/// An update's attached screenshot(s) or video clip(s) at `width`.
-/// Single attachments render directly; multiple attachments render an interactive carousel
-/// with left/right arrows, a top-right `1 / N` badge, and clickable slide dots.
 pub fn media_view(s: &State, p: &Palette, u: &FeedUpdate, width: f32) -> Option<El> {
     let slides = crate::media_slides(u);
     if slides.is_empty() {
@@ -953,8 +965,6 @@ pub fn media_view(s: &State, p: &Palette, u: &FeedUpdate, width: f32) -> Option<
     if total == 1 {
         return render_slide(s, p, slide, width, None).map(|(el, _)| el);
     }
-    // Every slide of a carousel shares one 16:10 frame, so stepping through never changes the
-    // card's height; each image fits inside it.
     let frame_h = (width * CAROUSEL_RATIO).min(SHOT_MAX_H);
     let (slide_el, frame_h) = render_slide(s, p, slide, width, Some(frame_h))?;
 
@@ -986,14 +996,11 @@ pub fn media_view(s: &State, p: &Palette, u: &FeedUpdate, width: f32) -> Option<
         .border(1.0, oklch(1.0, 0.0, 0.0).alpha(0.18))
         .child(text(format!("{} / {total}", idx + 1)).font(style::META).color(oklch(0.96, 0.0, 0.0)));
 
-    // The controls ride on the slide itself, so a press on an arrow is the arrow's, never the
-    // image's (which opens the lightbox).
     let frame = slide_el
         .child(counter)
         .child(arrow_btn(format!("car-prev-{uid}"), &CHEVRON_LEFT, "Previous slide", -1).absolute(10.0, btn_y))
         .child(arrow_btn(format!("car-next-{uid}"), &CHEVRON_RIGHT, "Next slide", 1).pin(None, Some(btn_y), Some(10.0), None));
 
-    // Each dot's hit area is at least 24 x 24 pt (WCAG 2.5.8); the visible dot stays small.
     let mut dots = row().key(format!("car-dots-{uid}")).w_full().center().pt(2.0);
     for i in 0..total {
         let active = i == idx;
@@ -1021,7 +1028,6 @@ pub fn media_view(s: &State, p: &Palette, u: &FeedUpdate, width: f32) -> Option<
     Some(col().key(format!("car-{uid}")).w_full().child(frame).child(dots))
 }
 
-/// A carousel frame's height as a share of its width (16:10).
 const CAROUSEL_RATIO: f32 = 10.0 / 16.0;
 
 static CHEVRON_LEFT: Icon = Icon {
@@ -1036,7 +1042,6 @@ static CHEVRON_RIGHT: Icon = Icon {
     body: r#"<path d="M6 3.5L10.5 8L6 12.5" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" fill="none"/>"#,
 };
 
-/// One slide at its natural height, or fitted inside a fixed `frame` height for a carousel.
 fn render_slide(s: &State, p: &Palette, slide: &crate::MediaSlide, width: f32, frame: Option<f32>) -> Option<(El, f32)> {
     let mid = slide.id;
     if let Some(player) = s.videos.get(&mid) {

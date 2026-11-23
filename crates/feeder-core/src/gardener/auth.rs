@@ -1,5 +1,3 @@
-//! Connection checks and account labels for each provider's own CLI.
-
 use std::io::{self, BufRead, BufReader, Read, Write};
 use std::os::unix::process::CommandExt;
 use std::path::Path;
@@ -13,18 +11,14 @@ use super::{Backend, profile, session};
 
 const CODEX_ACCOUNT_TIMEOUT: Duration = Duration::from_secs(3);
 
-/// What the installed CLI reports about its Curator account. This does not check subscription
-/// entitlements, model access, or remaining usage.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ConnectionStatus {
     NotInstalled,
     SignedOut,
     Connected,
-    /// The CLI did not confirm an account. Some providers can still offer models without one.
     Unknown,
 }
 
-/// Sign-in state plus any non-secret account label the CLI reports (such as an email and plan).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct AccountStatus {
     pub status: ConnectionStatus,
@@ -38,33 +32,20 @@ impl AccountStatus {
 }
 
 impl Backend {
-    /// Checks the provider's login in the same environment used by Curator runs and sign-in.
-    /// Runs no model prompt. Call on a worker thread: a slow check can take up to five seconds.
-    pub fn connection_status(self, data_dir: &Path) -> ConnectionStatus {
-        self.check_status(data_dir, false).status
-    }
-
-    /// Checks the provider's login and reads a short display label (email/plan or connected
-    /// providers) when the CLI reports one. Call on a worker thread.
     pub fn account_status(self, data_dir: &Path) -> AccountStatus {
-        self.check_status(data_dir, true)
-    }
-
-    fn check_status(self, data_dir: &Path, with_label: bool) -> AccountStatus {
         let Some(bin) = self.binary() else { return AccountStatus::from_status(ConnectionStatus::NotInstalled) };
         let Ok(mut cmd) = profile::command(self, &bin, data_dir) else { return AccountStatus::from_status(ConnectionStatus::Unknown) };
         let args: &[&str] = match self {
             Self::ClaudeCode => &["auth", "status", "--json"],
             Self::Codex => &["login", "status"],
             Self::OpenCode => &["auth", "list", "--format", "json", "--standalone"],
-            // Listing models requires a login and does not create a conversation.
             Self::Antigravity => &["models"],
         };
         let Ok((status, stdout, stderr)) = read_output(cmd.args(args), Duration::from_secs(5)) else {
             return AccountStatus::from_status(ConnectionStatus::Unknown);
         };
         let conn = classify(self, status.code(), &stdout, &stderr);
-        let label = if with_label && conn == ConnectionStatus::Connected {
+        let label = if conn == ConnectionStatus::Connected {
             match self {
                 Self::ClaudeCode => claude_account_label(&stdout),
                 Self::OpenCode => opencode_account_label(&stdout),
@@ -232,13 +213,10 @@ fn classify(backend: Backend, code: Option<i32>, stdout: &[u8], stderr: &[u8]) -
             Connected
         }
         (Backend::Codex, Some(1)) if has_line("Not logged in") => SignedOut,
-        (Backend::OpenCode, Some(0)) => {
-            match serde_json::from_slice::<Vec<Value>>(stdout) {
-                Ok(accounts) if accounts.iter().any(Value::is_object) => Connected,
-                // OpenCode can offer free models without any accounts configured.
-                _ => Unknown,
-            }
-        }
+        (Backend::OpenCode, Some(0)) => match serde_json::from_slice::<Vec<Value>>(stdout) {
+            Ok(accounts) if accounts.iter().any(Value::is_object) => Connected,
+            _ => Unknown,
+        },
         (Backend::Antigravity, Some(0))
             if String::from_utf8_lossy(stdout).lines().any(|line| {
                 let line = line.trim();

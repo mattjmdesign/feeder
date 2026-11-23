@@ -1,19 +1,12 @@
-//! Turns each CLI's JSON stream into [`Event`]s: Claude Code's `stream-json` and Codex's
-//! `exec --json`. Lines that aren't JSON, or events the gardener doesn't show, yield nothing.
-
 use serde_json::Value;
 
 use super::session::{Event, ToolCall};
 
-/// The prefix Claude Code puts on the gardener server's tool names.
 const CLAUDE_TOOL_PREFIX: &str = "mcp__feeder__";
 
-/// What a stream has seen so far, for decisions that span lines.
 #[derive(Debug, Default)]
 pub(super) struct StreamState {
-    /// The last thing shown was assistant text, so a new text block needs a paragraph break.
     after_text: bool,
-    /// Codex's thread id, for resuming the conversation on the next turn.
     pub(super) thread_id: Option<String>,
 }
 
@@ -26,7 +19,6 @@ impl StreamState {
         self.after_text = true;
     }
 
-    /// A new text block after earlier text: separate the two.
     fn text_block(&mut self, text: &str, out: &mut Vec<Event>) {
         if self.after_text {
             out.push(Event::Text("\n\n".into()));
@@ -40,7 +32,6 @@ impl StreamState {
     }
 }
 
-/// One line of `claude -p --output-format stream-json --verbose --include-partial-messages`.
 pub(super) fn claude_line(line: &str, state: &mut StreamState) -> Vec<Event> {
     let mut out = Vec::new();
     let Ok(v) = serde_json::from_str::<Value>(line) else { return out };
@@ -62,7 +53,6 @@ pub(super) fn claude_line(line: &str, state: &mut StreamState) -> Vec<Event> {
                 _ => {}
             }
         }
-        // The finished message carries each tool call with its whole input.
         Some("assistant") => {
             for block in v["message"]["content"].as_array().into_iter().flatten().filter(|b| b["type"] == "tool_use") {
                 let name = block["name"].as_str().unwrap_or("");
@@ -99,7 +89,6 @@ pub(super) fn claude_line(line: &str, state: &mut StreamState) -> Vec<Event> {
     out
 }
 
-/// One line of `codex exec --json`.
 pub(super) fn codex_line(line: &str, state: &mut StreamState) -> Vec<Event> {
     let mut out = Vec::new();
     let Ok(v) = serde_json::from_str::<Value>(line) else { return out };
@@ -156,7 +145,6 @@ pub(super) fn codex_line(line: &str, state: &mut StreamState) -> Vec<Event> {
     out
 }
 
-/// A failure, or a request to sign in when that's what it is.
 pub(super) fn failure(why: String) -> Event {
     if looks_signed_out(&why) { Event::NeedsSignIn } else { Event::Failed(why) }
 }

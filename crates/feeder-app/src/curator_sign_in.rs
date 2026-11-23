@@ -1,9 +1,3 @@
-//! Curator account detection and sign-in handoff.
-//!
-//! Each installed provider CLI manages its own credentials: Claude Code, Codex, and Antigravity
-//! run their official browser flows directly from Feeder, while OpenCode opens Terminal for its
-//! interactive provider picker.
-
 use std::borrow::Cow;
 use std::collections::HashMap;
 use std::io::{self, Write};
@@ -65,7 +59,6 @@ impl SignIn {
         }
     }
 
-    /// Refreshes every installed CLI's sign-in status when Settings opens, off the UI thread.
     pub fn follow_accounts(&mut self, open: bool, wake: Option<&Waker>) {
         if !open {
             self.scan_fresh = false;
@@ -217,8 +210,6 @@ fn open_terminal(backend: Backend) -> io::Result<()> {
     if !env.feeder.is_file() {
         return Err(io::Error::new(io::ErrorKind::NotFound, "Feeder’s command-line helper is missing."));
     }
-    // Terminal opens an executable script directly. No Apple Events permission or login shell
-    // PATH is needed to find Feeder. The script contains only paths and the chosen provider.
     let path = std::env::temp_dir().join(format!("feeder-sign-in-{}-{}.command", std::process::id(), NEXT.fetch_add(1, Ordering::Relaxed)));
     let mut file = std::fs::OpenOptions::new().write(true).create_new(true).mode(0o700).open(&path)?;
     let result = (|| {
@@ -240,7 +231,6 @@ fn open_terminal(backend: Backend) -> io::Result<()> {
 }
 
 impl SignIn {
-    /// Sample sign-in states for snapshot scenes.
     pub fn demo(&mut self) {
         self.scan_fresh = true;
         self.scanned = HashMap::from([
@@ -251,8 +241,6 @@ impl SignIn {
         ]);
     }
 
-    /// Whether Curator can run on it: signed in, or a CLI that doesn't report accounts (OpenCode's
-    /// free models).
     pub fn usable(&self, backend: Backend) -> bool {
         if matches!(self.status.as_ref(), Some((b, Status::Connected(_))) if *b == backend) {
             return true;
@@ -261,8 +249,6 @@ impl SignIn {
     }
 }
 
-/// A subscription's sign-in line and its one action (Sign In…, Cancel, Check Sign-In), for its
-/// Settings row. Signing in never turns it on for Curator.
 pub fn cells(s: &State, backend: Backend, p: &Palette, k: &Kit) -> (El, El) {
     let sign_in = &s.curator_sign_in;
     let transient = sign_in.status.as_ref().filter(|(b, _)| *b == backend).map(|(_, st)| st);

@@ -252,7 +252,6 @@ const ballStyle = `background:${orbBackground(hero)}`;
 <script>
   import { orbBackground, randomOrb } from '../lib/orb';
 
-  // Interactive orb swap (quiet easter egg — no prompt needed)
   const orb = document.querySelector<HTMLButtonElement>('.orb');
   const ball = orb?.querySelector<HTMLElement>('.orb__ball');
   const brandOrb = document.getElementById('brand-orb');
@@ -270,7 +269,6 @@ const ballStyle = `background:${orbBackground(hero)}`;
     orb.classList.add('is-new');
   });
 
-  // Theme switcher (defaults to OS preference, persists user toggle)
   const root = document.documentElement;
   const toggle = document.getElementById('theme-toggle');
   const mq = window.matchMedia('(prefers-color-scheme: dark)');
@@ -299,20 +297,17 @@ const ballStyle = `background:${orbBackground(hero)}`;
       try {
         localStorage.removeItem('feeder-theme');
       } catch {
-        /* storage unavailable */
       }
     } else {
       root.dataset.theme = next;
       try {
         localStorage.setItem('feeder-theme', next);
       } catch {
-        /* storage unavailable */
       }
     }
     syncThemeControl();
   });
 
-  // Copy prompt button
   for (const btn of document.querySelectorAll<HTMLButtonElement>('[data-copy]')) {
     btn.addEventListener('click', async () => {
       try {
@@ -320,12 +315,10 @@ const ballStyle = `background:${orbBackground(hero)}`;
         btn.dataset.done = '';
         setTimeout(() => delete btn.dataset.done, 1400);
       } catch {
-        /* clipboard blocked */
       }
     });
   }
 
-  // Optional latest release version label
   const versionEl = document.getElementById('version');
   if (versionEl) {
     fetch('https://api.github.com/repos/mattjmdesign/feeder/releases/latest')
@@ -452,7 +445,6 @@ const ballStyle = `background:${orbBackground(hero)}`;
     text-align: center;
   }
 
-  /* Crisp glass orb on its own — grounded physical shadow, no outer glow */
   .orb {
     --size: clamp(118px, 16vw, 146px);
     position: relative;

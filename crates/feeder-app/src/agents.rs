@@ -1,7 +1,3 @@
-//! Each agent tool shown by its mark: a known tool's logo (T3 Code's bundled app icon among them),
-//! else the Finder icon of an installed app the agent is named after, else a monogram. Hovering a
-//! mark names the agent.
-
 use std::path::PathBuf;
 
 use rune::tok::TextStyle;
@@ -10,12 +6,11 @@ use rune::{Color, El, Icon, Image, el, icon, oklch, text};
 use crate::logos;
 use crate::style::Palette;
 
-/// The logo and colour for an agent's display name, when it's a tool we know.
 fn known(agent: &str, p: &Palette) -> Option<(&'static Icon, Color)> {
     let a = agent.to_ascii_lowercase();
     let ink = p.text;
     let mark = if a.contains("claude") {
-        (&logos::CLAUDE, oklch(0.68, 0.13, 42.0)) // Claude's terracotta
+        (&logos::CLAUDE, oklch(0.68, 0.13, 42.0))
     } else if a.contains("codex") || a.contains("openai") || a.contains("chatgpt") {
         (&logos::OPENAI, ink)
     } else if a.contains("opencode") {
@@ -38,9 +33,6 @@ fn known(agent: &str, p: &Palette) -> Option<(&'static Icon, Color)> {
     Some(mark)
 }
 
-/// The app an agent without a logo of its own is named after, where apps install: a tool Feeder
-/// sets up by its known bundle names (T3 Code ships as "T3 Code (Beta)"), else "<agent>.app".
-/// Only paths; the watcher checks which exist, off the UI thread.
 pub fn app_candidates(agent: &str) -> Vec<PathBuf> {
     let name = agent.trim();
     if name.is_empty() || name.contains(['/', '.']) {
@@ -55,8 +47,6 @@ pub fn app_candidates(agent: &str) -> Vec<PathBuf> {
     names.iter().flat_map(|n| [PathBuf::from("/Applications").join(n), home.join("Applications").join(n)]).collect()
 }
 
-/// An update's author mark: the agent's own logo or app icon, else the icon of the app it posted
-/// from (an OpenBot agent named "Rust Dev" wears OpenBot's), else a monogram.
 pub fn post_mark(s: &crate::State, agent: &str, via: Option<&str>, p: &Palette, size: f32) -> El {
     let own = has_logo(agent) || s.agent_icon(agent).is_some_and(|i| i.size().is_some());
     match via.filter(|_| !own) {
@@ -81,8 +71,6 @@ fn model_service(model: &str) -> Option<ModelService<'_>> {
         if provider.is_empty() || name.is_empty() {
             return None;
         }
-        // A host namespace takes precedence over the model family: a third-party host may
-        // serve a model it didn't make.
         return Some(match provider.to_ascii_lowercase().as_str() {
             "openai" => Branded("openai"),
             "anthropic" => Branded("claude"),
@@ -103,7 +91,6 @@ fn model_service(model: &str) -> Option<ModelService<'_>> {
     Some(Branded(brand))
 }
 
-/// A model picker mark for its hosting service, model family, or subscription default.
 pub fn model_mark(model: &str, subscription: &str, p: &Palette, size: f32, app: Option<&Image>) -> El {
     match model_service(model) {
         Some(ModelService::Branded(service)) => mark(service, p, size, None),
@@ -112,20 +99,16 @@ pub fn model_mark(model: &str, subscription: &str, p: &Palette, size: f32, app: 
     }
 }
 
-/// Whether the agent's mark ships with Feeder, so no app icon is needed.
 pub fn has_logo(agent: &str) -> bool {
     known(agent, &crate::style::palette(true)).is_some()
 }
 
-/// The agent's mark at `size` points, named for screen readers and on hover. `app` is its app's
-/// icon, once loaded.
 pub fn mark(agent: &str, p: &Palette, size: f32, app: Option<&Image>) -> El {
     let named = |e: El| e.label(agent.to_string()).help(agent.to_string());
     if let Some((logo, color)) = known(agent, p) {
         return named(icon(logo, size).color(color));
     }
     if let Some(img) = app.filter(|i| i.size().is_some()) {
-        // App icons carry their own margin; a touch larger sits level with the logos.
         let s = size * 1.2;
         return named(el().size(s, s).pixels(img.pixels()));
     }

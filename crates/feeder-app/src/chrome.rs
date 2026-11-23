@@ -1,13 +1,9 @@
-//! The window's top bar, its menu, lightbox (zoom/pan, video, before/after compare),
-//! Quick Jump palette, toasts, and Settings sheet.
-
 use std::path::Path;
 
 use feeder_core::setup::{self, Tool};
 use feeder_core::{OrbSize, Order, Theme, ago};
 use rune::{
-    ClipboardContent, ClipboardImage, Cursor, Drag, El, Icon, Key, KeyEvent, ScrollSpec, SurfaceFit, Transition, Tx, col, el, oklch, row,
-    text, text_input,
+    ClipboardImage, Cursor, Drag, El, Icon, Key, KeyEvent, ScrollSpec, SurfaceFit, Transition, Tx, col, el, oklch, row, text, text_input,
 };
 use rune_kit::search::Fold;
 use rune_kit::{
@@ -30,9 +26,6 @@ static GEAR_ICON: Icon = Icon {
     body: r#"<path d="M12.22 2h-.44a2 2 0 0 0-2 2v.18a2 2 0 0 1-1 1.73l-.43.25a2 2 0 0 1-2 0l-.15-.08a2 2 0 0 0-2.73.73l-.22.38a2 2 0 0 0 .73 2.73l.15.1a2 2 0 0 1 1 1.72v.51a2 2 0 0 1-1 1.74l-.15.09a2 2 0 0 0-.73 2.73l.22.38a2 2 0 0 0 2.73.73l.15-.08a2 2 0 0 1 2 0l.43.25a2 2 0 0 1 1 1.73V20a2 2 0 0 0 2 2h.44a2 2 0 0 0 2-2v-.18a2 2 0 0 1 1-1.73l.43-.25a2 2 0 0 1 2 0l.15.08a2 2 0 0 0 2.73-.73l.22-.39a2 2 0 0 0-.73-2.73l-.15-.08a2 2 0 0 1-1-1.74v-.5a2 2 0 0 1 1-1.74l.15-.09a2 2 0 0 0 .73-2.73l-.22-.38a2 2 0 0 0-2.73-.73l-.15.08a2 2 0 0 1-2 0l-.43-.25a2 2 0 0 1-1-1.73V4a2 2 0 0 0-2-2z" stroke="currentColor" stroke-width="1.6" fill="none" stroke-linejoin="round"/><circle cx="12" cy="12" r="3" stroke="currentColor" stroke-width="1.6" fill="none"/>"#,
 };
 
-/// The bar over Home and a project's feed: rune-kit's toolbar band, as the Notebook's
-/// `SplitView` draws it, so the view tabs and the menu hold their place across every view.
-/// `leading` starts past the traffic lights; `trailing` sits before the Curator button.
 pub fn bar(s: &State, p: &Palette, k: &Kit, inset: f32, leading: El, trailing: Option<El>) -> El {
     let mut toolbar = Toolbar::new().leading(row().pl(inset.max(0.0)).center_y().child(leading));
     if let Some(t) = trailing {
@@ -41,7 +34,6 @@ pub fn bar(s: &State, p: &Palette, k: &Kit, inset: f32, leading: El, trailing: O
     toolbar.trailing(curator_button(s, p)).build(k).key("bar")
 }
 
-/// Curator's own orb: pale and iridescent, so the button reads as Feeder's, not a project's.
 pub(crate) const CURATOR_ORB: feeder_core::Orb =
     feeder_core::Orb { seed: 7, hues: [285.0, 220.0, 330.0], chroma: 0.16, angle: 0.8, pattern: feeder_core::Pattern::Pearl };
 
@@ -57,9 +49,6 @@ fn curator_here(s: &State) -> bool {
     s.open.is_none() && s.tab == Tab::Notebook && s.notebook.shelf == crate::notebook::Shelf::Gardener
 }
 
-/// Top right, past the view tabs: the way into Curator from anywhere. The orb is the button: an
-/// iridescent sphere, a ring when Curator is open, a halo while it works, and a small amber count
-/// of flagged updates on its shoulder.
 pub fn curator_button(s: &State, p: &Palette) -> El {
     let size = 26.0;
     let flags = s.notebook.gardener.open_flags.len();
@@ -98,12 +87,10 @@ pub fn curator_button(s: &State, p: &Palette) -> El {
     b
 }
 
-/// Bottom left of the window: the app menu (Settings, Quick Jump, Quit…) behind a gear.
 pub fn settings_corner(s: &State, p: &Palette, k: &Kit, layer: &mut Vec<El>) -> El {
     el().key("settings-corner").pin(Some(12.0), None, None, Some(10.0)).child(menu(s, p, k, layer))
 }
 
-/// Home | Feed | Notebook, top right.
 pub fn tabs(s: &State, k: &Kit) -> El {
     let labels: Vec<&str> = Tab::ALL.iter().map(|t| t.label()).collect();
     SegmentedControl::new(&labels, Tab::ALL.iter().position(|t| *t == s.tab))
@@ -113,7 +100,6 @@ pub fn tabs(s: &State, k: &Kit) -> El {
         .build(k)
 }
 
-/// A quiet text button for the bar.
 pub fn bar_button(key: &str, label: &str, p: &Palette) -> El {
     row()
         .key(key.to_string())
@@ -144,11 +130,10 @@ pub fn reveal_path(path: &Path) {
     let _ = cmd.spawn();
 }
 
-fn copy_image_to_clipboard(path: &Path, tx: &mut Tx) -> Result<(), String> {
+fn load_clipboard_image(path: &Path) -> Result<ClipboardImage, String> {
     let bytes = std::fs::read(path).map_err(|e| format!("Couldn't read image: {e}"))?;
     if let Some(img) = ClipboardImage::from_png(bytes) {
-        tx.copy_rich(ClipboardContent::new("").with_image(img));
-        return Ok(());
+        return Ok(img);
     }
     #[cfg(target_os = "macos")]
     {
@@ -168,13 +153,38 @@ fn copy_image_to_clipboard(path: &Path, tx: &mut Tx) -> Result<(), String> {
             return Err("Couldn't convert image to PNG".into());
         }
         let png = png.map_err(|e| format!("Couldn't read converted PNG: {e}"))?;
-        let img = ClipboardImage::from_png(png).ok_or_else(|| "Image is too large or not valid PNG".to_string())?;
-        tx.copy_rich(ClipboardContent::new("").with_image(img));
-        Ok(())
+        ClipboardImage::from_png(png).ok_or_else(|| "Image is too large or not valid PNG".to_string())
     }
     #[cfg(not(target_os = "macos"))]
     {
         Err("Only PNG images can be copied on this platform".into())
+    }
+}
+
+fn start_copy_image_to_clipboard(s: &mut State, path: std::path::PathBuf) {
+    let (tx, rx) = std::sync::mpsc::channel();
+    let wake = s.wake.clone();
+    s.clipboard_image_rx = Some(rx);
+    if std::thread::Builder::new()
+        .name("feeder-copy-image".into())
+        .spawn(move || {
+            let _ = tx.send(load_clipboard_image(&path));
+            if let Some(wake) = wake {
+                wake();
+            }
+        })
+        .is_err()
+    {
+        s.clipboard_image_rx = None;
+        s.push_toast(
+            "copy-image-err",
+            ToastItem {
+                title: "Couldn't copy image".into(),
+                description: Some("Couldn't start image conversion.".into()),
+                kind: ToastKind::Error,
+            },
+            Some(4.0),
+        );
     }
 }
 
@@ -240,7 +250,6 @@ fn format_duration(secs: f64) -> String {
     format!("{mins}:{rem:02}")
 }
 
-/// Interactive media preview: zoom/pan images, Before/After swipe compare, carousel filmstrip, and video playback.
 pub fn lightbox(s: &State, inset: f32, p: &Palette, k: &Kit, reduced_motion: bool) -> Option<El> {
     let id = s.lightbox?;
     let found = s.find_media(id);
@@ -415,23 +424,7 @@ pub fn lightbox(s: &State, inset: f32, p: &Palette, k: &Kit, reduced_motion: boo
                 .fill(p.card)
                 .border(1.0, p.hairline)
                 .label("Copy screenshot image")
-                .on_press_tx(move |s: &mut State, tx: &mut Tx| match copy_image_to_clipboard(&path, tx) {
-                    Ok(()) => {
-                        s.mark_copied(CopyTarget::LightboxImage);
-                        s.push_toast(
-                            "copy-image",
-                            ToastItem { title: "Copied screenshot to clipboard".into(), description: None, kind: ToastKind::Info },
-                            Some(2.5),
-                        );
-                    }
-                    Err(err) => {
-                        s.push_toast(
-                            "copy-image-err",
-                            ToastItem { title: "Couldn't copy image".into(), description: Some(err), kind: ToastKind::Error },
-                            Some(4.0),
-                        );
-                    }
-                }),
+                .on_press(move |s: &mut State| start_copy_image_to_clipboard(s, path.clone())),
         );
     }
 
@@ -724,7 +717,6 @@ pub fn palette_items(s: &State) -> Vec<PaletteItem> {
         items.push(PaletteItem { action, title: title.into(), subtitle: subtitle.into(), badge: None, project_id: None, unseen: false });
     }
     if !q.is_empty() {
-        // Notebook pages whose title, topic, tags, or body mention the query, so any note is one ⌘K away.
         let pages = s.notebook.pages.iter().filter(|pg| {
             !pg.is_archived()
                 && (fold.contains(&pg.title, q)
@@ -800,7 +792,6 @@ fn execute_palette_action(s: &mut State, action: PaletteAction, tx: &mut Tx) {
     }
 }
 
-/// Quick Jump (`⌘K`) command, project & full-history update switcher overlay.
 pub fn palette(s: &State, p: &Palette, _k: &Kit) -> Option<El> {
     if !s.palette_open {
         return None;
@@ -929,7 +920,6 @@ pub fn palette(s: &State, p: &Palette, _k: &Kit) -> Option<El> {
     )
 }
 
-/// Bottom-right toast stack for archive undo, clipboard image confirmation, and store errors.
 pub fn toasts(s: &State, k: &Kit) -> Option<El> {
     let entries = s.toasts.entries();
     if entries.is_empty() {
@@ -974,7 +964,6 @@ pub fn toasts(s: &State, k: &Kit) -> Option<El> {
     Some(region.build(k))
 }
 
-/// Confirmation dialog before deleting a single update card.
 pub fn delete_confirm(s: &State, p: &Palette, k: &Kit) -> Option<El> {
     let uid = s.delete_confirm?;
     let panel = col()
@@ -1006,8 +995,6 @@ pub fn delete_confirm(s: &State, p: &Palette, k: &Kit) -> Option<El> {
     )
 }
 
-/// The Settings sheet over a dimmed window, or nothing while it's closed.
-/// Settings' pages, listed in its sidebar.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum SettingsPage {
     #[default]
@@ -1032,8 +1019,6 @@ impl SettingsPage {
     }
 }
 
-/// Settings: a window-sized sheet with a sidebar of pages. Pushes its own dropdowns after itself,
-/// so they open above it.
 pub fn settings(s: &State, p: &Palette, k: &Kit, layer: &mut Vec<El>) {
     if !s.settings_open {
         return;
@@ -1201,8 +1186,6 @@ pub fn settings(s: &State, p: &Palette, k: &Kit, layer: &mut Vec<El>) {
 
     let content = col().grow(1.0).min_w(0.0).h_full().child(done).child(scroll);
 
-    // In a window smaller than the sheet, the sheet shrinks to the scrim's padding and the page
-    // scrolls beside a fixed sidebar.
     let panel = row()
         .key("settings")
         .role("dialog")
@@ -1238,8 +1221,6 @@ pub fn settings(s: &State, p: &Palette, k: &Kit, layer: &mut Vec<El>) {
     layer.extend(pops);
 }
 
-/// Opens Settings on Agents, for the places that are about connecting a tool: the empty Home and
-/// "Connect Agents…".
 pub fn open_agent_setup(s: &mut State, _tx: &mut Tx) {
     s.settings_page = SettingsPage::Agents;
     s.settings_open = true;
@@ -1247,8 +1228,6 @@ pub fn open_agent_setup(s: &mut State, _tx: &mut Tx) {
 
 const AGENTS_SECTION_KEY: &str = "settings-agents";
 
-/// Settings → Connected Tools: a row per installed tool with its own connect control, then a config any
-/// other MCP tool can read. Nothing connects until it's pressed.
 fn agents_section(s: &State, p: &Palette, k: &Kit) -> El {
     let note = |t: &str| text(t.to_string()).font(style::META).color(p.text_3).wrap();
     let mut rows = vec![note("Connecting a tool adds Feeder's MCP server and two skills to its settings.")];
@@ -1284,8 +1263,6 @@ fn agents_section(s: &State, p: &Palette, k: &Kit) -> El {
     section(p, "Tools on this Mac", rows).key(AGENTS_SECTION_KEY)
 }
 
-/// One installed tool: its mark and name, where it stands under the name, and the one action
-/// that changes that on the right.
 fn agent_row(s: &State, p: &Palette, k: &Kit, tool: Tool, link: &Link) -> El {
     let action = |label: &str, variant: ButtonVariant, connect: bool| {
         Button::new(label.to_string())
@@ -1330,14 +1307,11 @@ fn agent_row(s: &State, p: &Palette, k: &Kit, tool: Tool, link: &Link) -> El {
         .min_h(36.0)
         .gap(12.0)
         .center_y()
-        // One box for every mark, so logos and app icons leave the names on one edge.
         .child(el().size(20.0, 20.0).center().child(agents::mark(tool.name(), p, 18.0, s.agent_icon(tool.name()))))
         .child(words)
         .child(control)
 }
 
-/// Settings → Uninstall: undoes every change Feeder made outside its own folder, so moving it to
-/// the Trash leaves nothing behind but the data the person chooses to keep.
 fn uninstall_section(s: &State, p: &Palette, k: &Kit) -> El {
     let note = |t: &str| text(t.to_string()).font(style::META).color(p.text_3).wrap();
     let any_connected = s.agents.rows.iter().flatten().any(|(_, l)| matches!(l, Link::Connected | Link::Outdated | Link::Disconnecting));

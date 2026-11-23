@@ -1,3 +1,2 @@
-# The codebase reads in wide lines; keep rustfmt to that rather than the 100-column default.
 max_width = 140
 use_small_heuristics = "Max"

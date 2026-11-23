@@ -1,9 +1,3 @@
-//! The Notebook's learning loop: agents flag knowledge that is missing, wrong or outdated while
-//! they work, and the gardener (a background curator agent) resolves those flags by editing pages.
-//!
-//! Every page change made through [`Store::curate`] is logged with the reason and the content it
-//! replaced, so the person can read why the Notebook changed and revert any change.
-
 use std::collections::HashMap;
 use std::fmt;
 use std::str::FromStr;
@@ -14,26 +8,18 @@ use serde::{Deserialize, Serialize};
 use crate::gardener::{MAX_EDITS_PER_RUN, Run, Scope, SessionMode};
 use crate::{Error, Kind, Page, PageDraft, Result, Standing, Store, now_ms, secret_in};
 
-/// The name the gardener writes under, in page bylines and the change log.
 pub const GARDENER: &str = "Gardener";
 
-/// Length limits for a flag's note (what's missing or wrong).
 pub const FLAG_NOTE_CHARS: std::ops::RangeInclusive<usize> = 4..=2_000;
 
-/// Length limit for a flag's optional suggested fix.
 pub const FLAG_SUGGESTION_MAX_CHARS: usize = 10_000;
 
-/// Length limit for the reason logged with a change.
 pub const REASON_MAX_CHARS: usize = 1_000;
 
-/// What an agent found while working.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum FlagKind {
-    /// The Notebook has nothing on something the agent needed.
     Missing,
-    /// A page says something that turned out to be false.
     Wrong,
-    /// A page was true once but no longer is (a renamed command, a moved file).
     Outdated,
 }
 
@@ -48,7 +34,6 @@ impl FlagKind {
         }
     }
 
-    /// Sentence-case label for the app.
     pub fn label(self) -> &'static str {
         match self {
             FlagKind::Missing => "Missing",
@@ -77,13 +62,10 @@ impl FromStr for FlagKind {
     }
 }
 
-/// Where a flag is in its life.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum FlagStatus {
     Open,
-    /// Fixed by a Notebook change.
     Resolved,
-    /// Looked at and set aside (not a real gap, or a duplicate).
     Dismissed,
 }
 
@@ -105,42 +87,31 @@ impl FlagStatus {
     }
 }
 
-/// The current Notebook review outcome for a Feed update.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum FeedReviewStatus {
-    /// Curator still has an open flag for the update.
     Queued,
-    /// The review resolved the flag. The linked note can be absent if it was deleted.
     Reviewed { note_id: Option<i64> },
-    /// The review closed the flag without a note change.
     Dismissed,
 }
 
-/// One report that the Notebook is missing something, or says something wrong.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Flag {
     pub id: i64,
     pub kind: FlagKind,
-    /// The page the flag is about, when there is one.
     pub page_id: Option<i64>,
-    /// The project the agent was working in.
     pub project_id: Option<i64>,
     pub agent: String,
     pub note: String,
     pub suggestion: Option<String>,
     pub status: FlagStatus,
-    /// What was done about it, in a sentence.
     pub resolution: Option<String>,
     pub resolved_by: Option<String>,
-    /// The Notebook change that resolved it.
     pub change_id: Option<i64>,
     pub created_at: i64,
     pub resolved_at: Option<i64>,
-    /// The Feed thread that raised this flag.
     pub source_update_id: Option<i64>,
 }
 
-/// A flag before it is saved.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct NewFlag {
     pub kind: FlagKind,
@@ -150,20 +121,12 @@ pub struct NewFlag {
     pub suggestion: Option<String>,
 }
 
-/// How a flag was closed.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum FlagOutcome {
-    /// Fixed, optionally by a logged Notebook change.
-    Resolved {
-        note: String,
-        change_id: Option<i64>,
-    },
-    Dismissed {
-        note: String,
-    },
+    Resolved { note: String, change_id: Option<i64> },
+    Dismissed { note: String },
 }
 
-/// What a logged change did to a page.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum ChangeAction {
     Created,
@@ -182,7 +145,6 @@ impl ChangeAction {
         }
     }
 
-    /// Past-tense verb for the app ("Revised", "Archived").
     pub fn label(self) -> &'static str {
         match self {
             ChangeAction::Created => "Wrote",
@@ -203,7 +165,6 @@ impl ChangeAction {
     }
 }
 
-/// A page's content at one moment, kept so a revision can be undone.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PageSnapshot {
     pub kind: String,
@@ -235,27 +196,20 @@ impl PageSnapshot {
     }
 }
 
-/// One logged change to the Notebook.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Change {
     pub id: i64,
     pub page_id: i64,
-    /// The page's title at the time of the change.
     pub page_title: String,
     pub action: ChangeAction,
     pub agent: String,
     pub reason: Option<String>,
-    /// What a revision replaced. `None` for every other action.
     pub before: Option<PageSnapshot>,
     pub created_at: i64,
     pub reverted_at: Option<i64>,
-    /// The change this one undid, for a revert's own log entry.
     pub undoes: Option<i64>,
-    /// Feed updates the change drew on.
     pub source_updates: Vec<i64>,
-    /// The session that saved this change, if it was made in a tracked run.
     pub gardener_run_id: Option<i64>,
-    /// Knowledge flags that supported this edit.
     pub source_flags: Vec<i64>,
 }
 
@@ -264,13 +218,11 @@ impl Change {
         self.reverted_at.is_some()
     }
 
-    /// Whether Revert applies: not yet reverted, and not itself an undo.
     pub fn is_revertible(&self) -> bool {
         !self.is_reverted() && self.undoes.is_none()
     }
 }
 
-/// An edit the gardener (or any curator) wants to make, with its reason.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Curation {
     Create { draft: PageDraft, project_id: Option<i64> },
@@ -278,17 +230,13 @@ pub enum Curation {
     Archive { page_id: i64 },
 }
 
-/// Why an edit is made and what it came from. The gardener must name at least one source.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Provenance {
     pub reason: String,
-    /// Open flags the edit fixes; they are resolved with it.
     pub flags: Vec<i64>,
-    /// Feed updates (agent traces) the edit draws on.
     pub updates: Vec<i64>,
 }
 
-/// The result of [`Store::curate`]: the page as it now stands and the logged change.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Curated {
     pub page: Page,
@@ -299,19 +247,10 @@ const FLAG_COLS: &str = "id, kind, page_id, project_id, agent, note, suggestion,
 const CHANGE_COLS: &str = "c.id, c.page_id, c.page_title, c.action, c.agent, c.reason, c.before, c.created_at, c.reverted_at, c.undoes, c.source_updates, c.gardener_run_id, c.source_flags";
 
 impl Store {
-    /// Files a flag about missing or wrong knowledge.
-    ///
-    /// # Errors
-    /// [`Error::Invalid`] when the note is too short or long, or looks like it holds a secret;
-    /// [`Error::NotFound`] when `page_id` names no page.
     pub fn flag_knowledge(&self, flag: NewFlag, agent: &str) -> Result<Flag> {
         self.insert_flag(flag, agent, None)
     }
 
-    /// Flags a Feed thread for the Gardener, reusing an already-open flag for that thread.
-    ///
-    /// # Errors
-    /// Returns an error when the update no longer exists or the store cannot save the flag.
     pub fn flag_update_for_notebook(&self, update_id: i64, author: &str) -> Result<Flag> {
         let tx = Transaction::new_unchecked(&self.conn, TransactionBehavior::Immediate)?;
         let update = self.update(update_id)?.ok_or_else(|| Error::NotFound(format!("no Feed update {update_id}")))?;
@@ -379,12 +318,10 @@ impl Store {
         Ok(self.conn.query_row(&format!("SELECT {FLAG_COLS} FROM knowledge_flags WHERE id = ?1"), params![id], flag_row).optional()?)
     }
 
-    /// Flags in `status` (every flag when `None`), the newest first.
     pub fn flags(&self, status: Option<FlagStatus>, limit: usize) -> Result<Vec<Flag>> {
         self.flags_in_scope(status, Scope::Notebook, limit)
     }
 
-    /// Lists flags in the selected scope before applying the limit.
     pub fn flags_in_scope(&self, status: Option<FlagStatus>, scope: Scope, limit: usize) -> Result<Vec<Flag>> {
         let limit = i64::try_from(limit.max(1)).unwrap_or(i64::MAX);
         let mut stmt = self.conn.prepare(&format!(
@@ -398,13 +335,6 @@ impl Store {
         Ok(rows.collect::<rusqlite::Result<_>>()?)
     }
 
-    /// Looks up review outcomes for visible Feed updates in one query.
-    ///
-    /// Updates never queued for review are absent. An open flag takes precedence over closed
-    /// flags, including when undoing a note change reopens an older flag for the update.
-    ///
-    /// # Errors
-    /// Returns an error if the store cannot read the review outcomes.
     pub fn feed_review_statuses(&self, update_ids: &[i64]) -> Result<HashMap<i64, FeedReviewStatus>> {
         if update_ids.is_empty() {
             return Ok(HashMap::new());
@@ -436,11 +366,6 @@ impl Store {
         Ok(usize::try_from(n).unwrap_or(0))
     }
 
-    /// Closes an open flag.
-    ///
-    /// # Errors
-    /// [`Error::NotFound`] for an unknown flag or change; [`Error::Invalid`] when the flag is
-    /// already closed.
     pub fn close_flag(&self, id: i64, outcome: FlagOutcome, by: &str) -> Result<Flag> {
         let flag = self.flag(id)?.ok_or_else(|| Error::NotFound(format!("no flag {id}")))?;
         if flag.status != FlagStatus::Open {
@@ -463,17 +388,6 @@ impl Store {
         self.flag(id)?.ok_or_else(|| Error::NotFound(format!("no flag {id}")))
     }
 
-    /// Makes one Notebook edit, logs it with its provenance, and resolves the flags it fixes, all
-    /// in one transaction.
-    ///
-    /// The [`GARDENER`] is held to tighter rules: it must name a source (a flag or a Feed update),
-    /// and on pages a person wrote or edited by hand it may only add to the end, never rewrite or
-    /// archive.
-    ///
-    /// # Errors
-    /// Whatever the edit itself returns (limits, near-duplicates, unknown pages), and
-    /// [`Error::Invalid`] for a long reason, a flag that isn't open, or a broken gardener rule.
-    /// Nothing is written on error.
     pub fn curate(&self, curation: Curation, author: &str, provenance: &Provenance) -> Result<Curated> {
         let tx = Transaction::new_unchecked(&self.conn, TransactionBehavior::Immediate)?;
         let result = self.curate_inner(curation, author, provenance, None)?;
@@ -481,10 +395,6 @@ impl Store {
         Ok(result)
     }
 
-    /// Saves an edit and its evidence under the active session's authority.
-    ///
-    /// # Errors
-    /// Rejects inactive runs, out-of-scope inputs and edits over the session limit.
     pub fn curate_gardener_run(&self, run_id: i64, mut curation: Curation, provenance: &Provenance) -> Result<Curated> {
         let tx = Transaction::new_unchecked(&self.conn, TransactionBehavior::Immediate)?;
         let run = self.curator_run_with_budget(run_id)?;
@@ -524,7 +434,6 @@ impl Store {
         Ok(result)
     }
 
-    /// Dismisses an in-scope flag while the session is still active.
     pub fn dismiss_gardener_flag(&self, run_id: i64, id: i64, reason: String) -> Result<Flag> {
         let tx = Transaction::new_unchecked(&self.conn, TransactionBehavior::Immediate)?;
         let run = self.curator_run_with_budget(run_id)?;
@@ -543,7 +452,6 @@ impl Store {
         Ok(flag)
     }
 
-    /// Flag IDs dismissed by this Curator run, in dismissal order.
     pub fn curator_dismissed_flag_ids(&self, run_id: i64) -> Result<Vec<i64>> {
         let mut statement = self.conn.prepare("SELECT flag_id FROM curator_flag_dismissals WHERE run_id = ?1 ORDER BY rowid")?;
         Ok(statement.query_map([run_id], |row| row.get(0))?.collect::<rusqlite::Result<_>>()?)
@@ -616,8 +524,6 @@ impl Store {
             "UPDATE notebook_changes SET source_updates = ?1, source_flags = ?2, gardener_run_id = ?3, after_state = ?4 WHERE id = ?5",
             params![encode_ids(&provenance.updates), encode_ids(&provenance.flags), gardener_run_id, after, change_id],
         )?;
-        // Cited flags must exist. Open ones are resolved by this change; a flag that's already
-        // closed still counts as the source (say, a follow-up edit to the page that resolved it).
         for &flag in &provenance.flags {
             let found = self.flag(flag)?.ok_or_else(|| Error::NotFound(format!("no flag {flag} to cite")))?;
             if found.status == FlagStatus::Open {
@@ -681,7 +587,6 @@ impl Store {
         row.transpose()
     }
 
-    /// Logged changes, the newest first, optionally only one author's or one page's.
     pub fn changes(&self, agent: Option<&str>, page_id: Option<i64>, limit: usize) -> Result<Vec<Change>> {
         let limit = i64::try_from(limit.max(1)).unwrap_or(i64::MAX);
         let mut stmt = self.conn.prepare(&format!(
@@ -693,7 +598,6 @@ impl Store {
         rows.collect::<rusqlite::Result<Vec<_>>>()?.into_iter().collect()
     }
 
-    /// Changes saved by this run, newest first, including their current Revert state.
     pub fn gardener_run_changes(&self, run_id: i64) -> Result<Vec<Change>> {
         let mut stmt =
             self.conn.prepare(&format!("SELECT {CHANGE_COLS} FROM notebook_changes c WHERE c.gardener_run_id = ?1 ORDER BY c.id DESC"))?;
@@ -701,7 +605,6 @@ impl Store {
         rows.collect::<rusqlite::Result<Vec<_>>>()?.into_iter().collect()
     }
 
-    /// Notebook changes that cite this Feed thread, newest first.
     pub fn changes_from_update(&self, update_id: i64) -> Result<Vec<Change>> {
         let mut stmt = self.conn.prepare(&format!(
             "SELECT {CHANGE_COLS} FROM notebook_changes c
@@ -712,13 +615,6 @@ impl Store {
         rows.collect::<rusqlite::Result<Vec<_>>>()?.into_iter().collect()
     }
 
-    /// Undoes a logged change: a written page is archived, a revision goes back to the text it
-    /// replaced, and an archived page comes back. The undo is logged too, and flags the change
-    /// resolved open again.
-    ///
-    /// # Errors
-    /// [`Error::Invalid`] when the change was already reverted, or when the page has changed
-    /// since (revert the newer change first, so nothing is silently lost).
     pub fn revert_change(&self, id: i64, by: &str) -> Result<Curated> {
         let tx = Transaction::new_unchecked(&self.conn, TransactionBehavior::Immediate)?;
         let change = self.change(id)?.ok_or_else(|| Error::NotFound(format!("no notebook change {id}")))?;
@@ -774,7 +670,6 @@ impl Store {
         };
         self.conn.execute("UPDATE notebook_changes SET reverted_at = ?1 WHERE id = ?2", params![now_ms(), id])?;
         self.conn.execute("UPDATE notebook_changes SET undoes = ?1 WHERE id = ?2", params![id, curated.1])?;
-        // The flags this change fixed are unfixed again, so the gardener sees them next pass.
         self.conn.execute(
             "UPDATE knowledge_flags SET status = 'open', resolution = NULL, resolved_by = NULL, change_id = NULL, resolved_at = NULL
              WHERE change_id = ?1",
@@ -784,18 +679,6 @@ impl Store {
         let (page, change_id) = curated;
         let change = self.change(change_id)?.ok_or_else(|| Error::NotFound(format!("change {change_id} vanished")))?;
         Ok(Curated { page, change })
-    }
-
-    /// Counts that change whenever flags or the change log do, for the app's poll loop.
-    pub fn knowledge_stamp(&self) -> Result<(i64, i64, i64, i64)> {
-        Ok(self.conn.query_row(
-            "SELECT (SELECT COALESCE(MAX(id), 0) FROM knowledge_flags),
-                    (SELECT COUNT(*) FROM knowledge_flags WHERE status = 'open'),
-                    (SELECT COALESCE(MAX(id), 0) FROM notebook_changes),
-                    (SELECT COUNT(*) FROM notebook_changes WHERE reverted_at IS NOT NULL)",
-            [],
-            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
-        )?)
     }
 
     fn log_change(&self, page: &Page, action: ChangeAction, agent: &str, reason: &str, before: Option<&PageSnapshot>) -> Result<i64> {
@@ -848,7 +731,6 @@ fn flag_row(r: &Row<'_>) -> rusqlite::Result<Flag> {
     })
 }
 
-/// Reads a change row; the outer `Result` is SQLite's, the inner one a malformed log entry.
 fn change_row(r: &Row<'_>) -> rusqlite::Result<Result<Change>> {
     let action: String = r.get(3)?;
     let before: Option<String> = r.get(6)?;
@@ -890,7 +772,6 @@ fn decode_ids(ids: Option<&str>) -> Vec<i64> {
     ids.unwrap_or_default().split_whitespace().filter_map(|id| id.parse().ok()).collect()
 }
 
-/// Creates the flag and change-log tables. Runs after the notebook's own migration.
 pub(crate) fn migrate(conn: &Connection) -> Result<()> {
     conn.execute_batch(
         "CREATE TABLE IF NOT EXISTS notebook_changes (
@@ -1039,7 +920,6 @@ mod tests {
         assert_eq!(flag.status, FlagStatus::Resolved);
         assert_eq!(flag.change_id, Some(made.change.id));
 
-        // A bad edit writes nothing: no page, no log entry, the flag stays open.
         let other = s.flag_knowledge(missing("Nothing on deploys"), "Codex").expect("flag");
         let before = s.changes(None, None, 50).expect("log").len();
         let refused = s.curate(Curation::Revise { page_id: made.page.id, draft: draft("x", "") }, GARDENER, &cites("bad", &[other.id]));
@@ -1147,7 +1027,6 @@ mod tests {
             .expect("appending is allowed");
         assert!(added.page.human_edited, "the page stays marked as hand-written");
 
-        // The person can still do anything by hand.
         s.curate(Curation::Archive { page_id: mine.id }, crate::HUMAN_AUTHOR, &Provenance::default()).expect("person archives");
     }
 

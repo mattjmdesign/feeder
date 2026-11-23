@@ -1,9 +1,3 @@
-//! A Model Context Protocol server on stdio: newline-delimited JSON-RPC 2.0.
-//!
-//! The project defaults to the git repository of the folder the server was started in, which is
-//! the agent's project folder for stdio servers. The agent defaults to the client's own name from
-//! `initialize` (`claude-code` shows as "Claude Code").
-
 use std::cell::{Ref, RefCell};
 use std::collections::HashMap;
 use std::io::{BufRead, Write};
@@ -25,12 +19,9 @@ const MAX_INLINE_SCREENSHOTS: usize = 6;
 const MAX_INLINE_SCREENSHOT_BYTES: u64 = 5 * 1024 * 1024;
 const MAX_RPC_LINE_BYTES: usize = 16 * 1024 * 1024;
 
-/// Who the server is for.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Role {
-    /// A coding agent: every feed, to-do and notebook tool.
     Agent,
-    /// The Notebook gardener: only its own guarded tools.
     Gardener(i64),
 }
 
@@ -144,12 +135,11 @@ impl Server {
             .unwrap_or_else(|| "Unknown agent".into())
     }
 
-    /// The reply to one message, or None for a notification.
     fn handle(&mut self, msg: &Value) -> Option<Value> {
         let id = msg.get("id").cloned();
         let method = msg.get("method").and_then(Value::as_str).unwrap_or("");
         let params = msg.get("params").cloned().unwrap_or(json!({}));
-        let id = id?; // notifications (initialized, cancelled) need no answer
+        let id = id?;
         let result = match method {
             "initialize" => self.initialize(&params).map_err(|e| (-32603, e)),
             "ping" => Ok(json!({})),
@@ -898,7 +888,6 @@ impl Server {
         str_arg(args, "project_path").map(PathBuf::from).unwrap_or_else(|| self.cwd.clone())
     }
 
-    /// The project the call names, else the one at `project_path`, else the server's folder.
     fn project(&self, store: &Store, args: &Value, create: bool) -> Result<Option<Project>, String> {
         let found = match (str_arg(args, "project"), create) {
             (Some(name), true) => store.project_named(name, None).map(Some),
@@ -1006,7 +995,6 @@ fn error(id: Value, code: i64, message: &str) -> Value {
     json!({ "jsonrpc": "2.0", "id": id, "error": { "code": code, "message": message } })
 }
 
-/// Every tool the server offers: the feed's, then the notebook's.
 fn all_tools() -> Value {
     let mut list = tools();
     if let Value::Array(items) = &mut list {
@@ -1460,7 +1448,6 @@ mod tests {
             .unwrap();
         assert_eq!(open_before.pointer("/result/structuredContent/needs_you_updates/0/id"), Some(&json!(uid)));
 
-        // Simulate human reply through the store.
         let store = Store::open(&store_dir).unwrap();
         let human_reply = store.add_reply(uid, "You", true, "Yes, ship today!").unwrap();
 
@@ -1730,7 +1717,7 @@ mod tests {
             }))
             .unwrap();
         let content = feed.pointer("/result/content").and_then(Value::as_array).unwrap();
-        assert_eq!(content.len(), 3); // 1 text + 2 inline images
+        assert_eq!(content.len(), 3);
 
         let draft = feeder_core::PageDraft {
             topic: Some("Rust".into()),
@@ -1927,7 +1914,6 @@ mod tests {
         assert_eq!(sourced.pointer("/result/isError"), Some(&json!(false)), "{sourced}");
         assert_eq!(sourced.pointer("/result/structuredContent/page/agent"), Some(&json!("Gardener")));
 
-        // The refused edit didn't use up the cap: four more fit, the fifth after that doesn't.
         let store = Store::open(&store_dir).unwrap();
         let titles = ["Signing builds", "Rotating logs", "Caching fonts", "Pinning toolchains"];
         for (n, title) in (10_i64..).zip(titles) {
@@ -2132,7 +2118,6 @@ mod tests {
         let run = store.start_gardener_run(feeder_core::gardener::Backend::Codex).unwrap();
         let titles = ["Signing builds", "Rotating logs", "Caching fonts", "Pinning toolchains", "Tagging releases", "Pruning branches"];
         let mut refused = 0;
-        // Codex starts a fresh server for each turn: three turns, two edits each.
         for (turn, pair) in titles.chunks(2).enumerate() {
             let mut server = Server::new(Some("codex".into()), work_dir.clone(), Some(store_dir.clone()));
             server.role = Role::Gardener(run);

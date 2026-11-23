@@ -1,7 +1,3 @@
-//! Keeps the window in step with the store without touching disk on the UI thread. A worker owns
-//! its own connection, checks SQLite's `data_version` a few times a second (it moves whenever the
-//! CLI or an MCP server commits) and hands the view a fresh snapshot when anything changed.
-
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::mpsc::{self, RecvTimeoutError, Sender};
@@ -22,7 +18,6 @@ pub struct Want {
     pub visible: bool,
 }
 
-/// How many timeline posts to load at first, and how many more each time the end comes near.
 pub const TIMELINE_PAGE: usize = 25;
 
 enum Msg {
@@ -40,11 +35,9 @@ enum Msg {
     AddReply(i64, String),
     SaveSettings(Settings),
     Notebook(NotebookOp),
-    /// Load the timeline's first `n` posts.
     Timeline(usize),
 }
 
-/// A failed text write whose draft should be restored in the UI so the user never loses typing.
 #[derive(Clone, Debug)]
 pub enum FailedWrite {
     Reply { update_id: i64, body: String },
@@ -52,36 +45,27 @@ pub enum FailedWrite {
     Brief { project_id: i64, body: Option<String> },
 }
 
-/// A change to the notebook made in the app; the user is the author.
 pub enum NotebookOp {
     Create(PageDraft),
     Revise(i64, PageDraft),
     ToggleTask(i64, usize, bool),
     SetStanding(i64, Standing),
     Delete(i64),
-    /// Undo a logged change (see the Curator page).
     Revert(i64),
-    /// Flag a Feed update for the Curator to review (idempotent).
     FlagUpdate(i64),
-    /// Delete a saved Curator chat's transcript; its Notebook edits stay.
     DeleteChat(i64),
 }
 
-/// What the Notebook's Gardener page shows.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct GardenerView {
-    /// The gardener's latest changes, newest first, with any reverts of them.
     pub changes: Vec<Change>,
     pub open_flags: Vec<Flag>,
     pub last_run: Option<Run>,
     pub running: Option<Run>,
-    /// Saved Curator chats, newest first.
     pub chats: Vec<ChatSummary>,
-    /// The installed CLIs that can run it, Claude Code first.
     pub backends: Vec<Backend>,
 }
 
-/// How many of the gardener's changes and open flags the page lists.
 const GARDENER_LIST: usize = 30;
 
 fn gardener_view(s: &Store, backends: &[Backend]) -> feeder_core::Result<GardenerView> {
@@ -99,17 +83,13 @@ pub struct Snapshot {
     pub projects: Vec<ProjectSummary>,
     pub want: Want,
     pub feed: Vec<FeedUpdate>,
-    /// Every project's updates, newest first, `timeline_limit` at most.
     pub timeline: Vec<FeedUpdate>,
     pub timeline_limit: usize,
-    /// Replies keyed by `update_id`.
     pub replies: HashMap<i64, Vec<Reply>>,
     pub search_query: String,
     pub search_hits: Vec<FeedUpdate>,
-    /// Every notebook page, archived ones included, when the notebook changed since the last snapshot.
     pub pages: Option<Vec<Page>>,
     pub gardener: Option<GardenerView>,
-    /// Agents without a logo whose app is installed, with the app to take the icon from.
     pub agent_apps: Vec<(String, PathBuf)>,
     pub error: Option<String>,
     pub mutation_error: Option<String>,
@@ -180,7 +160,6 @@ impl Watcher {
                 let mut last_notebook_stamp: Option<(i64, i64, i64, i64)> = None;
                 let mut next_pulse_expiry: Option<i64> = None;
                 let mut dirty = true;
-                // Which CLIs are installed only changes when the person installs one; check at start.
                 let backends = Backend::installed();
                 loop {
                     let mut renames = Vec::new();
@@ -196,8 +175,6 @@ impl Watcher {
                     let mut notebook_ops = Vec::new();
                     let mut mutation_error: Option<String> = None;
                     let mut failed_writes = Vec::new();
-                    // Poll frequently while visible; back off when minimized/hidden so background
-                    // wakeups stay quiet while still catching updates for notifications.
                     let poll_interval = if want.visible { Duration::from_millis(400) } else { Duration::from_secs(2) };
                     match rx.recv_timeout(poll_interval) {
                         Ok(first) => {
@@ -328,8 +305,6 @@ impl Watcher {
                     }
                     for op in notebook_ops {
                         let res = match op {
-                            // The user curates by hand, so a page they file deliberately is kept even if it
-                            // resembles another.
                             NotebookOp::Create(draft) => s.create_page(draft, "You", None, OnSimilar::Allow).map(|_| ()),
                             NotebookOp::Revise(id, draft) => s.revise_page(id, draft, "You").map(|_| ()),
                             NotebookOp::ToggleTask(id, task_index, checked) => s.toggle_page_task(id, task_index, checked).map(|_| ()),
@@ -346,8 +321,6 @@ impl Watcher {
 
                     let version = s.data_version().ok();
                     let pulse_expired = next_pulse_expiry.is_some_and(|exp| now_ms() >= exp);
-                    // A Git refresh does not invalidate SQLite-backed views. In particular,
-                    // don't reload Feed media and Curator history on a Files-only update.
                     if !dirty && !pulse_expired && mutation_error.is_none() && version == seen {
                         publish_files(&files_slot, &wake, &mut files_refresh, s);
                         continue;
@@ -453,7 +426,6 @@ impl Watcher {
         self.tx.send(Msg::Search(query)).ok();
     }
 
-    /// Renames off the UI thread; the next snapshot carries the new name.
     pub fn rename(&self, id: i64, name: String) {
         self.tx.send(Msg::Rename(id, name)).ok();
     }
@@ -498,8 +470,6 @@ impl Watcher {
         self.tx.send(Msg::AddReply(update_id, body)).ok();
     }
 
-    /// Asks for the timeline's first `n` posts; callable from scroll handlers, which can't
-    /// change state themselves.
     pub fn timeline(&self, n: usize) {
         self.tx.send(Msg::Timeline(n)).ok();
     }

@@ -16,7 +16,6 @@
   --orb-ring: inset 0 0 0 0.5px rgb(0 0 0 / 0.1);
   --orb-drop: 0 14px 26px -10px rgb(0 0 0 / 0.24), 0 4px 10px -4px rgb(0 0 0 / 0.12);
   --ease: cubic-bezier(0.2, 0.9, 0.2, 1);
-  /* The whole type scale: five sizes, weights 400 and 500 */
   --fs-sm: 13px;
   --fs-body: 15px;
   --fs-lead: 17px;

@@ -1,12 +1,9 @@
-//! The everyday agent's Notebook tools: search, read, record what helped, and flag gaps for Curator.
-
 use feeder_core::{FlagKind, FlagStatus, Kind, NewFlag, PageFilter, now_ms};
 use serde_json::{Value, json};
 
 use super::{Server, ToolOutput, str_arg};
 use crate::notebook::{page_json, project_name};
 
-/// The tools this module answers, by name.
 pub(super) const TOOLS: [&str; 4] = ["search_notebook", "read_page", "mark_page_helped", "flag_knowledge"];
 
 impl Server {
@@ -34,14 +31,12 @@ impl Server {
         let store = self.open_store()?;
         let hits = store.search_pages(query, &filter, limit).map_err(|e| e.to_string())?;
         let text = if hits.is_empty() {
-            // An empty search is the clearest sign of a gap, so it files itself for the gardener.
             if !query.trim().is_empty() {
                 let note = format!("Notebook search found nothing for “{}”", query.trim());
                 let open = store.flags(Some(FlagStatus::Open), 200).map_err(|e| e.to_string())?;
                 if !open.iter().any(|f| f.note == note) {
                     let project_id = self.project(&store, args, false).ok().flatten().map(|p| p.id);
                     let flag = NewFlag { kind: FlagKind::Missing, page_id: None, project_id, note, suggestion: None };
-                    // Best effort: a refused flag (a secret in the query, say) mustn't fail the search.
                     let _ = store.flag_knowledge(flag, &self.resolve_agent(args));
                 }
             }

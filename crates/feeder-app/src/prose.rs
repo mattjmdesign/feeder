@@ -1,7 +1,3 @@
-//! Shapes an update for reading. A short label such as "Next:" becomes a section heading.
-//! Plain lines get automatic emphasis for metrics and code styling for paths and ticket IDs.
-//! Authored Markdown goes directly to Rune's renderer.
-
 #[derive(Debug, PartialEq, Eq)]
 pub struct Section {
     pub label: Option<String>,
@@ -13,9 +9,7 @@ pub fn sections(body: &str) -> Vec<Section> {
         .map(str::trim)
         .map(|p| {
             let (label, rest) = split_label(p);
-            // Under a heading the sentence starts afresh: "Where it stands: the branch…" → "The branch…".
             let rest = if label.is_some() { capitalize(rest) } else { rest.to_string() };
-            // Leave authored Markdown and multiline structure to the renderer.
             let markdown = if rest.contains(['\n', '`', '[', '*', '_', '<', '>', '~', '\\', '|']) || rest.starts_with('#') {
                 rest
             } else {
@@ -55,8 +49,6 @@ const LABELS: [&str; 26] = [
     "risk",
 ];
 
-/// A paragraph's leading label: a known cue (or an explicitly bolded label up to 4 words and 32
-/// characters) before a colon. Ordinary sentences like "Built Feeder: ..." stay prose.
 fn split_label(p: &str) -> (Option<String>, &str) {
     let (bold, s) = match p.strip_prefix("**") {
         Some(rest) => (true, rest),
@@ -77,7 +69,7 @@ fn split_label(p: &str) -> (Option<String>, &str) {
         return (None, p);
     }
     if !(after.starts_with(' ') || after.starts_with('\n')) {
-        return (None, p); // "12:30", "https:" and the like
+        return (None, p);
     }
     if !bold && !LABELS.contains(&trimmed.to_ascii_lowercase().as_str()) {
         return (None, p);
@@ -93,7 +85,6 @@ fn capitalize(s: &str) -> String {
     }
 }
 
-/// Wraps ticket ids (two to eight capitals, a dash, digits) in backticks, outside code spans.
 fn code_tickets(s: &str) -> String {
     let chars: Vec<char> = s.chars().collect();
     let mut out = String::with_capacity(s.len() + 8);
@@ -135,7 +126,6 @@ const FILE_TYPES: [&str; 26] = [
     "sql", "sh", "app", "png", "svg", "lock", "env",
 ];
 
-/// Adds code and bold outside what's already code or bold.
 fn enrich(md: &str) -> String {
     let lead = lead_sentence(md);
     let mut out = String::with_capacity(md.len() + 32);
@@ -144,7 +134,7 @@ fn enrich(md: &str) -> String {
             out.push('`');
         }
         if i % 2 == 1 {
-            out.push_str(code_part); // inside a code span
+            out.push_str(code_part);
             continue;
         }
         for (j, bold_part) in code_part.split("**").enumerate() {
@@ -156,7 +146,6 @@ fn enrich(md: &str) -> String {
     }
     match lead {
         Some(n) if !md.contains("**") => {
-            // `n` counts characters of `md`; the enriched text has the same sentence, longer.
             let first: String = md.chars().take(n).collect();
             let enriched_first = enrich(&first);
             match out.strip_prefix(&enriched_first) {
@@ -168,10 +157,9 @@ fn enrich(md: &str) -> String {
     }
 }
 
-/// The length of a short first sentence worth leading with, when more follows it.
 fn lead_sentence(md: &str) -> Option<usize> {
     if md.starts_with(['-', '*', '1']) || md.contains('\n') {
-        return None; // lists and multi-line blocks keep their own shape
+        return None;
     }
     let chars: Vec<char> = md.chars().collect();
     let end =
@@ -186,7 +174,6 @@ fn enrich_words(text: &str) -> String {
     let mut i = 0;
     while i < words.len() {
         let w = words[i];
-        // A number with a unit after it: "14 ms", "3.2 MB".
         if let Some(next) = words.get(i + 1) {
             let unit = next.trim_end_matches([',', '.', ';', ')']).to_ascii_lowercase();
             if is_number(w) && UNITS.contains(&unit.as_str()) {
@@ -240,7 +227,6 @@ fn is_hash(w: &str) -> bool {
         && w.chars().any(|c| c.is_ascii_alphabetic())
 }
 
-/// Branches and paths: `sam/wave-3-plan`, `~/Applications/Feeder.app`, `src/main.rs`.
 fn is_pathlike(w: &str) -> bool {
     if !w.contains('/') || w.starts_with('/') && w.len() < 3 || is_ratio(w) {
         return false;

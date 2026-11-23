@@ -7,13 +7,6 @@ import { ToolLogo, type ToolKey } from './ToolLogo'
 import { useSiteTheme } from './theme'
 import './demos.css'
 
-// Connecting a tool in Settings → Connected Tools. Beats, once in view: the cursor
-// goes to Codex's Connect and clicks it; the button settles as Connected
-// with a check, on the same button, and the row's note changes to say the
-// tool needs a restart. Claude Code is already connected, Cursor not yet.
-//
-// Real strings: the pane title, three tool names, their notes and buttons.
-
 type S = { codex: boolean }
 
 const initial: S = { codex: false }

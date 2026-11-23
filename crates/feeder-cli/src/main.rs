@@ -1,5 +1,3 @@
-//! `feeder`: post and read project updates from a terminal, or serve them to agents over MCP.
-
 mod gardener;
 mod mcp;
 mod notebook;
@@ -25,75 +23,75 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
-    /// Post an update to a project's feed (1–3 short blocks). `feeder guide` shows how to write one.
+    #[command(about = "Post an update to a project's feed (1–3 short blocks). `feeder guide` shows how to write one.")]
     #[command(after_long_help = GUIDE)]
     Post {
-        /// The update. Omit it, or pass `-`, to read it from stdin.
+        #[arg(help = "The update. Omit it, or pass `-`, to read it from stdin.")]
         message: Vec<String>,
-        /// Project name. Defaults to the git repository (or folder) of --dir.
+        #[arg(help = "Project name. Defaults to the git repository (or folder) of --dir.")]
         #[arg(short, long)]
         project: Option<String>,
-        /// Who's posting, e.g. "Claude Code". Detected from the tool you run it in.
+        #[arg(help = "Who's posting, e.g. \"Claude Code\". Detected from the tool you run it in.")]
         #[arg(short, long)]
         agent: Option<String>,
-        /// Screenshot(s) or short video clip(s) to attach (repeat up to 8× for a carousel).
+        #[arg(help = "Screenshot(s) or short video clip(s) to attach (repeat up to 8× for a carousel).")]
         #[arg(short, long)]
         screenshot: Vec<PathBuf>,
-        /// Git branch name. Defaults to the current branch of --dir.
+        #[arg(help = "Git branch name. Defaults to the current branch of --dir.")]
         #[arg(short, long)]
         branch: Option<String>,
-        /// Optional diff stat override (auto-detected from git when omitted).
+        #[arg(help = "Optional diff stat override (auto-detected from git when omitted).")]
         #[arg(long)]
         diff_stat: Option<String>,
-        /// The folder to detect the project from. Defaults to the current folder.
+        #[arg(help = "The folder to detect the project from. Defaults to the current folder.")]
         #[arg(long)]
         dir: Option<PathBuf>,
         #[arg(long)]
         json: bool,
     },
-    /// Edit an existing update's text body.
+    #[command(about = "Edit an existing update's text body.")]
     Edit {
-        /// Update id.
+        #[arg(help = "Update id.")]
         id: i64,
-        /// The new update text. Omit it, or pass `-`, to read it from stdin.
+        #[arg(help = "The new update text. Omit it, or pass `-`, to read it from stdin.")]
         message: Vec<String>,
         #[arg(long)]
         json: bool,
     },
-    /// Delete a single update (and its stored media).
+    #[command(about = "Delete a single update (and its stored media).")]
     #[command(alias = "rm-update")]
     DeleteUpdate {
-        /// Update id.
+        #[arg(help = "Update id.")]
         id: i64,
-        /// Required: confirms the deletion.
+        #[arg(help = "Required: confirms the deletion.")]
         #[arg(long)]
         yes: bool,
     },
-    /// Show a project's latest updates, newest first.
+    #[command(about = "Show a project's latest updates, newest first.")]
     Feed {
-        /// Project name. Defaults to the project of the current folder.
+        #[arg(help = "Project name. Defaults to the project of the current folder.")]
         project: Option<String>,
         #[arg(short = 'n', long, default_value_t = 5)]
         limit: usize,
         #[arg(long)]
         json: bool,
     },
-    /// Reply to an update card (human answer/decision or agent follow-up).
+    #[command(about = "Reply to an update card (human answer/decision or agent follow-up).")]
     Reply {
-        /// Update id.
+        #[arg(help = "Update id.")]
         id: i64,
-        /// Reply message. Omit or pass `-` to read from stdin.
+        #[arg(help = "Reply message. Omit or pass `-` to read from stdin.")]
         message: Vec<String>,
-        /// Author name (defaults to "You" for human replies or detected agent with --from-agent).
+        #[arg(help = "Author name (defaults to \"You\" for human replies or detected agent with --from-agent).")]
         #[arg(short, long)]
         agent: Option<String>,
-        /// Mark this reply as coming from an agent instead of the user.
+        #[arg(help = "Mark this reply as coming from an agent instead of the user.")]
         #[arg(long)]
         from_agent: bool,
         #[arg(long)]
         json: bool,
     },
-    /// Show replies (optionally only unread human replies) and mark them read.
+    #[command(about = "Show replies (optionally only unread human replies) and mark them read.")]
     Replies {
         #[arg(short, long)]
         project: Option<String>,
@@ -104,41 +102,41 @@ enum Command {
         #[arg(long)]
         json: bool,
     },
-    /// View or update a project's pinned brief (`Goal / Focus / Commands`).
+    #[command(about = "View or update a project's pinned brief (`Goal / Focus / Commands`).")]
     Brief {
-        /// New brief text. Omit to print the current brief.
+        #[arg(help = "New brief text. Omit to print the current brief.")]
         text: Vec<String>,
         #[arg(short, long)]
         project: Option<String>,
-        /// Clear the pinned brief.
+        #[arg(help = "Clear the pinned brief.")]
         #[arg(long)]
         clear: bool,
         #[arg(long)]
         json: bool,
     },
-    /// The shared notebook of lessons: fixes, pitfalls, patterns and decisions across projects.
+    #[command(about = "The shared notebook of lessons: fixes, pitfalls, patterns and decisions across projects.")]
     #[command(visible_aliases = ["nb", "kb"])]
     Notebook {
         #[command(subcommand)]
         action: Option<notebook::NotebookCmd>,
     },
-    /// Flag Notebook knowledge that is missing, wrong or outdated for Curator to review.
+    #[command(about = "Flag Notebook knowledge that is missing, wrong or outdated for Curator to review.")]
     Flag {
-        /// What's missing or wrong.
+        #[arg(help = "What's missing or wrong.")]
         note: Vec<String>,
-        /// Flag a Feed thread and its replies for Curator to review.
+        #[arg(help = "Flag a Feed thread and its replies for Curator to review.")]
         #[arg(long, conflicts_with_all = ["note", "kind", "page", "suggest", "project"])]
         update: Option<i64>,
-        /// `missing` (default), `wrong` or `outdated`.
+        #[arg(help = "`missing` (default), `wrong` or `outdated`.")]
         #[arg(long)]
         kind: Option<String>,
-        /// The page that's wrong or outdated.
+        #[arg(help = "The page that's wrong or outdated.")]
         #[arg(long)]
         page: Option<i64>,
-        /// The correct information, if you know it.
+        #[arg(help = "The correct information, if you know it.")]
         #[arg(long)]
         suggest: Option<String>,
-        /// The project you're working in. Defaults to the current folder's project.
+        #[arg(help = "The project you're working in. Defaults to the current folder's project.")]
         #[arg(short, long)]
         project: Option<String>,
         #[arg(short, long)]
@@ -146,40 +144,40 @@ enum Command {
         #[arg(long)]
         json: bool,
     },
-    /// List open flags (or all with --all), or dismiss one.
+    #[command(about = "List open flags (or all with --all), or dismiss one.")]
     Flags {
         #[arg(long)]
         all: bool,
-        /// Dismiss this flag.
+        #[arg(help = "Dismiss this flag.")]
         #[arg(long)]
         dismiss: Option<i64>,
-        /// Why it's dismissed.
+        #[arg(help = "Why it's dismissed.")]
         #[arg(long, requires = "dismiss")]
         reason: Option<String>,
         #[arg(long)]
         json: bool,
     },
-    /// Ask a Notebook question or review flagged notes with Curator.
+    #[command(about = "Ask a Notebook question or review flagged notes with Curator.")]
     #[command(name = "curator", visible_alias = "gardener")]
     Gardener {
         #[command(subcommand)]
         action: gardener::GardenerCmd,
     },
-    /// Manage a project's optional to-do list.
+    #[command(about = "Manage a project's optional to-do list.")]
     Todo {
         #[command(subcommand)]
         action: Option<TodoCmd>,
         #[arg(short, long)]
         project: Option<String>,
-        /// Show only open (unchecked) to-dos.
+        #[arg(help = "Show only open (unchecked) to-dos.")]
         #[arg(long)]
         open: bool,
         #[arg(long)]
         json: bool,
     },
-    /// Emit or clear a live "working" pulse on a project's orb.
+    #[command(about = "Emit or clear a live \"working\" pulse on a project's orb.")]
     Pulse {
-        /// Short activity status, e.g. "Refactoring auth".
+        #[arg(help = "Short activity status, e.g. \"Refactoring auth\".")]
         status: Vec<String>,
         #[arg(short, long)]
         project: Option<String>,
@@ -187,77 +185,77 @@ enum Command {
         agent: Option<String>,
         #[arg(short, long)]
         branch: Option<String>,
-        /// Time-to-live in seconds (default 120).
+        #[arg(help = "Time-to-live in seconds (default 120).")]
         #[arg(long, default_value_t = 120)]
         ttl: u64,
-        /// Clear the pulse for this project and agent.
+        #[arg(help = "Clear the pulse for this project and agent.")]
         #[arg(long)]
         clear: bool,
         #[arg(long)]
         json: bool,
     },
-    /// Install (or remove) a quiet git post-commit hook in a repository.
+    #[command(about = "Install (or remove) a quiet git post-commit hook in a repository.")]
     InstallHook {
-        /// Repository folder (defaults to current directory).
+        #[arg(help = "Repository folder (defaults to current directory).")]
         dir: Option<PathBuf>,
-        /// Remove the Feeder hook instead of installing it.
+        #[arg(help = "Remove the Feeder hook instead of installing it.")]
         #[arg(long)]
         remove: bool,
     },
-    /// Internal handler invoked by git's post-commit hook.
+    #[command(about = "Internal handler invoked by git's post-commit hook.")]
     #[command(hide = true)]
     HookPostCommit { dir: Option<PathBuf> },
-    /// Start the local / Tailscale companion HTTP server.
+    #[command(about = "Start the local / Tailscale companion HTTP server.")]
     Serve {
-        /// Address and port to bind (e.g. 127.0.0.1:7331 or your Tailscale IP).
+        #[arg(help = "Address and port to bind (e.g. 127.0.0.1:7331 or your Tailscale IP).")]
         #[arg(long, default_value = "127.0.0.1:7331")]
         bind: String,
-        /// Optional Bearer token required for access (recommended when binding beyond localhost).
+        #[arg(help = "Optional Bearer token required for access (recommended when binding beyond localhost).")]
         #[arg(long)]
         token: Option<String>,
     },
-    /// List projects, most recently active first.
+    #[command(about = "List projects, most recently active first.")]
     Projects {
-        /// Show only archived projects.
+        #[arg(help = "Show only archived projects.")]
         #[arg(long)]
         archived: bool,
-        /// Show both active and archived projects.
+        #[arg(help = "Show both active and archived projects.")]
         #[arg(long)]
         all: bool,
         #[arg(long)]
         json: bool,
     },
-    /// Add a project without posting to it, optionally under a nickname.
+    #[command(about = "Add a project without posting to it, optionally under a nickname.")]
     Add {
-        /// The project folder. Defaults to the current folder's git repository.
+        #[arg(help = "The project folder. Defaults to the current folder's git repository.")]
         dir: Option<PathBuf>,
-        /// A nickname to show instead of the folder name.
+        #[arg(help = "A nickname to show instead of the folder name.")]
         #[arg(short, long)]
         name: Option<String>,
     },
-    /// Give a project a nickname (found by its old name or folder name). "" restores the folder name.
+    #[command(about = "Give a project a nickname (found by its old name or folder name). \"\" restores the folder name.")]
     Rename { project: String, name: String },
-    /// Hide a project from the active Home shelf and global Feed without deleting its history.
+    #[command(about = "Hide a project from the active Home shelf and global Feed without deleting its history.")]
     Archive {
-        /// Project name. Defaults to the project of the current folder.
+        #[arg(help = "Project name. Defaults to the project of the current folder.")]
         project: Option<String>,
     },
-    /// Restore an archived project to the active Home shelf and global Feed.
+    #[command(about = "Restore an archived project to the active Home shelf and global Feed.")]
     Unarchive {
-        /// Project name. Defaults to the project of the current folder.
+        #[arg(help = "Project name. Defaults to the project of the current folder.")]
         project: Option<String>,
     },
-    /// Pin a project so it stays anchored first on Home.
+    #[command(about = "Pin a project so it stays anchored first on Home.")]
     Pin {
-        /// Project name. Defaults to the project of the current folder.
+        #[arg(help = "Project name. Defaults to the project of the current folder.")]
         project: Option<String>,
     },
-    /// Unpin a project.
+    #[command(about = "Unpin a project.")]
     Unpin {
-        /// Project name. Defaults to the project of the current folder.
+        #[arg(help = "Project name. Defaults to the project of the current folder.")]
         project: Option<String>,
     },
-    /// Search updates across projects.
+    #[command(about = "Search updates across projects.")]
     Search {
         query: String,
         #[arg(short, long)]
@@ -269,113 +267,111 @@ enum Command {
         #[arg(long)]
         json: bool,
     },
-    /// Mark a project (or --all active projects) as read.
+    #[command(about = "Mark a project (or --all active projects) as read.")]
     Seen {
-        /// Project name. Defaults to the project of the current folder.
+        #[arg(help = "Project name. Defaults to the project of the current folder.")]
         project: Option<String>,
-        /// Mark every active project as read.
+        #[arg(help = "Mark every active project as read.")]
         #[arg(long)]
         all: bool,
     },
-    /// Dismiss the "needs you" flag on a project's latest update or a specific update id.
+    #[command(about = "Dismiss the \"needs you\" flag on a project's latest update or a specific update id.")]
     Dismiss {
-        /// Project name. Defaults to the project of the current folder.
+        #[arg(help = "Project name. Defaults to the project of the current folder.")]
         project: Option<String>,
-        /// Specific update id to dismiss instead of the project's latest update.
+        #[arg(help = "Specific update id to dismiss instead of the project's latest update.")]
         #[arg(long)]
         id: Option<i64>,
     },
-    /// Delete a project, its feed and its screenshots.
+    #[command(about = "Delete a project, its feed and its screenshots.")]
     Remove {
         project: String,
-        /// Required: confirms the deletion.
+        #[arg(help = "Required: confirms the deletion.")]
         #[arg(long)]
         yes: bool,
     },
-    /// Run the MCP server on stdio (agent tools start this themselves; it's local only).
+    #[command(about = "Run the MCP server on stdio (agent tools start this themselves; it's local only).")]
     Mcp {
-        /// Offer only the Notebook gardener's tools (Feeder starts this for a gardener session).
+        #[arg(help = "Offer only the Notebook gardener's tools (Feeder starts this for a gardener session).")]
         #[arg(long, hide = true, requires = "gardener_run")]
         gardener: bool,
         #[arg(long, hide = true, requires = "gardener")]
         gardener_run: Option<i64>,
     },
-    /// Connect Feeder to your agent tools: the MCP server, plus the writing skill.
-    ///
-    /// With no tools named it lists them; `--all` connects every one found on this Mac.
-    /// `--remove` disconnects instead; `--remove --all` also deletes the skills, which is
-    /// everything to undo before deleting Feeder.
-    /// Tools: claude-code, claude-desktop, codex, cursor, antigravity, t3-code, opencode.
+    #[command(
+        about = "Connect Feeder to your agent tools: the MCP server, plus the writing skill.",
+        long_about = "Connect Feeder to your agent tools: the MCP server, plus the writing skill.\n\nWith no tools named it lists them; `--all` connects every one found on this Mac.\n`--remove` disconnects instead; `--remove --all` also deletes the skills, which is\neverything to undo before deleting Feeder.\nTools: claude-code, claude-desktop, codex, cursor, antigravity, t3-code, opencode."
+    )]
     Setup {
         tools: Vec<String>,
         #[arg(long)]
         all: bool,
-        /// Print the config each tool needs instead of changing anything.
+        #[arg(help = "Print the config each tool needs instead of changing anything.")]
         #[arg(long)]
         print: bool,
-        /// Disconnect the named tools (or, with `--all`, every tool) instead of connecting them.
+        #[arg(help = "Disconnect the named tools (or, with `--all`, every tool) instead of connecting them.")]
         #[arg(long, conflicts_with = "print")]
         remove: bool,
     },
-    /// How to write a good update (the same guide agents get).
+    #[command(about = "How to write a good update (the same guide agents get).")]
     Guide,
-    /// Print where the store lives.
+    #[command(about = "Print where the store lives.")]
     Where,
 }
 
 #[derive(Subcommand)]
 enum TodoCmd {
-    /// List to-dos for a project (default when no subcommand is given).
+    #[command(about = "List to-dos for a project (default when no subcommand is given).")]
     List {
         #[arg(short, long)]
         project: Option<String>,
-        /// Show only open (unchecked) to-dos.
+        #[arg(help = "Show only open (unchecked) to-dos.")]
         #[arg(long)]
         open: bool,
         #[arg(long)]
         json: bool,
     },
-    /// Add a to-do item to a project's checklist.
+    #[command(about = "Add a to-do item to a project's checklist.")]
     Add {
-        /// To-do title (omit or pass `-` to read from stdin).
+        #[arg(help = "To-do title (omit or pass `-` to read from stdin).")]
         title: Vec<String>,
         #[arg(short, long)]
         project: Option<String>,
         #[arg(long)]
         json: bool,
     },
-    /// Mark a to-do item done (or pass --reopen to uncheck it).
+    #[command(about = "Mark a to-do item done (or pass --reopen to uncheck it).")]
     Done {
-        /// To-do id.
+        #[arg(help = "To-do id.")]
         id: i64,
-        /// Reopen a completed to-do instead of marking it done.
+        #[arg(help = "Reopen a completed to-do instead of marking it done.")]
         #[arg(long)]
         reopen: bool,
         #[arg(long)]
         json: bool,
     },
-    /// Rename an existing to-do item.
+    #[command(about = "Rename an existing to-do item.")]
     Edit {
-        /// To-do id.
+        #[arg(help = "To-do id.")]
         id: i64,
-        /// New to-do title.
+        #[arg(help = "New to-do title.")]
         title: Vec<String>,
         #[arg(long)]
         json: bool,
     },
-    /// Delete a single to-do item.
+    #[command(about = "Delete a single to-do item.")]
     #[command(alias = "delete")]
     Rm {
-        /// To-do id.
+        #[arg(help = "To-do id.")]
         id: i64,
         #[arg(long)]
         json: bool,
     },
-    /// Clear completed to-dos (or --all to clear the whole checklist).
+    #[command(about = "Clear completed to-dos (or --all to clear the whole checklist).")]
     Clear {
         #[arg(short, long)]
         project: Option<String>,
-        /// Remove every to-do for this project, including open ones.
+        #[arg(help = "Remove every to-do for this project, including open ones.")]
         #[arg(long)]
         all: bool,
         #[arg(long)]
@@ -969,7 +965,6 @@ fn run_setup(names: Vec<String>, all: bool, print: bool, remove: bool) -> Result
         tools.push(Tool::parse(n).ok_or_else(|| format!("unknown tool `{n}`; run `feeder setup` to list them"))?);
     }
     if all {
-        // Removing covers tools since uninstalled too, whose configs may still name Feeder.
         tools.extend(Tool::ALL.into_iter().filter(|t| remove || setup::detected(*t)));
     }
     tools.dedup();

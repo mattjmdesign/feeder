@@ -16,7 +16,6 @@ pub fn step_selection(ids: &[i64], current: Option<i64>, delta: isize) -> Option
 }
 
 pub fn on_key(s: &mut State, e: &KeyEvent, tx: &mut Tx) -> bool {
-    // ⌘+ / ⌘− / ⌘0 / ⌘9 zoom the Files map while it shows.
     if s.open.is_some() && crate::files::on_key(s, e) {
         return true;
     }
@@ -236,7 +235,6 @@ pub fn on_key(s: &mut State, e: &KeyEvent, tx: &mut Tx) -> bool {
         return true;
     }
 
-    // Single-key keyboard navigation when not typing or inside a modal or menu.
     if !s.is_typing()
         && s.lightbox.is_none()
         && !s.settings_open

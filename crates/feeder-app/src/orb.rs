@@ -1,11 +1,6 @@
-//! Draws a project's [`Orb`] as stacked gradients: a pattern body, then the same rim shade, key
-//! light and bounce light on every orb, so they all read as one family of glass spheres lit from
-//! the upper left.
-
 use feeder_core::{Orb, Pattern};
 use rune::{Color, El, el, oklch};
 
-/// Harmonize secondary/tertiary hues so even legacy orbs with distant hues stay clean and cohesive.
 fn harmonized_hue(o: &Orb, i: usize) -> f32 {
     let h0 = o.hues[0];
     let hi = o.hues[i % 3];
@@ -16,13 +11,11 @@ fn harmonized_hue(o: &Orb, i: usize) -> f32 {
     (h0 + delta.clamp(-42.0, 42.0)).rem_euclid(360.0)
 }
 
-/// A colour from the orb's palette: hue `i` (0..3) at lightness `l` and `c` × its chroma.
 fn tone(o: &Orb, i: usize, l: f32, c: f32) -> Color {
     let base_c = o.chroma.max(0.15);
     oklch(l, (base_c * c).min(0.24), harmonized_hue(o, i))
 }
 
-/// The orb's signature colour, for dots, glows and accents elsewhere.
 pub fn accent(o: &Orb) -> Color {
     match o.pattern {
         Pattern::Pearl => tone(o, 0, 0.8, 0.9),
@@ -30,7 +23,6 @@ pub fn accent(o: &Orb) -> Color {
     }
 }
 
-/// Soft breathing halo placed behind an orb when an agent session has an active pulse.
 pub fn pulse_halo(o: &Orb, size: f32, phase: f32) -> El {
     let pad = (size * 0.22).clamp(14.0, 26.0);
     let total = size + pad * 2.0;
@@ -52,7 +44,6 @@ pub fn orb(o: &Orb, size: f32) -> El {
         body = body.child(paint(layer()));
     }
 
-    // Shared lighting: a subtle rim shade, soft bottom bounce, crisp edge highlight, and key glint.
     let rim = layer().radial_gradient([0.5, 0.5], r, [(0.0, black(0.0)), (0.68, black(0.0)), (0.9, black(0.12)), (1.0, black(0.28))]);
     let caustic_tone = tone(o, 1, 0.86, 0.75);
     let caustic = layer().radial_gradient(

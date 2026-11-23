@@ -1,5 +1,4 @@
 #!/usr/bin/env bash
-# Prints the directory containing the pinned Sparkle framework and release tools.
 set -euo pipefail
 
 cd "$(dirname "$0")/.."

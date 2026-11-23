@@ -1,7 +1,3 @@
-//! Which subscriptions power Curator, what each is called, and the model and thinking level it
-//! runs with. A CLI that is installed and signed in is only *available*: Curator uses it after the
-//! person turns it on. Saved beside `settings.json` as `curator.json`.
-
 use std::collections::BTreeMap;
 use std::io::{self, BufRead, BufReader, Read, Write};
 use std::os::unix::fs::OpenOptionsExt;
@@ -18,7 +14,6 @@ use super::{Backend, profile, session};
 use crate::{Error, Result};
 
 const FILE: &str = "curator.json";
-/// The most a nickname keeps, so a pasted paragraph can't stretch the picker.
 pub const NICKNAME_CHARS: usize = 32;
 const MAX_MODEL_CHARS: usize = 128;
 const MAX_EFFORT_CHARS: usize = 32;
@@ -30,21 +25,15 @@ const OPENCODE_CACHE_MAX_BYTES: u64 = 32 * 1024 * 1024;
 const OPENCODE_EFFORTS: [&str; 5] = ["low", "medium", "high", "xhigh", "max"];
 const ANTIGRAVITY_LEVELS: [&str; 5] = ["low", "medium", "high", "xhigh", "max"];
 
-/// One subscription's Curator choices.
 #[derive(Serialize, Deserialize, Clone, Debug, Default, PartialEq, Eq)]
 #[serde(default)]
 pub struct Provider {
-    /// Curator may run on it. Off until the person turns it on.
     pub enabled: bool,
-    /// The person's own name for it, such as "Personal" or "Work".
     pub nickname: String,
-    /// A model ID the CLI accepts. `None` runs the CLI's default.
     pub model: Option<String>,
-    /// A thinking level the model lists. `None` runs the model's default.
     pub effort: Option<String>,
 }
 
-/// Every subscription's choices, and the one new chats start on.
 #[derive(Serialize, Deserialize, Clone, Debug, Default, PartialEq, Eq)]
 #[serde(default)]
 pub struct Prefs {
@@ -52,7 +41,6 @@ pub struct Prefs {
     pub providers: BTreeMap<String, Provider>,
 }
 
-/// What a session passes to its CLI.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct RunConfig {
     pub model: Option<String>,
@@ -60,11 +48,6 @@ pub struct RunConfig {
 }
 
 impl RunConfig {
-    /// Validates user-supplied model and thinking-level overrides before passing them to a CLI.
-    ///
-    /// # Errors
-    /// Returns [`Error::Invalid`] if a value could be parsed as a CLI flag or contains whitespace
-    /// or control characters.
     pub fn validate(&self) -> Result<()> {
         if let Some(model) = &self.model {
             validate_model(model)?;
@@ -98,8 +81,6 @@ fn validate_effort(effort: &str) -> Result<()> {
     Ok(())
 }
 
-/// A model the CLI offers, with the thinking levels it accepts (empty when the CLI has no
-/// separate setting).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ModelInfo {
     pub id: String,
@@ -108,15 +89,10 @@ pub struct ModelInfo {
 }
 
 impl Prefs {
-    /// The saved choices, or none turned on when nothing is saved or it doesn't parse.
     pub fn load(dir: &Path) -> Prefs {
         std::fs::read_to_string(dir.join(FILE)).ok().and_then(|s| serde_json::from_str(&s).ok()).unwrap_or_default()
     }
 
-    /// Writes through a temporary file (`0600`), so a crash never leaves half a file.
-    ///
-    /// # Errors
-    /// Returns an I/O error when the folder or file can't be written.
     pub fn save(&self, dir: &Path) -> io::Result<()> {
         std::fs::create_dir_all(dir)?;
         let tmp = dir.join(format!("{FILE}.tmp-{}-{:08x}", std::process::id(), fastrand::u32(..)));
@@ -147,8 +123,6 @@ impl Prefs {
         self.providers.get(backend.as_str()).is_some_and(|p| p.enabled)
     }
 
-    /// Turns a subscription on or off. The first one turned on becomes the default; turning the
-    /// default off moves it to another that's still on.
     pub fn set_enabled(&mut self, backend: Backend, on: bool) {
         self.edit(backend, |p| p.enabled = on);
         if on && self.default_backend().is_none() {
@@ -159,17 +133,14 @@ impl Prefs {
         }
     }
 
-    /// The subscriptions turned on, in [`Backend::ALL`] order.
     pub fn enabled(&self) -> Vec<Backend> {
         Backend::ALL.into_iter().filter(|b| self.is_enabled(*b)).collect()
     }
 
-    /// The default, when it's still turned on.
     pub fn default_backend(&self) -> Option<Backend> {
         self.default.as_deref().and_then(|d| d.parse().ok()).filter(|b| self.is_enabled(*b))
     }
 
-    /// The nickname, else the CLI's name.
     pub fn name(&self, backend: Backend) -> String {
         let nick = self.get(backend).nickname;
         if nick.trim().is_empty() { backend.label().to_string() } else { nick.trim().to_string() }
@@ -189,7 +160,6 @@ impl Prefs {
     }
 }
 
-/// A thinking level as people read it: "xhigh" becomes "Extra High".
 pub fn effort_label(effort: &str) -> String {
     match effort {
         "xhigh" => "Extra High".into(),
@@ -202,13 +172,8 @@ pub fn effort_label(effort: &str) -> String {
 }
 
 impl Backend {
-    /// The models this CLI offers on this Mac. Runs the CLI, so call it off the UI thread.
-    ///
-    /// # Errors
-    /// Returns an error when the CLI is missing, signed out, or its list can't be read.
     pub fn models(self, data: &Path) -> Result<Vec<ModelInfo>> {
         match self {
-            // Claude Code has no list command; its aliases always name the newest of each family.
             Backend::ClaudeCode => {
                 let efforts: Vec<String> = ["low", "medium", "high", "xhigh", "max"].map(String::from).to_vec();
                 Ok([("opus", "Opus"), ("sonnet", "Sonnet"), ("haiku", "Haiku"), ("fable", "Fable")]
@@ -250,7 +215,6 @@ fn read_command_stdout(cmd: &mut Command, timeout: Duration) -> io::Result<(std:
             let mut text = String::new();
             if let Some(mut pipe) = stdout {
                 let _ = pipe.by_ref().take(LIST_OUTPUT_BYTES).read_to_string(&mut text);
-                // Keep draining past the cap so the child never stalls on a full pipe.
                 let _ = io::copy(&mut pipe, &mut io::sink());
             }
             text
@@ -272,8 +236,6 @@ fn read_command_stdout(cmd: &mut Command, timeout: Duration) -> io::Result<(std:
 }
 
 fn codex_models(data: &Path) -> Result<Vec<ModelInfo>> {
-    // Match `profile::command`: Codex runs under real HOME with stripped env vars, so check
-    // `~/.codex/models_cache.json` first and fall back to `codex app-server` `model/list`.
     if let Some(path) = dirs::home_dir().map(|h| h.join(".codex").join("models_cache.json"))
         && let Ok(text) = std::fs::read_to_string(&path)
     {
@@ -446,9 +408,6 @@ fn parse_opencode_with_cache(text: &str, cache: Option<&Value>) -> Vec<ModelInfo
         .collect()
 }
 
-/// Antigravity lists one ID per thinking level ("gemini-4-neon-high"). Groups bases that have
-/// multiple thinking levels into one model so the picker matches `agy acp`'s own `configOptions`,
-/// while keeping single-level IDs (such as `gpt-oss-120b-medium`) intact.
 fn parse_antigravity(text: &str) -> Vec<ModelInfo> {
     struct Row<'a> {
         id: &'a str,
@@ -490,8 +449,6 @@ fn parse_antigravity(text: &str) -> Vec<ModelInfo> {
     models
 }
 
-/// The ID Antigravity runs: its per-level ID when a supported thinking level is selected and not
-/// already suffixed onto the model ID.
 pub(super) fn antigravity_model(run: &RunConfig) -> Option<String> {
     let model = run.model.as_deref()?;
     let already_leveled = ANTIGRAVITY_LEVELS.iter().any(|level| model.ends_with(&format!("-{level}")));

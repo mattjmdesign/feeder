@@ -1,5 +1,3 @@
-//! A bounded, read-only preview of a file in a local project's checkout.
-
 use std::ffi::CString;
 use std::fs::{File, OpenOptions};
 use std::io::{self, Read};
@@ -11,7 +9,6 @@ use std::path::{Component, Path};
 const MAX_TEXT_BYTES: u64 = 512 * 1024;
 const MAX_IMAGE_BYTES: u64 = 8 * 1024 * 1024;
 
-/// The file's content, or a reason it has no in-app preview.
 #[derive(Debug, PartialEq, Eq)]
 pub enum FilePreview {
     Text(String),
@@ -20,11 +17,6 @@ pub enum FilePreview {
     TooLarge,
 }
 
-/// Reads one regular file relative to a project directory. Call from a background worker.
-/// The file is opened read-only and symlinks are rejected at each step below the root.
-///
-/// # Errors
-/// Returns an I/O error for an invalid path, or when the file cannot be opened or read.
 pub fn read_file_preview(root: &Path, path: &Path) -> io::Result<FilePreview> {
     let mut file = open_project_file(root, path)?;
     let metadata = file.metadata()?;
@@ -85,13 +77,10 @@ fn open_component(directory: RawFd, name: &std::ffi::CStr, is_dir: bool) -> io::
     if is_dir {
         flags |= libc::O_DIRECTORY;
     }
-    // SAFETY: directory belongs to a live File, the name is NUL-terminated, and no creation
-    // flag is set. A successful call returns one owned descriptor.
     let fd = unsafe { libc::openat(directory, name.as_ptr(), flags) };
     if fd < 0 {
         return Err(io::Error::last_os_error());
     }
-    // SAFETY: openat succeeded and no other owner has taken the descriptor.
     Ok(unsafe { File::from_raw_fd(fd) })
 }
 

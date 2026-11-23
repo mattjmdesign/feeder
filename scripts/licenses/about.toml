@@ -1,5 +1,3 @@
-# Licenses `cargo about` accepts for Feeder's dependencies; anything else stops the build of
-# assets/ThirdPartyLicenses.html until it's reviewed.
 accepted = [
   "MIT",
   "MIT-0",

@@ -1,5 +1,3 @@
-//! Which project a directory belongs to: its git root if it has one, else the directory itself.
-
 use std::path::{Path, PathBuf};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -11,7 +9,6 @@ pub struct DetectedProject {
 pub fn detect_project(dir: &Path) -> DetectedProject {
     let dir = dir.canonicalize().unwrap_or_else(|_| dir.to_path_buf());
     let root = match dir.ancestors().find(|p| p.join(".git").exists()) {
-        // A linked worktree belongs to the repository it was made from.
         Some(top) => main_worktree(top).unwrap_or_else(|| top.to_path_buf()),
         None => dir.clone(),
     };
@@ -20,8 +17,6 @@ pub fn detect_project(dir: &Path) -> DetectedProject {
     DetectedProject { name, path: root }
 }
 
-/// For a linked worktree (its `.git` is a file reading `gitdir: <main>/.git/worktrees/<name>`),
-/// the main checkout's folder. Submodules, whose `.git` files point into `.git/modules`, aren't.
 fn main_worktree(top: &Path) -> Option<PathBuf> {
     let file = top.join(".git");
     if !file.is_file() {
@@ -39,8 +34,6 @@ fn main_worktree(top: &Path) -> Option<PathBuf> {
     Some(main.canonicalize().unwrap_or_else(|_| main.to_path_buf()))
 }
 
-/// Reads the current git branch (or 7-char detached SHA) for `dir`, if it is inside a git
-/// repository or linked worktree.
 pub fn detect_branch(dir: &Path) -> Option<String> {
     let dir = dir.canonicalize().unwrap_or_else(|_| dir.to_path_buf());
     let top = dir.ancestors().find(|p| p.join(".git").exists())?;
@@ -71,7 +64,6 @@ pub fn detect_branch(dir: &Path) -> Option<String> {
     None
 }
 
-/// The key a project is found by: lowercase ASCII letters and digits joined by single dashes.
 pub fn slugify(name: &str) -> String {
     let mut slug = String::new();
     for c in name.trim().chars().flat_map(char::to_lowercase) {
@@ -92,8 +84,6 @@ pub struct GitMeta {
     pub diff_stat: Option<String>,
 }
 
-/// Captures the current branch, short commit SHA, and compact diff stat (`+42/-18 · 4f`)
-/// for `dir` when it sits inside a git repository.
 pub fn detect_git_meta(dir: &Path) -> GitMeta {
     let branch = detect_branch(dir);
     if branch.is_none() {
@@ -107,7 +97,6 @@ pub fn detect_git_meta(dir: &Path) -> GitMeta {
     GitMeta { branch, commit_sha, diff_stat }
 }
 
-/// Captures `(commit_subject, GitMeta)` for the latest commit on `HEAD` (used by `post-commit` hook).
 pub fn latest_commit_summary(dir: &Path) -> Option<(String, GitMeta)> {
     let branch = detect_branch(dir);
     let commit_sha = git_output(dir, &["rev-parse", "--short=7", "HEAD"]).filter(|s| !s.is_empty())?;
@@ -117,8 +106,6 @@ pub fn latest_commit_summary(dir: &Path) -> Option<(String, GitMeta)> {
     Some((subject, GitMeta { branch, commit_sha: Some(commit_sha), diff_stat }))
 }
 
-/// Formats `git --shortstat` output like `"4 files changed, 42 insertions(+), 18 deletions(-)"`
-/// into `"+42/-18 · 4f"`.
 pub fn format_shortstat(raw: &str) -> Option<String> {
     let mut files: Option<u64> = None;
     let mut ins: u64 = 0;
@@ -152,8 +139,6 @@ fn git_output(dir: &Path, args: &[&str]) -> Option<String> {
 const HOOK_START: &str = "# >>> feeder-hook >>>";
 const HOOK_END: &str = "# <<< feeder-hook <<<";
 
-/// Resolves `.git/hooks/post-commit` for `dir` and appends an idempotent background hook calling
-/// `feeder hook-post-commit`.
 pub fn install_post_commit_hook(dir: &Path, feeder_bin: &Path) -> crate::Result<PathBuf> {
     let hooks_dir = git_output(dir, &["rev-parse", "--git-path", "hooks"])
         .map(PathBuf::from)
@@ -189,7 +174,6 @@ pub fn install_post_commit_hook(dir: &Path, feeder_bin: &Path) -> crate::Result<
     Ok(hook_path)
 }
 
-/// Removes the Feeder block from `.git/hooks/post-commit` if present. Returns `true` if removed.
 pub fn remove_post_commit_hook(dir: &Path) -> crate::Result<bool> {
     let Some(hooks_rel) = git_output(dir, &["rev-parse", "--git-path", "hooks"]) else {
         return Err(crate::Error::Invalid(format!("{} is not a git repository", dir.display())));

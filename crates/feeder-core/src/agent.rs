@@ -1,8 +1,3 @@
-//! Friendly names for the agents that post. MCP clients introduce themselves by an id such as
-//! `claude-code`; the feed shows "Claude Code".
-
-/// The agent tool this process runs under, from the variables each one sets. A host app wins
-/// over the harness inside it: Claude Code running in T3 Code posts as T3 Code.
 pub fn agent_from_env() -> Option<String> {
     agent_from(|k| std::env::var(k).ok().filter(|v| !v.is_empty()))
 }
@@ -28,7 +23,6 @@ fn agent_from(get: impl Fn(&str) -> Option<String>) -> Option<String> {
     Some(found.into())
 }
 
-/// The host app behind a post, independent of any explicit author name.
 pub(crate) fn host_from_env() -> Option<&'static str> {
     host_from(|key| std::env::var(key).ok().filter(|value| !value.is_empty()))
 }
@@ -78,7 +72,6 @@ pub fn agent_display_name(raw: &str) -> String {
     if id.is_empty() {
         return "Unknown agent".to_string();
     }
-    // A kebab id we don't know: title-case its words. A name with spaces or capitals is kept.
     if id.chars().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-' || c == '_') {
         return id
             .split(['-', '_'])

@@ -1,5 +1,3 @@
-//! Read-only file and change snapshots for the project's Files view.
-
 use std::collections::{BTreeSet, HashMap};
 use std::ffi::OsStr;
 use std::fs::{self, OpenOptions};
@@ -17,7 +15,6 @@ pub struct WorkingTree {
     pub status: TreeStatus,
     pub root: Option<PathBuf>,
     pub branch: Option<String>,
-    /// Tracked and untracked paths relative to `root`. Changes can also name deleted files.
     pub files: Vec<String>,
     pub changes: Vec<FileChange>,
     pub last_commit: Option<Commit>,
@@ -39,7 +36,6 @@ pub struct FileChange {
     pub kind: ChangeKind,
     pub added: u32,
     pub removed: u32,
-    /// Last filesystem modification in milliseconds. Absent for deleted files.
     pub modified_at: Option<i64>,
 }
 
@@ -57,8 +53,6 @@ pub struct Commit {
     pub at: i64,
 }
 
-/// Reads the checkout containing `path`. Plain folders get up to 5,000 file paths.
-/// This can run Git and read the filesystem, so call it off the UI thread.
 pub fn read_working_tree(path: Option<&Path>) -> WorkingTree {
     let mut tree = WorkingTree {
         status: TreeStatus::NoFolder,
@@ -131,7 +125,7 @@ fn load(folder: &Path, tree: &mut WorkingTree) -> Result<TreeStatus, String> {
         } else {
             match (*x, *y) {
                 (b'?', b'?') => ChangeKind::New,
-                (b'A', b'D') | (b'D', b' ') | (b' ', b'D') | (b'M', b'D') | (b'T', b'D') => ChangeKind::Deleted,
+                (b'A' | b' ' | b'M' | b'T', b'D') | (b'D', b' ') => ChangeKind::Deleted,
                 (b'A', b' ' | b'M' | b'T') => ChangeKind::New,
                 _ => ChangeKind::Edited,
             }
@@ -172,7 +166,7 @@ fn git(root: &Path, args: &[&str]) -> Result<Output, String> {
         .env_remove("GIT_COMMON_DIR")
         .env_remove("GIT_INDEX_FILE")
         .output()
-        .map_err(|e| format!("Couldn't run git {}: {e}", args[0]))
+        .map_err(|e| format!("Couldn't run git {}: {e}", args.first().copied().unwrap_or("")))
 }
 
 fn git_read(root: &Path, args: &[&str]) -> Result<Vec<u8>, String> {
@@ -199,9 +193,7 @@ fn fields(bytes: &[u8]) -> impl Iterator<Item = &[u8]> + Clone {
 }
 
 fn path_string(path: &[u8]) -> Result<String, String> {
-    // Reject ambiguous paths before the UI can resolve or open the wrong file.
     let path = std::str::from_utf8(path).map_err(|_| "Git returned a filename that isn't UTF-8")?;
-    // Git lists an embedded untracked repository as a single entry with a trailing slash.
     let path = path.strip_suffix('/').unwrap_or(path);
     if path.split('/').any(|part| matches!(part, "" | "." | "..")) {
         return Err("Git returned an invalid relative path".into());
@@ -235,7 +227,6 @@ fn count_lines(path: &Path) -> io::Result<u32> {
     if !metadata.is_file() {
         return Ok(0);
     }
-    // A generated file can grow while the view is open. Read only what was present at open.
     let mut file = file.take(metadata.len());
     let mut buffer = [0; 8192];
     let mut lines = 0_u32;
@@ -247,7 +238,8 @@ fn count_lines(path: &Path) -> io::Result<u32> {
         if bytes.contains(&0) {
             return Ok(0);
         }
-        lines = lines.saturating_add(bytes.iter().filter(|&&byte| byte == b'\n').count() as u32);
+        let newlines = u32::try_from(bytes.iter().filter(|&&byte| byte == b'\n').count()).unwrap_or(u32::MAX);
+        lines = lines.saturating_add(newlines);
         last = tail;
     }
 }

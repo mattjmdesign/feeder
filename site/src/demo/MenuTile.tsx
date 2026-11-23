@@ -2,12 +2,6 @@ import { Stage } from '../stageshow/kit/stage'
 import { useSiteTheme } from './theme'
 import './demos.css'
 
-// The menu bar companion, opened. A still: the marble icon pressed in the
-// menu bar and its menu below it, one project waiting on you, one working,
-// the rest recent. Mirrors crates/feeder-menubar.
-//
-// Real strings: section names, project names and their notes.
-
 function Marbles({ attention }: { attention?: boolean }) {
   return (
     <svg viewBox="0 0 18 18" width="16" height="16" aria-hidden="true">

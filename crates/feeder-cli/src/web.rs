@@ -1,6 +1,3 @@
-//! Lightweight local HTTP companion (`feeder serve`) for reading feeds, briefs,
-//! screenshots/clips, and submitting human replies from a phone or another device over Tailscale.
-
 use std::collections::HashMap;
 use std::fs::File;
 use std::io::{BufRead, BufReader, Read, Write};

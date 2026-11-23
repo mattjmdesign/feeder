@@ -2,7 +2,6 @@ import { Plug } from 'lucide-react'
 
 export type ToolKey = 'claude' | 'codex' | 'cursor' | 'opencode' | 't3code' | 'antigravity' | 'mcp'
 
-// Simple Icons (CC0) 24×24 marks matching crates/feeder-app/src/logos.rs.
 const SVG_PATHS: Partial<Record<ToolKey, { d: string; color?: string }>> = {
   claude: {
     color: '#d97757',
@@ -44,7 +43,6 @@ export function ToolLogo({ tool, size = 16 }: { tool: ToolKey; size?: number }) 
     return <Plug size={size - 1} strokeWidth={2} style={{ flex: 'none', opacity: 0.72 }} aria-hidden="true" />
   }
 
-  // Matches crates/feeder-app/src/agents.rs fallback circular monogram
   const glyph = MONOGRAMS[tool] ?? '?'
   return (
     <span
