@@ -148,9 +148,6 @@ pub fn refresh_search_paths() {
 }
 
 fn probed_shell_paths() -> Vec<PathBuf> {
-    if cfg!(test) {
-        return Vec::new();
-    }
     let generation = SEARCH_PATH_GENERATION.load(Ordering::Relaxed);
     let mut cache = SHELL_PATH_CACHE.lock().unwrap_or_else(PoisonError::into_inner);
     if let Some((cached, paths)) = cache.as_ref()
@@ -189,12 +186,16 @@ fn probe_login_shell_path() -> Vec<PathBuf> {
         .unwrap_or_default()
 }
 
-fn kill_process_group(child: &mut Child) {
-    if let Ok(group) = libc::pid_t::try_from(child.id())
-        && group > 0
-    {
-        unsafe { libc::kill(-group, libc::SIGKILL) };
+fn start_in_new_session(cmd: &mut Command) {
+    unsafe {
+        cmd.pre_exec(|| if libc::setsid() == -1 { Err(std::io::Error::last_os_error()) } else { Ok(()) });
     }
+}
+
+fn kill_session(child: &mut Child) {
+    let group = format!("-{}", child.id());
+    let _ =
+        Command::new("/bin/kill").args(["-KILL", "--", &group]).stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null()).status();
     let _ = child.kill();
     let _ = child.wait();
 }
@@ -208,9 +209,7 @@ fn run_path_probe(shell: &Path, args: &[&str], timeout: Duration) -> Option<Vec<
         .env("TERM", "dumb")
         .env("NO_COLOR", "1")
         .env("ZSH_TMUX_AUTOSTART", "false");
-    unsafe {
-        cmd.pre_exec(|| if libc::setsid() == -1 { Err(std::io::Error::last_os_error()) } else { Ok(()) });
-    }
+    start_in_new_session(&mut cmd);
     let mut child = cmd.spawn().ok()?;
     let stdout = child.stdout.take()?;
     let (tx, rx) = std::sync::mpsc::sync_channel(1);
@@ -237,7 +236,7 @@ fn run_path_probe(shell: &Path, args: &[&str], timeout: Duration) -> Option<Vec<
         })
         .is_err()
     {
-        kill_process_group(&mut child);
+        kill_session(&mut child);
         return None;
     }
 
@@ -247,7 +246,7 @@ fn run_path_probe(shell: &Path, args: &[&str], timeout: Duration) -> Option<Vec<
             Ok(Some(status)) => break Some(status),
             Ok(None) if start.elapsed() < timeout => std::thread::sleep(Duration::from_millis(15)),
             Ok(None) | Err(_) => {
-                kill_process_group(&mut child);
+                kill_session(&mut child);
                 break None;
             }
         }
@@ -258,7 +257,7 @@ fn run_path_probe(shell: &Path, args: &[&str], timeout: Duration) -> Option<Vec<
     let bytes = match rx.recv_timeout(Duration::from_millis(100)) {
         Ok(bytes) => bytes,
         Err(_) => {
-            kill_process_group(&mut child);
+            kill_session(&mut child);
             return None;
         }
     };
@@ -366,9 +365,6 @@ fn fallback_dirs(home: &Path) -> Vec<PathBuf> {
         PathBuf::from("/usr/local/bin"),
         PathBuf::from("/usr/local/sbin"),
     ]);
-    if !cfg!(test) {
-        dirs.extend(etc_paths_dirs());
-    }
     dirs
 }
 
@@ -380,13 +376,16 @@ fn push_unique_dirs(out: &mut Vec<PathBuf>, dirs: impl IntoIterator<Item = PathB
     }
 }
 
+fn env_path_dirs() -> Vec<PathBuf> {
+    std::env::var_os("PATH").map(|p| std::env::split_paths(&p).collect()).unwrap_or_default()
+}
+
 pub(crate) fn search_dirs() -> Vec<PathBuf> {
     let mut dirs = Vec::new();
-    if let Some(env_path) = std::env::var_os("PATH") {
-        push_unique_dirs(&mut dirs, std::env::split_paths(&env_path));
-    }
+    push_unique_dirs(&mut dirs, env_path_dirs());
     push_unique_dirs(&mut dirs, probed_shell_paths());
     push_unique_dirs(&mut dirs, fallback_dirs(&home()));
+    push_unique_dirs(&mut dirs, etc_paths_dirs());
     dirs
 }
 
@@ -404,10 +403,10 @@ pub(crate) fn search_path_env(extra_front: Option<&Path>) -> OsString {
 }
 
 pub(crate) fn which(cmd: &str) -> Option<PathBuf> {
-    let env_dirs: Vec<PathBuf> = std::env::var_os("PATH").map(|p| std::env::split_paths(&p).collect()).unwrap_or_default();
-    find_executable(cmd, env_dirs)
+    find_executable(cmd, env_path_dirs())
         .or_else(|| find_executable(cmd, probed_shell_paths()))
         .or_else(|| find_executable(cmd, fallback_dirs(&home())))
+        .or_else(|| find_executable(cmd, etc_paths_dirs()))
 }
 
 fn find_executable(cmd: &str, dirs: impl IntoIterator<Item = PathBuf>) -> Option<PathBuf> {
@@ -498,9 +497,7 @@ fn dir_in_paths(paths: &[PathBuf], target: &Path) -> bool {
 
 pub fn install_cli_link(bin: &Path) -> std::io::Result<(PathBuf, bool)> {
     let mut path_dirs: Vec<PathBuf> = Vec::new();
-    if let Some(env_path) = std::env::var_os("PATH") {
-        push_unique_dirs(&mut path_dirs, std::env::split_paths(&env_path));
-    }
+    push_unique_dirs(&mut path_dirs, env_path_dirs());
     push_unique_dirs(&mut path_dirs, probed_shell_paths());
     push_unique_dirs(&mut path_dirs, etc_paths_dirs());
     let preferred =
@@ -1098,6 +1095,34 @@ mod tests {
         let found = versioned_node_bins(&base);
         std::fs::remove_dir_all(&base).ok();
         assert_eq!(found, vec![node.join("v22.2.1/bin"), node.join("v20.11.0/bin"), node.join("v18.19.0/bin")]);
+    }
+
+    #[test]
+    fn path_probe_reads_the_printed_path() {
+        let script = format!("printf '{PATH_PROBE_START}/probe/a:/probe/b{PATH_PROBE_END}'");
+        let dirs = run_path_probe(Path::new("/bin/sh"), &["-c", &script], Duration::from_secs(5));
+        assert_eq!(dirs, Some(vec![PathBuf::from("/probe/a"), PathBuf::from("/probe/b")]));
+    }
+
+    #[test]
+    fn path_probe_timeout_kills_the_shell_and_its_children() {
+        let dir = std::env::temp_dir().join(format!("feeder-probe-{}-{:08x}", std::process::id(), fastrand::u32(..)));
+        std::fs::create_dir_all(&dir).unwrap();
+        let pid_file = dir.join("child.pid");
+        let script = format!("sleep 30 & echo $! > '{}'; wait", pid_file.display());
+        let started = Instant::now();
+        let dirs = run_path_probe(Path::new("/bin/sh"), &["-c", &script], Duration::from_millis(300));
+        assert_eq!(dirs, None);
+        assert!(started.elapsed() < Duration::from_secs(5));
+        let pid = std::fs::read_to_string(&pid_file).unwrap().trim().to_string();
+        let child_alive = || Command::new("/bin/kill").args(["-0", &pid]).stderr(Stdio::null()).status().is_ok_and(|s| s.success());
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while child_alive() && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        let survived = child_alive();
+        std::fs::remove_dir_all(&dir).ok();
+        assert!(!survived, "the probe's background child {pid} outlived the timeout");
     }
 
     #[test]

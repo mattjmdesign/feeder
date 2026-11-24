@@ -52,6 +52,8 @@ pnpm --dir site dev
 
 - **Never write comments in code.** No `//`, `///`, `//!`, `/* ... */`, `#` comments in scripts or config, or `<!-- ... -->` in templates. Write clear names and small functions instead, put CLI help strings in `clap` `#[command(about = ...)]` / `#[arg(help = ...)]` attributes, and put project docs in Markdown files (`AGENTS.md`, `README.md`).
 - `scripts/no-comments.sh` enforces this across all owned code files (only `#!` shebangs, vendored `site/src/stageshow/`, and generated `assets/ThirdPartyLicenses.html` / `site/public/licenses.html` are exempt).
+- **Unsafe code can't carry a `// SAFETY:` comment**, so avoid it when a safe call exists (`/bin/kill` instead of `libc::kill`, for example). When it can't be avoided, put it in a small function named for its one job and record why it's sound here:
+  - `setup::start_in_new_session` calls `setsid` in `pre_exec`. Between fork and exec only async-signal-safe calls are allowed; `setsid` is one, and the closure doesn't allocate. The shell-PATH probe needs its own session: an interactive login shell started from a terminal otherwise grabs that terminal and stalls until the probe times out. Std's safe `CommandExt::setsid` is still unstable.
 
 ### Privacy
 
