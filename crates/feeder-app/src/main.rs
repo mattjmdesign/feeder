@@ -82,6 +82,58 @@ pub enum HomeFilter {
     Working,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum OnboardingStep {
+    #[default]
+    Connect,
+    FirstUpdate,
+    Curator,
+}
+
+impl OnboardingStep {
+    pub const ALL: [OnboardingStep; 3] = [OnboardingStep::Connect, OnboardingStep::FirstUpdate, OnboardingStep::Curator];
+
+    pub fn index(self) -> usize {
+        match self {
+            OnboardingStep::Connect => 0,
+            OnboardingStep::FirstUpdate => 1,
+            OnboardingStep::Curator => 2,
+        }
+    }
+
+    pub fn key(self) -> &'static str {
+        match self {
+            OnboardingStep::Connect => "connect",
+            OnboardingStep::FirstUpdate => "first-update",
+            OnboardingStep::Curator => "curator",
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            OnboardingStep::Connect => "Connect tools",
+            OnboardingStep::FirstUpdate => "First update",
+            OnboardingStep::Curator => "Curator",
+        }
+    }
+
+    pub fn next(self) -> Option<OnboardingStep> {
+        match self {
+            OnboardingStep::Connect => Some(OnboardingStep::FirstUpdate),
+            OnboardingStep::FirstUpdate => Some(OnboardingStep::Curator),
+            OnboardingStep::Curator => None,
+        }
+    }
+
+    pub fn prev(self) -> Option<OnboardingStep> {
+        match self {
+            OnboardingStep::Connect => None,
+            OnboardingStep::FirstUpdate => Some(OnboardingStep::Connect),
+            OnboardingStep::Curator => Some(OnboardingStep::FirstUpdate),
+        }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub enum ToastKind {
     Info,
@@ -133,6 +185,7 @@ pub struct State {
     pub limit: usize,
     pub hovered: Option<i64>,
     pub home_filter: HomeFilter,
+    pub onboarding_step: OnboardingStep,
     pub home_selected: Option<i64>,
     pub feed_selected: Option<i64>,
     pub timeline_selected: Option<i64>,
@@ -220,6 +273,7 @@ impl State {
             limit: PAGE,
             hovered: None,
             home_filter: HomeFilter::All,
+            onboarding_step: OnboardingStep::Connect,
             home_selected: None,
             feed_selected: None,
             timeline_selected: None,
@@ -811,6 +865,14 @@ impl State {
         }
     }
 
+    pub fn set_onboarding_skipped(&mut self, skipped: bool) {
+        self.settings.onboarding_skipped = skipped;
+        if !skipped {
+            self.onboarding_step = OnboardingStep::Connect;
+        }
+        self.save_settings();
+    }
+
     pub fn push_toast(&mut self, key: impl Into<String>, item: ToastItem, secs: Option<f64>) {
         self.toasts.step(ToastEvent::Shown { key: key.into(), options: item, secs, now: self.clock });
     }
@@ -1119,7 +1181,7 @@ fn view(s: &State, cx: &mut Cx<State>) -> El {
     layer.extend(chrome::lightbox(s, inset, &p, &k, reduced_motion));
     layer.extend(chrome::delete_confirm(s, &p, &k));
     chrome::settings(s, &p, &k, &mut layer);
-    layer.extend(chrome::toasts(s, &k));
+    layer.extend(chrome::toasts(s, &p, &k));
     let base = el()
         .key("root")
         .w_full()
@@ -1161,8 +1223,15 @@ fn poll(s: &mut State, clock: f64, tx: &mut Tx) -> bool {
     }
     s.sync_search();
     changed |= s.notebook.chat.drain();
+    let onboarding_curator = s.loaded
+        && s.projects.is_empty()
+        && !s.settings.onboarding_skipped
+        && s.open.is_none()
+        && s.tab == Tab::Home
+        && s.onboarding_step == OnboardingStep::Curator;
     s.curator_sign_in.follow_accounts(
-        s.settings_open && s.settings_page == chrome::SettingsPage::Curator && s.notebook.preview_backends.is_none(),
+        ((s.settings_open && s.settings_page == chrome::SettingsPage::Curator) || onboarding_curator)
+            && s.notebook.preview_backends.is_none(),
         s.wake.as_ref(),
     );
     changed |= s.curator_sign_in.poll();
@@ -1532,6 +1601,36 @@ fn main() {
         min_size: Some((640.0, 480.0)),
         scenes: &[
             ("app-icon", |s| s.icon = true),
+            ("onboarding-connect", |s| {
+                s.settings.onboarding_skipped = false;
+                s.onboarding_step = OnboardingStep::Connect;
+            }),
+            ("onboarding-first-update", |s| {
+                s.settings.onboarding_skipped = false;
+                s.onboarding_step = OnboardingStep::FirstUpdate;
+            }),
+            ("onboarding-curator", |s| {
+                s.settings.onboarding_skipped = false;
+                s.onboarding_step = OnboardingStep::Curator;
+            }),
+            ("onboarding-skipped", |s| s.settings.onboarding_skipped = true),
+            ("toast-update", |s| {
+                s.settings.onboarding_skipped = true;
+                s.push_toast(
+                    "app-update",
+                    ToastItem {
+                        title: "Feeder is up to date".into(),
+                        description: Some("Feeder 0.5.12 is the newest version available.".into()),
+                        kind: ToastKind::Info,
+                    },
+                    None,
+                );
+            }),
+            #[cfg(feeder_sparkle)]
+            ("update-popover", |s| {
+                s.settings.onboarding_skipped = true;
+                s.updates.demo_available();
+            }),
             ("feed", |s| s.tab = Tab::Feed),
             ("notebook", |s| s.tab = Tab::Notebook),
             ("notebook-page", |s| {
@@ -2163,5 +2262,28 @@ mod tests {
         assert!(s.update_is_flagged_or_reviewed(10));
         s.review_statuses.insert(10, FeedReviewStatus::Reviewed { note_id: Some(7) });
         assert!(s.update_is_flagged_or_reviewed(10));
+    }
+
+    #[test]
+    fn onboarding_steps_advance_retreat_and_reset_on_reopen() {
+        assert_eq!(OnboardingStep::Connect.index(), 0);
+        assert_eq!(OnboardingStep::Connect.prev(), None);
+        assert_eq!(OnboardingStep::Connect.next(), Some(OnboardingStep::FirstUpdate));
+        assert_eq!(OnboardingStep::FirstUpdate.index(), 1);
+        assert_eq!(OnboardingStep::FirstUpdate.prev(), Some(OnboardingStep::Connect));
+        assert_eq!(OnboardingStep::FirstUpdate.next(), Some(OnboardingStep::Curator));
+        assert_eq!(OnboardingStep::Curator.index(), 2);
+        assert_eq!(OnboardingStep::Curator.prev(), Some(OnboardingStep::FirstUpdate));
+        assert_eq!(OnboardingStep::Curator.next(), None);
+
+        let mut s = State::new();
+        s.onboarding_step = OnboardingStep::Curator;
+        s.set_onboarding_skipped(true);
+        assert!(s.settings.onboarding_skipped);
+        assert_eq!(s.onboarding_step, OnboardingStep::Curator);
+
+        s.set_onboarding_skipped(false);
+        assert!(!s.settings.onboarding_skipped);
+        assert_eq!(s.onboarding_step, OnboardingStep::Connect);
     }
 }

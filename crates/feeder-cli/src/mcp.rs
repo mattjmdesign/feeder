@@ -1,23 +1,20 @@
 use std::cell::{Ref, RefCell};
-use std::collections::{HashMap, HashSet};
 use std::io::{BufRead, Write};
 use std::path::{Path, PathBuf};
 
-use feeder_core::{
-    FeedUpdate, GUIDE, MAX_CHARS, MAX_MEDIA_PER_UPDATE, MAX_PARAGRAPHS, NOTEBOOK_GUIDE, NewUpdate, PageFilter, Project, Reply, Store,
-    agent_display_name, agent_from_env, ago, detect_git_meta, detect_project, now_ms, parse_attention,
-};
+use feeder_core::{MAX_CHARS, MAX_PARAGRAPHS, Project, Store, agent_display_name, agent_from_env, detect_project};
 use serde_json::{Value, json};
 
-use crate::{project_json, todo_json, update_json};
+use self::protocol::{PROTOCOL_VERSIONS, rpc_error, supports_batching};
 
+mod feed;
 mod gardener;
-mod notebook;
+mod library;
+mod protocol;
+mod resources;
 
-const PROTOCOL_VERSIONS: [&str; 4] = ["2025-11-25", "2025-06-18", "2025-03-26", "2024-11-05"];
-const MAX_INLINE_SCREENSHOTS: usize = 6;
-const MAX_INLINE_SCREENSHOT_BYTES: u64 = 5 * 1024 * 1024;
 const MAX_RPC_LINE_BYTES: usize = 16 * 1024 * 1024;
+const BLOCKED_PROJECT_ROOTS: [&str; 8] = ["/Users", "/Applications", "/System", "/Library", "/tmp", "/private/tmp", "/var", "/private/var"];
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Role {
@@ -25,11 +22,17 @@ pub enum Role {
     Gardener(i64),
 }
 
-struct Server {
+struct OpenedStore {
+    store: Store,
+    dev_ino: Option<(u64, u64)>,
+}
+
+pub struct Server {
     client: Option<String>,
+    protocol_version: String,
     cwd: PathBuf,
     store_dir: Option<PathBuf>,
-    store: RefCell<Option<Store>>,
+    store: RefCell<Option<OpenedStore>>,
     role: Role,
 }
 
@@ -64,7 +67,7 @@ pub fn serve(role: Role) -> Result<(), String> {
             break;
         }
         let reply = if buf.len() > MAX_RPC_LINE_BYTES {
-            Some(error(Value::Null, -32600, "request exceeds maximum size"))
+            Some(rpc_error(Value::Null, -32600, "request exceeds maximum size"))
         } else {
             let line = String::from_utf8_lossy(&buf);
             if line.trim().is_empty() {
@@ -72,11 +75,15 @@ pub fn serve(role: Role) -> Result<(), String> {
             }
             match serde_json::from_str::<Value>(&line) {
                 Ok(Value::Array(batch)) => {
-                    let replies: Vec<Value> = batch.iter().filter_map(|m| server.handle(m)).collect();
-                    (!replies.is_empty()).then_some(Value::Array(replies))
+                    if !supports_batching(&server.protocol_version) {
+                        Some(rpc_error(Value::Null, -32600, "JSON-RPC batching is not supported in this MCP protocol version"))
+                    } else {
+                        let replies: Vec<Value> = batch.iter().filter_map(|m| server.handle(m)).collect();
+                        (!replies.is_empty()).then_some(Value::Array(replies))
+                    }
                 }
                 Ok(msg) => server.handle(&msg),
-                Err(e) => Some(error(Value::Null, -32700, &format!("parse error: {e}"))),
+                Err(e) => Some(rpc_error(Value::Null, -32700, &format!("parse error: {e}"))),
             }
         };
         if let Some(reply) = reply {
@@ -110,29 +117,138 @@ fn read_line_capped<R: BufRead>(reader: &mut R, out: &mut Vec<u8>, max_bytes: us
     }
 }
 
+fn db_dev_ino(db_path: &Path) -> Option<(u64, u64)> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        std::fs::metadata(db_path).ok().map(|m| (m.dev(), m.ino()))
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = db_path;
+        None
+    }
+}
+
+fn has_git_root(dir: &Path) -> bool {
+    let canon = dir.canonicalize().unwrap_or_else(|_| dir.to_path_buf());
+    canon.ancestors().any(|p| p.join(".git").exists())
+}
+
+fn is_blocked_project_root(root: &Path) -> bool {
+    let canon = root.canonicalize().unwrap_or_else(|_| root.to_path_buf());
+    if canon.parent().is_none() {
+        return true;
+    }
+    if dirs::home_dir().and_then(|h| h.canonicalize().ok().or(Some(h))).is_some_and(|h| h == canon) {
+        return true;
+    }
+    BLOCKED_PROJECT_ROOTS.iter().any(|p| Path::new(p) == canon)
+}
+
+fn agent_instructions() -> String {
+    format!(
+        "Feeder is the user's local project update centre and shared engineering Library.\n\n\
+         Feed workflow:\n\
+         - Start or resume with `list_projects` (`filter: \"pending\"`) or `get_feed` (pass `task` keywords for up to 3 relevant Library notes).\n\
+         - Show live activity on longer tasks via `update_project` (`pulse`).\n\
+         - Post meaningful milestones with `post_update` in 1-{MAX_PARAGRAPHS} short Markdown blocks under {MAX_CHARS} chars separated by blank lines (`Done:`/`Shipped:`/`Fixed:` outcome + proof, `Why:`/`Benefit:`, `Next:` or `Decision needed:`/`Blocked:` for Needs you). Pass `media` paths when visual, plus optional `mark_replies_read`, `complete_todos`, `add_todos`, `helped_notes`, and `flag_lesson` in the same call.\n\n\
+         Library workflow:\n\
+         - Call `search_library` before non-trivial debugging or unfamiliar choices, then `read_library` on matching IDs.\n\
+         - On user corrections or non-obvious fixes/pitfalls/patterns, call `flag_knowledge` with a full Markdown draft in `suggestion` for Curator review; never write shared notes directly.\n\
+         - Never include secrets, tokens, or keys anywhere in Feeder."
+    )
+}
+
 impl Server {
     fn new(client: Option<String>, cwd: PathBuf, store_dir: Option<PathBuf>) -> Self {
-        Self { client, cwd, store_dir, store: RefCell::new(None), role: Role::Agent }
+        Self { client, protocol_version: PROTOCOL_VERSIONS[0].to_string(), cwd, store_dir, store: RefCell::new(None), role: Role::Agent }
     }
 
-    fn open_store(&self) -> Result<Ref<'_, Store>, String> {
-        if self.store.borrow().is_none() {
-            let opened = match &self.store_dir {
-                Some(dir) => Store::open(dir),
+    pub(super) fn open_store(&self) -> Result<Ref<'_, Store>, String> {
+        let dir = self.store_dir.as_deref().map(Path::to_path_buf).unwrap_or_else(feeder_core::data_dir);
+        let db_path = dir.join("feeder.db");
+        let current_id = db_dev_ino(&db_path);
+        let needs_reopen = self.store.borrow().as_ref().is_none_or(|opened| opened.dev_ino != current_id);
+        if needs_reopen {
+            *self.store.borrow_mut() = None;
+            let store = match &self.store_dir {
+                Some(path) => Store::open(path),
                 None => Store::open_default(),
             }
             .map_err(|e| e.to_string())?;
-            *self.store.borrow_mut() = Some(opened);
+            let dev_ino = db_dev_ino(&db_path);
+            *self.store.borrow_mut() = Some(OpenedStore { store, dev_ino });
         }
-        Ok(Ref::map(self.store.borrow(), |opt| opt.as_ref().expect("store initialized")))
+        Ok(Ref::map(self.store.borrow(), |opt| &opt.as_ref().expect("store initialized").store))
     }
 
-    fn resolve_agent(&self, args: &Value) -> String {
-        str_arg(args, "agent")
+    pub(super) fn resolve_agent(&self, explicit: Option<&str>) -> String {
+        explicit
             .map(agent_display_name)
             .or_else(agent_from_env)
             .or_else(|| self.client.as_deref().map(agent_display_name))
             .unwrap_or_else(|| "Unknown agent".into())
+    }
+
+    pub(super) fn base(&self, explicit_path: Option<&str>) -> PathBuf {
+        match explicit_path {
+            Some(raw) => {
+                let p = PathBuf::from(raw);
+                if p.is_absolute() { p } else { self.cwd.join(p) }
+            }
+            None => self.cwd.clone(),
+        }
+    }
+
+    pub(super) fn known_projects_hint(&self, store: &Store) -> String {
+        let Ok(list) = store.projects() else {
+            return String::new();
+        };
+        let names: Vec<_> = list.into_iter().filter(|p| !p.project.archived).map(|p| p.project.name).take(10).collect();
+        if names.is_empty() { String::new() } else { format!(" (active projects: {})", names.join(", ")) }
+    }
+
+    pub(super) fn resolve_project(
+        &self,
+        store: &Store,
+        explicit_name: Option<&str>,
+        explicit_path: Option<&str>,
+        create: bool,
+    ) -> Result<Option<Project>, String> {
+        if let Some(name) = explicit_name {
+            return if create { store.project_named(name, None).map(Some) } else { store.find_project(name) }.map_err(|e| e.to_string());
+        }
+        if let Some(raw_path) = explicit_path {
+            let folder = self.base(Some(raw_path));
+            if !folder.is_dir() {
+                return Err(format!("`project_path` does not exist or is not a folder: {}", folder.display()));
+            }
+            let detected = detect_project(&folder);
+            if create && is_blocked_project_root(&detected.path) {
+                return Err(format!(
+                    "refusing to create a project at `{}`; pass an explicit `project` name or project folder{}",
+                    detected.path.display(),
+                    self.known_projects_hint(store)
+                ));
+            }
+            return if create { store.project_at(&detected).map(Some) } else { store.find_detected(&detected) }.map_err(|e| e.to_string());
+        }
+        let detected = detect_project(&self.cwd);
+        if let Some(existing) = store.find_detected(&detected).map_err(|e| e.to_string())? {
+            return Ok(Some(existing));
+        }
+        if !create {
+            return Ok(None);
+        }
+        if !has_git_root(&self.cwd) || is_blocked_project_root(&detected.path) {
+            return Err(format!(
+                "couldn't infer a project from `{}` (not a project git repository); pass `project` or `project_path`{}",
+                self.cwd.display(),
+                self.known_projects_hint(store)
+            ));
+        }
+        store.project_at(&detected).map(Some).map_err(|e| e.to_string())
     }
 
     fn handle(&mut self, msg: &Value) -> Option<Value> {
@@ -140,75 +256,51 @@ impl Server {
         let method = msg.get("method").and_then(Value::as_str).unwrap_or("");
         let params = msg.get("params").cloned().unwrap_or(json!({}));
         let id = id?;
-        let result = match method {
-            "initialize" => self.initialize(&params).map_err(|e| (-32603, e)),
-            "ping" => Ok(json!({})),
-            "tools/list" => match self.role {
-                Role::Agent => Ok(json!({ "tools": all_tools() })),
-                Role::Gardener(run) => {
-                    self.curator_mode(run).map(|mode| json!({ "tools": gardener::tools(mode) })).map_err(|e| (-32603, e))
-                }
+        match method {
+            "initialize" => match self.initialize(&params) {
+                Ok(result) => Some(json!({ "jsonrpc": "2.0", "id": id, "result": result })),
+                Err(msg) => Some(rpc_error(id, -32603, &msg)),
             },
-            "tools/call" => Ok(self.call(&params)),
-            "resources/list" if self.role == Role::Agent => self.resources_list().map_err(|e| (-32603, e)),
-            "resources/templates/list" if self.role == Role::Agent => Ok(json!({
-                "resourceTemplates": [{
-                    "uriTemplate": "feeder://project/{slug}/feed",
-                    "name": "Project feed",
-                    "description": "Latest updates for a Feeder project in Markdown.",
-                    "mimeType": "text/markdown"
-                }, {
-                    "uriTemplate": "feeder://notebook/{id}",
-                    "name": "Library page",
-                    "description": "A single Feeder Library lesson in Markdown.",
-                    "mimeType": "text/markdown"
-                }]
-            })),
-            "resources/read" if self.role == Role::Agent => self.resources_read(&params),
-            "prompts/list" if self.role == Role::Agent => Ok(json!({ "prompts": [{
-                "name": "update",
-                "title": "Post a Feeder update",
-                "description": "Write this project's short Feed update (Done / Why / Next) and post it."
-            }, {
-                "name": "lesson",
-                "title": "Flag a lesson draft for Curator",
-                "description": "Submit a full Markdown lesson draft (mistake, root cause, fix/rule) for Curator to add to the Library."
-            }] })),
-            "prompts/get" if self.role == Role::Agent => match params.get("name").and_then(Value::as_str) {
-                Some("update") => Ok(json!({
-                    "description": "Write this project's short Feed update and post it.",
-                    "messages": [{ "role": "user", "content": { "type": "text", "text": format!(
-                        "{GUIDE}\n\nNow look at what changed in this project during this session (and `git log`/`git status` if useful), decide whether a screenshot or clip helps, then call post_update. If you also solved a non-obvious bug or learned a reusable rule, follow up with flag_knowledge and put a full Markdown lesson draft in suggestion."
-                    ) } }]
-                })),
-                Some("lesson") => Ok(json!({
-                    "description": "Submit a full Markdown lesson draft for Curator to review for the Library.",
-                    "messages": [{ "role": "user", "content": { "type": "text", "text": format!(
-                        "{NOTEBOOK_GUIDE}\n\nLook back over this session for a reusable lesson or user correction. Search the Library first with search_notebook. If you find a gap or correction, call flag_knowledge with a full Markdown lesson draft in suggestion (symptom/mistake, root cause, verified fix or rule). If the Library already covers it accurately, skip the flag."
-                    ) } }]
-                })),
-                _ => Err((-32602, "unknown prompt".to_string())),
-            },
-            _ => Err((-32601, format!("method not found: {method}"))),
-        };
-        Some(match result {
-            Ok(result) => json!({ "jsonrpc": "2.0", "id": id, "result": result }),
-            Err((code, message)) => error(id, code, &message),
-        })
+            "ping" => Some(json!({ "jsonrpc": "2.0", "id": id, "result": {} })),
+            "tools/list" => {
+                let res = match self.role {
+                    Role::Agent => Ok(json!({ "tools": all_tools() })),
+                    Role::Gardener(run) => self.curator_mode(run).map(|(mode, is_chat)| json!({ "tools": gardener::tools(mode, is_chat) })),
+                };
+                Some(match res {
+                    Ok(result) => json!({ "jsonrpc": "2.0", "id": id, "result": result }),
+                    Err(msg) => rpc_error(id, -32603, &msg),
+                })
+            }
+            "tools/call" => Some(match self.handle_tool_call(&params) {
+                Ok(result) => json!({ "jsonrpc": "2.0", "id": id, "result": result }),
+                Err((code, msg)) => rpc_error(id, code, &msg),
+            }),
+            "resources/list" if self.role == Role::Agent => Some(match self.resources_list() {
+                Ok(result) => json!({ "jsonrpc": "2.0", "id": id, "result": result }),
+                Err(msg) => rpc_error(id, -32603, &msg),
+            }),
+            "resources/templates/list" if self.role == Role::Agent => {
+                Some(json!({ "jsonrpc": "2.0", "id": id, "result": self.resource_templates_list() }))
+            }
+            "resources/read" if self.role == Role::Agent => Some(match self.resources_read(&params) {
+                Ok(result) => json!({ "jsonrpc": "2.0", "id": id, "result": result }),
+                Err((code, msg)) => rpc_error(id, code, &msg),
+            }),
+            "prompts/list" if self.role == Role::Agent => Some(json!({ "jsonrpc": "2.0", "id": id, "result": self.prompts_list() })),
+            "prompts/get" if self.role == Role::Agent => Some(self.prompts_get(id, &params)),
+            _ => Some(rpc_error(id, -32601, &format!("method not found: {method}"))),
+        }
     }
 
     fn initialize(&mut self, params: &Value) -> Result<Value, String> {
         self.client = params.pointer("/clientInfo/name").and_then(Value::as_str).map(str::to_string);
         let asked = params.get("protocolVersion").and_then(Value::as_str).unwrap_or(PROTOCOL_VERSIONS[0]);
         let version = if PROTOCOL_VERSIONS.contains(&asked) { asked } else { PROTOCOL_VERSIONS[0] };
+        self.protocol_version = version.to_string();
         let (capabilities, instructions) = match self.role {
-            Role::Agent => (
-                json!({ "tools": {}, "prompts": {}, "resources": {} }),
-                format!(
-                    "Feeder is the user's local project update centre and shared knowledge Library. Use `post_update` for short 3-block Feed handoffs (Done / Why / Next, under {MAX_CHARS} chars) and `get_feed` before picking a project back up. Search the shared Library (`search_notebook`) before non-trivial debugging. Whenever the user corrects you or you uncover a reusable fix, pitfall, or pattern, ALSO call `flag_knowledge` on top of your Feed update and put a full Markdown lesson draft in `suggestion` (symptom, root cause, code snippet, rule). Curator reviews those drafts and proposes clean Library edits for the user to approve.\n\n{GUIDE}\n\n{NOTEBOOK_GUIDE}"
-                ),
-            ),
-            Role::Gardener(run) => (json!({ "tools": {} }), self.curator_mode(run)?.instructions().to_string()),
+            Role::Agent => (json!({ "tools": {}, "prompts": {}, "resources": {} }), agent_instructions()),
+            Role::Gardener(run) => (json!({ "tools": {} }), self.curator_mode(run)?.0.instructions().to_string()),
         };
         Ok(json!({
             "protocolVersion": version,
@@ -218,1080 +310,78 @@ impl Server {
         }))
     }
 
-    fn call(&self, params: &Value) -> Value {
-        let name = params.get("name").and_then(Value::as_str).unwrap_or("");
-        let args = params.get("arguments").cloned().unwrap_or(json!({}));
-        let outcome = match (self.role, name) {
-            (Role::Gardener(run), name) => self.gardener_call(run, name, &args),
-            (Role::Agent, name) => self.agent_call(name, &args),
+    fn handle_tool_call(&self, params: &Value) -> Result<Value, (i64, String)> {
+        let Some(name) = params.get("name").and_then(Value::as_str).map(str::trim).filter(|s| !s.is_empty()) else {
+            return Err((-32602, "`name` string is required".into()));
         };
-        tool_result(outcome)
-    }
-
-    fn agent_call(&self, name: &str, args: &Value) -> Result<ToolOutput, String> {
-        let args = args.clone();
-        match name {
-            "post_update" => self.post_update(&args),
-            "edit_update" => self.edit_update(&args),
-            "delete_update" => self.delete_update(&args),
-            "get_feed" => self.get_feed(&args),
-            "get_recent_activity" => self.get_recent_activity(&args),
-            "search_updates" => self.search_updates(&args),
-            "list_projects" => self.list_projects(&args),
-            "reply_to_update" => self.reply_to_update(&args),
-            "get_pending_decisions" => self.get_pending_decisions(&args),
-            "dismiss_attention" => self.dismiss_attention(&args),
-            "mark_replies_read" => self.mark_replies_read(&args),
-            "set_project_brief" => self.set_project_brief(&args),
-            "pulse" => self.pulse(&args),
-            "list_todos" => self.list_todos(&args),
-            "add_todo" => self.add_todo(&args),
-            "toggle_todo" => self.toggle_todo(&args),
-            "delete_todo" => self.delete_todo(&args),
-            other if notebook::TOOLS.contains(&other) => self.notebook_call(other, &args),
-            _ => Err(format!("unknown tool: {name}")),
+        if params.get("arguments").is_some_and(|v| !v.is_null() && !v.is_object()) {
+            return Err((-32602, "`arguments` must be a JSON object".into()));
+        }
+        let args = params.get("arguments").cloned().unwrap_or(json!({}));
+        match (self.role, name) {
+            (Role::Gardener(run), _) => Ok(tool_result(self.gardener_call(run, name, &args))),
+            (Role::Agent, _) if library::TOOLS.contains(&name) => Ok(tool_result(self.library_call(name, &args))),
+            (Role::Agent, "write_page" | "archive_page" | "dismiss_flag") => Ok(tool_result(Err(
+                "everyday agents cannot edit shared Library notes directly; use `flag_knowledge` with a draft in `suggestion`".into(),
+            ))),
+            (Role::Agent, _) if is_agent_feed_tool(name) => Ok(tool_result(self.feed_call(name, &args))),
+            (Role::Agent, _) => Err((-32602, format!("unknown tool: {name}; call tools/list to see available tools"))),
         }
     }
+
+    #[cfg(test)]
+    fn call(&self, params: &Value) -> Value {
+        match self.handle_tool_call(params) {
+            Ok(result) => result,
+            Err((_, message)) => tool_result(Err(message)),
+        }
+    }
+}
+
+fn is_agent_feed_tool(name: &str) -> bool {
+    matches!(
+        name,
+        "list_projects"
+            | "get_feed"
+            | "search_updates"
+            | "post_update"
+            | "reply_to_update"
+            | "edit_update"
+            | "update_project"
+            | "delete_item"
+            | "get_recent_activity"
+            | "get_pending_decisions"
+            | "dismiss_attention"
+            | "mark_replies_read"
+            | "set_project_brief"
+            | "pulse"
+            | "list_todos"
+            | "add_todo"
+            | "toggle_todo"
+            | "delete_todo"
+            | "delete_update"
+    )
 }
 
 fn tool_result(outcome: Result<ToolOutput, String>) -> Value {
-    {
-        match outcome {
-            Ok(out) => {
-                let mut content = vec![json!({ "type": "text", "text": out.text })];
-                for img in out.images {
-                    content.push(json!({ "type": "image", "data": img.data_base64, "mimeType": img.mime_type }));
-                }
-                json!({ "content": content, "structuredContent": out.data, "isError": false })
+    match outcome {
+        Ok(out) => {
+            let mut content = vec![json!({ "type": "text", "text": out.text })];
+            for img in out.images {
+                content.push(json!({ "type": "image", "data": img.data_base64, "mimeType": img.mime_type }));
             }
-            Err(message) => json!({ "content": [{ "type": "text", "text": message }], "isError": true }),
+            json!({ "content": content, "structuredContent": out.data, "isError": false })
         }
+        Err(message) => json!({ "content": [{ "type": "text", "text": message }], "isError": true }),
     }
-}
-
-impl Server {
-    fn resources_list(&self) -> Result<Value, String> {
-        let store = self.open_store()?;
-        let projects = store.projects().map_err(|e| e.to_string())?;
-        let mut resources = vec![
-            json!({
-                "uri": "feeder://projects",
-                "name": "Projects",
-                "description": "All Feeder projects with update counts, attention status, active pulses, and last activity (JSON).",
-                "mimeType": "application/json"
-            }),
-            json!({
-                "uri": "feeder://notebook",
-                "name": "Notebook",
-                "description": "Shared index of current Feeder notebook lessons across all projects (Markdown).",
-                "mimeType": "text/markdown"
-            }),
-        ];
-        for sum in projects {
-            if sum.project.archived {
-                continue;
-            }
-            resources.push(json!({
-                "uri": format!("feeder://project/{}/feed", sum.project.slug),
-                "name": format!("{} feed", sum.project.name),
-                "description": format!("Latest updates for {}", sum.project.name),
-                "mimeType": "text/markdown"
-            }));
-        }
-        Ok(json!({ "resources": resources }))
-    }
-
-    fn resources_read(&self, params: &Value) -> Result<Value, (i64, String)> {
-        let uri = params
-            .get("uri")
-            .and_then(Value::as_str)
-            .map(str::trim)
-            .filter(|s| !s.is_empty())
-            .ok_or((-32602, "`uri` is required".to_string()))?;
-        let store = self.open_store().map_err(|e| (-32603, e))?;
-        if uri == "feeder://projects" {
-            let now = now_ms();
-            let list: Vec<Value> = store
-                .projects()
-                .map_err(|e| (-32603, e.to_string()))?
-                .into_iter()
-                .map(|p| {
-                    let mut v = project_json(&p.project);
-                    v["updates"] = json!(p.updates);
-                    v["last_at"] = json!(p.last_at);
-                    v["last_ago"] = json!(p.last_at.map(|at| ago(at, now)));
-                    v["last_agent"] = json!(p.last_agent);
-                    v["needs_you"] = json!(p.needs_you);
-                    v["unread_replies"] = json!(p.unread_replies);
-                    v["open_todos"] = json!(p.open_todos);
-                    v["active_pulse"] = p
-                        .active_pulse
-                        .as_ref()
-                        .map(|pulse| json!({ "agent": pulse.agent, "branch": pulse.branch, "status": pulse.status }))
-                        .unwrap_or(Value::Null);
-                    v
-                })
-                .collect();
-            let text = serde_json::to_string_pretty(&list).map_err(|e| (-32603, e.to_string()))?;
-            return Ok(json!({ "contents": [{ "uri": uri, "mimeType": "application/json", "text": text }] }));
-        }
-        if uri == "feeder://notebook" {
-            let pages = store.pages(&PageFilter::default()).map_err(|e| (-32603, e.to_string()))?;
-            let mut md = String::from("# Feeder Notebook\n");
-            if pages.is_empty() {
-                md.push_str("\nNo notebook pages yet.\n");
-            } else {
-                for p in &pages {
-                    md.push_str(&format!("\n- {}\n", p.summary_line()));
-                }
-            }
-            return Ok(json!({ "contents": [{ "uri": uri, "mimeType": "text/markdown", "text": md }] }));
-        }
-        if let Some(id_str) = uri.strip_prefix("feeder://notebook/") {
-            let id = id_str.parse::<i64>().map_err(|_| (-32002, format!("resource not found: {uri}")))?;
-            let page = store.page(id).map_err(|e| (-32603, e.to_string()))?.ok_or((-32002, format!("notebook page not found: {id}")))?;
-            let md = page.to_markdown(crate::notebook::project_name(&store, &page).as_deref(), now_ms());
-            return Ok(json!({ "contents": [{ "uri": uri, "mimeType": "text/markdown", "text": md }] }));
-        }
-        if let Some(rest) = uri.strip_prefix("feeder://project/")
-            && let Some(slug) = rest.strip_suffix("/feed")
-            && !slug.is_empty()
-        {
-            let project =
-                store.find_project(slug).map_err(|e| (-32603, e.to_string()))?.ok_or((-32002, format!("project not found: {slug}")))?;
-            let feed = store.feed(project.id, 20, None).map_err(|e| (-32603, e.to_string()))?;
-            let ids: Vec<i64> = feed.iter().map(|u| u.id).collect();
-            let replies = store.replies_for_updates(&ids).map_err(|e| (-32603, e.to_string()))?;
-            let todos = store.todos(project.id).map_err(|e| (-32603, e.to_string()))?;
-            let now = now_ms();
-            let mut md = format!("# {}\n", project.name);
-            if let Some(brief) = &project.brief {
-                md.push_str(&format!("\n> **Brief:** {}\n", brief.replace('\n', "\n> ")));
-            }
-            if !todos.is_empty() {
-                md.push_str("\n## To-dos\n\n");
-                for t in &todos {
-                    let mark = if t.done { "x" } else { " " };
-                    md.push_str(&format!("- [{mark}] {} (#{})\n", t.title, t.id));
-                }
-            }
-            if feed.is_empty() {
-                md.push_str("\nNo updates yet.\n");
-            } else {
-                for u in feed {
-                    let branch = u.branch.as_deref().map(|b| format!(" · `{b}`")).unwrap_or_default();
-                    let diff = u.diff_stat.as_deref().map(|d| format!(" · `{d}`")).unwrap_or_default();
-                    md.push_str(&format!("\n## {} · {}{branch}{diff} (#{})\n\n{}\n", u.agent, ago(u.created_at, now), u.id, u.body));
-                    if !u.media.is_empty() {
-                        for m in &u.media {
-                            md.push_str(&format!("\n[media: {}]\n", m.path.display()));
-                        }
-                    } else if let Some(shot) = &u.screenshot {
-                        md.push_str(&format!("\n[media: {}]\n", shot.display()));
-                    }
-                    for r in replies.iter().filter(|r| r.update_id == u.id) {
-                        md.push_str(&format!("\n- **{}** ({}): {}\n", r.author, ago(r.created_at, now), r.body));
-                    }
-                }
-            }
-            return Ok(json!({ "contents": [{ "uri": uri, "mimeType": "text/markdown", "text": md }] }));
-        }
-        Err((-32002, format!("resource not found: {uri}")))
-    }
-
-    fn post_update(&self, args: &Value) -> Result<ToolOutput, String> {
-        let summary = str_arg(args, "summary").ok_or("`summary` is required")?;
-        let store = self.open_store()?;
-        let project = self.project(&store, args, true)?.ok_or("no project")?;
-        let agent = self.resolve_agent(args);
-        let base = self.base(args);
-        let resolve_path = |raw: &str| {
-            let p = PathBuf::from(raw);
-            if p.is_absolute() { p } else { base.join(p) }
-        };
-        let screenshot = str_arg(args, "screenshot_path").map(resolve_path);
-        let mut seen = HashSet::new();
-        if let Some(ref first) = screenshot {
-            seen.insert(first.clone());
-        }
-        let screenshots: Vec<PathBuf> = args
-            .get("screenshots")
-            .and_then(Value::as_array)
-            .map(|items| {
-                items
-                    .iter()
-                    .filter_map(Value::as_str)
-                    .map(str::trim)
-                    .filter(|s| !s.is_empty())
-                    .map(resolve_path)
-                    .filter(|path| seen.insert(path.clone()))
-                    .collect()
-            })
-            .unwrap_or_default();
-        let git_dir = if str_arg(args, "project_path").is_some() || str_arg(args, "project").is_none() {
-            Some(base)
-        } else {
-            project.path.as_deref().map(PathBuf::from).filter(|p| p.exists())
-        };
-        let meta = git_dir.as_deref().map(detect_git_meta).unwrap_or_default();
-        let branch = str_arg(args, "branch").map(str::to_string).or(meta.branch);
-        let diff_stat = str_arg(args, "diff_stat").map(str::to_string).or(meta.diff_stat);
-        let commit_sha = meta.commit_sha;
-        let posted = store
-            .post(project.id, NewUpdate { agent, body: summary.to_string(), screenshot, screenshots, branch, diff_stat, commit_sha })
-            .map_err(|e| e.to_string())?;
-        let unread = store.unread_human_replies(Some(project.id)).map_err(|e| e.to_string())?;
-        let media_note = match posted.media.len() {
-            0 => String::new(),
-            1 => " (1 attachment)".to_string(),
-            n => format!(" ({n} attachments)"),
-        };
-        let mut text = format!("Posted update #{} to {}'s feed as {}{media_note}.", posted.id, project.name, posted.agent);
-        if !unread.is_empty() {
-            let now = now_ms();
-            text.push_str(&format!(
-                "\n\nNote: {} has {} unread human repl{}:",
-                project.name,
-                unread.len(),
-                if unread.len() == 1 { "y" } else { "ies" }
-            ));
-            for r in &unread {
-                text.push_str(&format!("\n- reply #{} on update #{} ({}): {}", r.id, r.update_id, ago(r.created_at, now), r.body));
-            }
-        }
-        let unread_json: Vec<_> = unread.iter().map(reply_json).collect();
-        Ok(ToolOutput::text(
-            text,
-            json!({ "project": project_json(&project), "update": update_json(&posted), "unread_replies": unread_json }),
-        ))
-    }
-
-    fn edit_update(&self, args: &Value) -> Result<ToolOutput, String> {
-        let id = args.get("id").and_then(Value::as_i64).ok_or("`id` is required")?;
-        let summary = str_arg(args, "summary").ok_or("`summary` is required")?;
-        let store = self.open_store()?;
-        let updated = store.edit_update(id, summary).map_err(|e| e.to_string())?;
-        let text = format!("Updated #{id}.");
-        Ok(ToolOutput::text(text, json!({ "update": update_json(&updated) })))
-    }
-
-    fn delete_update(&self, args: &Value) -> Result<ToolOutput, String> {
-        let id = args.get("id").and_then(Value::as_i64).ok_or("`id` is required")?;
-        let store = self.open_store()?;
-        store.delete_update(id).map_err(|e| e.to_string())?;
-        let text = format!("Deleted update #{id}.");
-        Ok(ToolOutput::text(text, json!({ "deleted": id })))
-    }
-
-    fn get_feed(&self, args: &Value) -> Result<ToolOutput, String> {
-        let limit = args.get("limit").and_then(Value::as_u64).unwrap_or(5).clamp(1, 50) as usize;
-        let include_shots = args.get("include_screenshots").and_then(Value::as_bool).unwrap_or(false);
-        let mark_read = args.get("mark_replies_read").and_then(Value::as_bool).unwrap_or(false);
-        let task = str_arg(args, "task");
-        let store = self.open_store()?;
-        let Some(project) = self.project(&store, args, false)? else {
-            let name = detect_project(&self.base(args)).name;
-            let mut data = json!({ "project": null, "todos": [], "updates": [], "unread_replies": [] });
-            if task.is_some() {
-                data["related_notes"] = json!([]);
-            }
-            return Ok(ToolOutput::text(format!("{name} has no updates yet."), data));
-        };
-        let feed = store.feed(project.id, limit, None).map_err(|e| e.to_string())?;
-        let ids: Vec<i64> = feed.iter().map(|u| u.id).collect();
-        let replies = store.replies_for_updates(&ids).map_err(|e| e.to_string())?;
-        let todos = store.todos(project.id).map_err(|e| e.to_string())?;
-        let unread = store.unread_human_replies(Some(project.id)).map_err(|e| e.to_string())?;
-        if mark_read && !unread.is_empty() {
-            let rids: Vec<i64> = unread.iter().map(|r| r.id).collect();
-            store.mark_replies_read(&rids).map_err(|e| e.to_string())?;
-        }
-        let now = now_ms();
-        let needs_you = feed.first().is_some_and(|u| {
-            u.attention_dismissed_at.is_none()
-                && parse_attention(&u.body).is_some()
-                && !replies.iter().any(|r| r.update_id == u.id && r.from_human)
-        });
-        let mut text = if feed.is_empty() {
-            format!("{} has no updates yet.", project.name)
-        } else {
-            format!("Latest {} update(s) for {}, newest first:", feed.len(), project.name)
-        };
-        if needs_you && let Some(latest) = feed.first() {
-            text.push_str(&format!("\n\nStatus: Needs you (open attention on update #{}).", latest.id));
-        }
-        if let Some(brief) = &project.brief {
-            text.push_str(&format!("\n\nPinned brief:\n{brief}"));
-        }
-        let mut related_notes = Vec::new();
-        if let Some(task) = task.filter(|task| task.trim().chars().take(160).any(char::is_alphanumeric)) {
-            let query: String = task.trim().chars().take(160).collect();
-            let notes = store.search_project_notes(project.id, &query, &PageFilter::default(), 3).map_err(|e| e.to_string())?;
-            if !notes.is_empty() {
-                text.push_str("\n\nNotebook notes for this task (open with read_page):");
-            }
-            for page in notes {
-                let url = format!("feeder://notebook/{}", page.id);
-                let scope = if page.project_id.is_some() { "project" } else { "shared" };
-                let excerpt = page.excerpt(160);
-                text.push_str(&format!("\n- #{} {} ({scope}) — {excerpt}", page.id, page.title));
-                related_notes.push(json!({ "id": page.id, "title": page.title, "excerpt": excerpt, "url": url, "scope": scope }));
-            }
-        }
-        if !todos.is_empty() {
-            let open_count = todos.iter().filter(|t| !t.done).count();
-            text.push_str(&format!("\n\nTo-dos ({open_count} open / {} total):", todos.len()));
-            for t in &todos {
-                let mark = if t.done { "x" } else { " " };
-                text.push_str(&format!("\n- [{mark}] {} (#{})", t.title, t.id));
-            }
-        }
-        if !unread.is_empty() {
-            text.push_str(&format!("\n\nUnread human replies ({}):", unread.len()));
-            for r in &unread {
-                text.push_str(&format!("\n- reply #{} on update #{} ({}): {}", r.id, r.update_id, ago(r.created_at, now), r.body));
-            }
-        }
-        for u in &feed {
-            text.push_str(&format!("\n\n{}", format_update_line(None, u, &replies, now)));
-        }
-        let images = if include_shots { collect_screenshots(&feed) } else { Vec::new() };
-        let updates: Vec<_> = feed
-            .iter()
-            .map(|u| {
-                let mut v = update_json(u);
-                v["replies"] = json!(replies.iter().filter(|r| r.update_id == u.id).map(reply_json).collect::<Vec<_>>());
-                v
-            })
-            .collect();
-        let todos_json: Vec<_> = todos.iter().map(todo_json).collect();
-        let unread_json: Vec<_> = unread.iter().map(reply_json).collect();
-        let mut data = json!({
-            "project": project_json(&project),
-            "needs_you": needs_you,
-            "todos": todos_json,
-            "updates": updates,
-            "unread_replies": unread_json,
-        });
-        if task.is_some() {
-            data["related_notes"] = json!(related_notes);
-        }
-        Ok(ToolOutput { text, data, images })
-    }
-
-    fn get_recent_activity(&self, args: &Value) -> Result<ToolOutput, String> {
-        let limit = args.get("limit").and_then(Value::as_u64).unwrap_or(10).clamp(1, 50) as usize;
-        let include_shots = args.get("include_screenshots").and_then(Value::as_bool).unwrap_or(false);
-        let store = self.open_store()?;
-        let timeline = store.timeline(limit).map_err(|e| e.to_string())?;
-        let ids: Vec<i64> = timeline.iter().map(|u| u.id).collect();
-        let replies = store.replies_for_updates(&ids).map_err(|e| e.to_string())?;
-        let projects = store.project_names().map_err(|e| e.to_string())?;
-        let now = now_ms();
-        let mut text = if timeline.is_empty() {
-            "No recent updates across active projects.".to_string()
-        } else {
-            format!("Latest {} update(s) across active projects:", timeline.len())
-        };
-        let mut list = Vec::new();
-        for u in &timeline {
-            let pname = projects.get(&u.project_id).map(String::as_str).unwrap_or("Unknown");
-            text.push_str(&format!("\n\n{}", format_update_line(Some(pname), u, &replies, now)));
-            let mut v = update_json(u);
-            v["project"] = json!(pname);
-            v["replies"] = json!(replies.iter().filter(|r| r.update_id == u.id).map(reply_json).collect::<Vec<_>>());
-            list.push(v);
-        }
-        let images = if include_shots { collect_screenshots(&timeline) } else { Vec::new() };
-        Ok(ToolOutput { text, data: json!({ "updates": list }), images })
-    }
-
-    fn search_updates(&self, args: &Value) -> Result<ToolOutput, String> {
-        let query = str_arg(args, "query").ok_or("`query` is required")?;
-        let include_archived = args.get("include_archived").and_then(Value::as_bool).unwrap_or(false);
-        let limit = args.get("limit").and_then(Value::as_u64).unwrap_or(10).clamp(1, 50) as usize;
-        let store = self.open_store()?;
-        let pid = match str_arg(args, "project") {
-            Some(name) => Some(store.find_project(name).map_err(|e| e.to_string())?.ok_or_else(|| format!("no project called {name}"))?.id),
-            None => None,
-        };
-        let hits = store.search_updates(query, pid, include_archived || pid.is_some(), limit).map_err(|e| e.to_string())?;
-        let ids: Vec<i64> = hits.iter().map(|u| u.id).collect();
-        let replies = store.replies_for_updates(&ids).map_err(|e| e.to_string())?;
-        let projects = store.project_names().map_err(|e| e.to_string())?;
-        let now = now_ms();
-        let mut text = if hits.is_empty() {
-            format!("No updates matching \"{query}\".")
-        } else {
-            format!("{} match(es) for \"{query}\":", hits.len())
-        };
-        let mut list = Vec::new();
-        for u in &hits {
-            let pname = projects.get(&u.project_id).map(String::as_str).unwrap_or("Unknown");
-            text.push_str(&format!("\n\n{}", format_update_line(Some(pname), u, &replies, now)));
-            let mut v = update_json(u);
-            v["project"] = json!(pname);
-            v["replies"] = json!(replies.iter().filter(|r| r.update_id == u.id).map(reply_json).collect::<Vec<_>>());
-            list.push(v);
-        }
-        Ok(ToolOutput::text(text, json!({ "updates": list })))
-    }
-
-    fn list_projects(&self, args: &Value) -> Result<ToolOutput, String> {
-        let include_archived = args.get("include_archived").and_then(Value::as_bool).unwrap_or(false);
-        let store = self.open_store()?;
-        let projects: Vec<_> =
-            store.projects().map_err(|e| e.to_string())?.into_iter().filter(|p| include_archived || !p.project.archived).collect();
-        let now = now_ms();
-        let mut text = if projects.is_empty() { "No projects yet.".to_string() } else { String::new() };
-        let mut list = Vec::new();
-        for p in &projects {
-            let last = match (p.last_at, &p.last_agent) {
-                (Some(at), Some(agent)) => format!("last update {} by {agent}", ago(at, now)),
-                _ => "no updates".into(),
-            };
-            if !text.is_empty() {
-                text.push('\n');
-            }
-            let pin = if p.project.pinned { " [pinned]" } else { "" };
-            let needs = if p.needs_you { " [needs you]" } else { "" };
-            let pulse = p.active_pulse.as_ref().map(|pu| format!(" [working: {}]", pu.status)).unwrap_or_default();
-            let todos = if p.open_todos > 0 { format!(", {} open to-do(s)", p.open_todos) } else { String::new() };
-            let tag = if p.project.archived { " [archived]" } else { "" };
-            text.push_str(&format!("{}{pin}{needs}{pulse}{tag} — {} update(s){todos}, {last}", p.project.name, p.updates));
-            let mut v = project_json(&p.project);
-            v["updates"] = json!(p.updates);
-            v["last_at"] = json!(p.last_at);
-            v["last_agent"] = json!(p.last_agent);
-            v["needs_you"] = json!(p.needs_you);
-            v["unread_replies"] = json!(p.unread_replies);
-            v["open_todos"] = json!(p.open_todos);
-            v["active_pulse"] = p
-                .active_pulse
-                .as_ref()
-                .map(|pu| {
-                    json!({ "agent": pu.agent, "branch": pu.branch, "status": pu.status, "updated_at": pu.updated_at, "expires_at": pu.expires_at })
-                })
-                .unwrap_or(Value::Null);
-            list.push(v);
-        }
-        Ok(ToolOutput::text(text, json!({ "projects": list })))
-    }
-
-    fn reply_to_update(&self, args: &Value) -> Result<ToolOutput, String> {
-        let id = args.get("id").and_then(Value::as_i64).ok_or("`id` is required")?;
-        let summary = str_arg(args, "summary").ok_or("`summary` is required")?;
-        let agent = self.resolve_agent(args);
-        let store = self.open_store()?;
-        let reply = store.add_reply(id, &agent, false, summary).map_err(|e| e.to_string())?;
-        let text = format!("Replied (#{}) to update #{id} as {}.", reply.id, reply.author);
-        Ok(ToolOutput::text(text, json!({ "reply": reply_json(&reply) })))
-    }
-
-    fn get_pending_decisions(&self, args: &Value) -> Result<ToolOutput, String> {
-        let mark_read = args.get("mark_read").and_then(Value::as_bool).unwrap_or(false);
-        let store = self.open_store()?;
-        let scope_project =
-            if args.get("project").is_some() || args.get("project_path").is_some() { self.project(&store, args, false)? } else { None };
-        let pid = scope_project.as_ref().map(|p| p.id);
-        let unread = store.unread_human_replies(pid).map_err(|e| e.to_string())?;
-        if mark_read && !unread.is_empty() {
-            let rids: Vec<i64> = unread.iter().map(|r| r.id).collect();
-            store.mark_replies_read(&rids).map_err(|e| e.to_string())?;
-        }
-        let summaries = store.projects().map_err(|e| e.to_string())?;
-        let names: HashMap<i64, String> = summaries.iter().map(|s| (s.project.id, s.project.name.clone())).collect();
-        let needs_you: Vec<_> =
-            summaries.into_iter().filter(|s| !s.project.archived && s.needs_you && pid.is_none_or(|id| s.project.id == id)).collect();
-        let now = now_ms();
-        let mut text = String::new();
-        if unread.is_empty() && needs_you.is_empty() {
-            text.push_str("No pending decisions or unread replies.");
-        } else {
-            if !unread.is_empty() {
-                text.push_str(&format!("Unread human replies ({}):", unread.len()));
-                for r in &unread {
-                    let pname = names.get(&r.project_id).map(String::as_str).unwrap_or("Unknown");
-                    text.push_str(&format!(
-                        "\n- reply #{} ({pname}, update #{}, {}): {}",
-                        r.id,
-                        r.update_id,
-                        ago(r.created_at, now),
-                        r.body
-                    ));
-                }
-            }
-            if !needs_you.is_empty() {
-                if !text.is_empty() {
-                    text.push_str("\n\n");
-                }
-                text.push_str(&format!("Open Decision/Blocked cards ({}):", needs_you.len()));
-                for s in &needs_you {
-                    let uid = s.last_update_id.unwrap_or(0);
-                    let when = s.last_at.map(|t| ago(t, now)).unwrap_or_else(|| "recently".into());
-                    let body = s.last_body.as_deref().unwrap_or("");
-                    text.push_str(&format!("\n- {} #{uid} ({when}): {body}", s.project.name));
-                }
-            }
-        }
-        let unread_json: Vec<_> = unread
-            .iter()
-            .map(|r| {
-                let mut v = reply_json(r);
-                v["project"] = json!(names.get(&r.project_id).cloned().unwrap_or_default());
-                v
-            })
-            .collect();
-        let flagged_json: Vec<_> = needs_you
-            .iter()
-            .filter_map(|s| {
-                let id = s.last_update_id?;
-                let body = s.last_body.as_deref()?;
-                let created_at = s.last_at?;
-                Some(json!({
-                    "id": id,
-                    "project_id": s.project.id,
-                    "project": s.project.name,
-                    "agent": s.last_agent,
-                    "body": body,
-                    "created_at": created_at,
-                }))
-            })
-            .collect();
-        Ok(ToolOutput::text(text, json!({ "unread_replies": unread_json, "needs_you_updates": flagged_json })))
-    }
-
-    fn dismiss_attention(&self, args: &Value) -> Result<ToolOutput, String> {
-        let store = self.open_store()?;
-        if let Some(id) = args.get("id").and_then(Value::as_i64) {
-            store.dismiss_attention(id).map_err(|e| e.to_string())?;
-            return Ok(ToolOutput::text(format!("Dismissed Needs you on update #{id}."), json!({ "dismissed_id": id })));
-        }
-        let Some(project) = self.project(&store, args, false)? else {
-            return Err("no matching project found; pass `id` or a valid `project`/`project_path`".into());
-        };
-        let dismissed = store.dismiss_project_attention(project.id).map_err(|e| e.to_string())?;
-        let text = if dismissed {
-            format!("Dismissed Needs you for {}.", project.name)
-        } else {
-            format!("{} has no updates to dismiss.", project.name)
-        };
-        Ok(ToolOutput::text(text, json!({ "project": project_json(&project), "dismissed": dismissed })))
-    }
-
-    fn mark_replies_read(&self, args: &Value) -> Result<ToolOutput, String> {
-        let store = self.open_store()?;
-        if let Some(arr) = args.get("ids").and_then(Value::as_array) {
-            let ids: Vec<i64> = arr.iter().filter_map(Value::as_i64).collect();
-            store.mark_replies_read(&ids).map_err(|e| e.to_string())?;
-            return Ok(ToolOutput::text(
-                format!("Marked {} repl{} as read.", ids.len(), if ids.len() == 1 { "y" } else { "ies" }),
-                json!({ "marked_ids": ids }),
-            ));
-        }
-        let Some(project) = self.project(&store, args, false)? else {
-            return Err("no matching project found; pass `ids` or a valid `project`/`project_path`".into());
-        };
-        store.mark_project_replies_read(project.id).map_err(|e| e.to_string())?;
-        Ok(ToolOutput::text(format!("Marked unread replies for {} as read.", project.name), json!({ "project": project_json(&project) })))
-    }
-
-    fn set_project_brief(&self, args: &Value) -> Result<ToolOutput, String> {
-        let store = self.open_store()?;
-        let project = self.project(&store, args, true)?.ok_or("no project")?;
-        let clear = args.get("clear").and_then(Value::as_bool).unwrap_or(false);
-        let brief = if clear {
-            None
-        } else {
-            let text = str_arg(args, "brief").map(str::trim).filter(|s| !s.is_empty()).ok_or("pass `brief` text or set `clear: true`")?;
-            Some(text)
-        };
-        store.set_project_brief(project.id, brief).map_err(|e| e.to_string())?;
-        let updated = store.project(project.id).map_err(|e| e.to_string())?.ok_or("project vanished")?;
-        let text = match &updated.brief {
-            Some(b) => format!("Updated pinned brief for {}:\n{b}", updated.name),
-            None => format!("Cleared pinned brief for {}.", updated.name),
-        };
-        Ok(ToolOutput::text(text, json!({ "project": project_json(&updated) })))
-    }
-
-    fn pulse(&self, args: &Value) -> Result<ToolOutput, String> {
-        let store = self.open_store()?;
-        let project = self.project(&store, args, true)?.ok_or("no project")?;
-        let agent = self.resolve_agent(args);
-        let clear = args.get("clear").and_then(Value::as_bool).unwrap_or(false);
-        if clear {
-            store.clear_pulse(project.id, &agent).map_err(|e| e.to_string())?;
-            return Ok(ToolOutput::text(
-                format!("Cleared live pulse for {} ({agent}).", project.name),
-                json!({ "cleared": true, "project": project_json(&project), "agent": agent }),
-            ));
-        }
-        let status = str_arg(args, "status").unwrap_or("Working");
-        let git_dir = if str_arg(args, "project_path").is_some() || str_arg(args, "project").is_none() {
-            Some(self.base(args))
-        } else {
-            project.path.as_deref().map(PathBuf::from).filter(|p| p.exists())
-        };
-        let meta = git_dir.as_deref().map(detect_git_meta).unwrap_or_default();
-        let branch = str_arg(args, "branch").map(str::to_string).or(meta.branch);
-        let ttl_secs = args.get("ttl_seconds").and_then(Value::as_u64).unwrap_or(120).clamp(5, 3600);
-        let ttl_ms = (ttl_secs * 1000) as i64;
-        let pulse = store.set_pulse(project.id, &agent, branch.as_deref(), status, ttl_ms).map_err(|e| e.to_string())?;
-        Ok(ToolOutput::text(
-            format!("Pulse active on {} ({}): {}", project.name, pulse.agent, pulse.status),
-            json!({
-                "project": project_json(&project),
-                "pulse": {
-                    "agent": pulse.agent,
-                    "branch": pulse.branch,
-                    "status": pulse.status,
-                    "updated_at": pulse.updated_at,
-                    "expires_at": pulse.expires_at,
-                }
-            }),
-        ))
-    }
-
-    fn list_todos(&self, args: &Value) -> Result<ToolOutput, String> {
-        let open_only = args.get("open_only").and_then(Value::as_bool).unwrap_or(false);
-        let store = self.open_store()?;
-        let Some(project) = self.project(&store, args, false)? else {
-            let name = detect_project(&self.base(args)).name;
-            return Ok(ToolOutput::text(format!("{name} has no to-dos."), json!({ "project": null, "todos": [] })));
-        };
-        let mut todos = store.todos(project.id).map_err(|e| e.to_string())?;
-        if open_only {
-            todos.retain(|t| !t.done);
-        }
-        let text = if todos.is_empty() {
-            format!("{} has no{} to-dos.", project.name, if open_only { " open" } else { "" })
-        } else {
-            let mut out = format!("To-dos for {} ({}):", project.name, todos.len());
-            for t in &todos {
-                let mark = if t.done { "x" } else { " " };
-                out.push_str(&format!("\n- [{mark}] {} (#{})", t.title, t.id));
-            }
-            out
-        };
-        let todos_json: Vec<_> = todos.iter().map(todo_json).collect();
-        Ok(ToolOutput::text(text, json!({ "project": project_json(&project), "todos": todos_json })))
-    }
-
-    fn add_todo(&self, args: &Value) -> Result<ToolOutput, String> {
-        let title = str_arg(args, "title").ok_or("`title` is required")?;
-        let store = self.open_store()?;
-        let project = self.project(&store, args, true)?.ok_or("no project")?;
-        let todo = store.add_todo(project.id, title).map_err(|e| e.to_string())?;
-        Ok(ToolOutput::text(
-            format!("Added to-do #{} to {}: {}", todo.id, project.name, todo.title),
-            json!({ "project": project_json(&project), "todo": todo_json(&todo) }),
-        ))
-    }
-
-    fn toggle_todo(&self, args: &Value) -> Result<ToolOutput, String> {
-        let id = args.get("id").and_then(Value::as_i64).ok_or("`id` is required")?;
-        let store = self.open_store()?;
-        let done = match args.get("done").and_then(Value::as_bool) {
-            Some(explicit) => explicit,
-            None => {
-                let current = store.todo(id).map_err(|e| e.to_string())?.ok_or_else(|| format!("no to-do {id}"))?;
-                !current.done
-            }
-        };
-        let todo = store.set_todo_done(id, done).map_err(|e| e.to_string())?;
-        let state = if todo.done { "Completed" } else { "Reopened" };
-        Ok(ToolOutput::text(format!("{state} to-do #{}: {}", todo.id, todo.title), json!({ "todo": todo_json(&todo) })))
-    }
-
-    fn delete_todo(&self, args: &Value) -> Result<ToolOutput, String> {
-        let id = args.get("id").and_then(Value::as_i64).ok_or("`id` is required")?;
-        let store = self.open_store()?;
-        store.delete_todo(id).map_err(|e| e.to_string())?;
-        Ok(ToolOutput::text(format!("Deleted to-do #{id}."), json!({ "deleted": id })))
-    }
-
-    fn base(&self, args: &Value) -> PathBuf {
-        str_arg(args, "project_path").map(PathBuf::from).unwrap_or_else(|| self.cwd.clone())
-    }
-
-    fn project(&self, store: &Store, args: &Value, create: bool) -> Result<Option<Project>, String> {
-        let found = match (str_arg(args, "project"), create) {
-            (Some(name), true) => store.project_named(name, None).map(Some),
-            (Some(name), false) => store.find_project(name),
-            (None, true) => store.project_at(&detect_project(&self.base(args))).map(Some),
-            (None, false) => store.find_detected(&detect_project(&self.base(args))),
-        };
-        found.map_err(|e| e.to_string())
-    }
-}
-
-fn reply_json(r: &Reply) -> Value {
-    json!({
-        "id": r.id,
-        "update_id": r.update_id,
-        "project_id": r.project_id,
-        "author": r.author,
-        "from_human": r.from_human,
-        "body": r.body,
-        "created_at": r.created_at,
-        "read_at": r.read_at,
-    })
-}
-
-fn format_update_line(project: Option<&str>, u: &FeedUpdate, replies: &[Reply], now: i64) -> String {
-    let branch = u.branch.as_deref().map(|b| format!(" · {b}")).unwrap_or_default();
-    let diff = u.diff_stat.as_deref().map(|d| format!(" · {d}")).unwrap_or_default();
-    let header = match project {
-        Some(p) => format!("── {p} · {} · {}{branch}{diff} (#{})", u.agent, ago(u.created_at, now), u.id),
-        None => format!("── {} · {}{branch}{diff} (#{})", u.agent, ago(u.created_at, now), u.id),
-    };
-    let mut out = format!("{header}\n{}", u.body);
-    if !u.media.is_empty() {
-        for m in &u.media {
-            out.push_str(&format!("\n[media: {}]", m.path.display()));
-        }
-    } else if let Some(shot) = &u.screenshot {
-        out.push_str(&format!("\n[media: {}]", shot.display()));
-    }
-    for r in replies.iter().filter(|r| r.update_id == u.id) {
-        let badge = if r.from_human && r.read_at.is_none() { " [unread]" } else { "" };
-        out.push_str(&format!("\n  ↳ {} ({}){badge}: {}", r.author, ago(r.created_at, now), r.body));
-    }
-    out
-}
-
-fn collect_screenshots(updates: &[FeedUpdate]) -> Vec<ImageBlock> {
-    let mut out = Vec::new();
-    for u in updates {
-        let paths: Vec<&Path> = if !u.media.is_empty() {
-            u.media.iter().map(|m| m.path.as_path()).collect()
-        } else {
-            u.screenshot.as_deref().into_iter().collect()
-        };
-        for path in paths {
-            if out.len() >= MAX_INLINE_SCREENSHOTS {
-                return out;
-            }
-            if let Some(block) = read_image_block(path) {
-                out.push(block);
-            }
-        }
-    }
-    out
-}
-
-fn read_image_block(path: &Path) -> Option<ImageBlock> {
-    let ext = path.extension()?.to_string_lossy().to_ascii_lowercase();
-    let mime_type = match ext.as_str() {
-        "png" => "image/png",
-        "jpg" | "jpeg" => "image/jpeg",
-        "webp" => "image/webp",
-        "gif" => "image/gif",
-        _ => return None,
-    };
-    let meta = std::fs::metadata(path).ok()?;
-    if !meta.is_file() || meta.len() > MAX_INLINE_SCREENSHOT_BYTES {
-        return None;
-    }
-    let bytes = std::fs::read(path).ok()?;
-    Some(ImageBlock { data_base64: base64_encode(&bytes), mime_type })
-}
-
-fn base64_encode(input: &[u8]) -> String {
-    const TABLE: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-    let mut out = String::with_capacity(input.len().div_ceil(3) * 4);
-    for chunk in input.chunks(3) {
-        let b0 = u32::from(chunk[0]);
-        let b1 = u32::from(chunk.get(1).copied().unwrap_or(0));
-        let b2 = u32::from(chunk.get(2).copied().unwrap_or(0));
-        let n = (b0 << 16) | (b1 << 8) | b2;
-        out.push(TABLE[((n >> 18) & 0x3f) as usize] as char);
-        out.push(TABLE[((n >> 12) & 0x3f) as usize] as char);
-        out.push(if chunk.len() > 1 { TABLE[((n >> 6) & 0x3f) as usize] as char } else { '=' });
-        out.push(if chunk.len() > 2 { TABLE[(n & 0x3f) as usize] as char } else { '=' });
-    }
-    out
-}
-
-fn str_arg<'a>(args: &'a Value, key: &str) -> Option<&'a str> {
-    args.get(key).and_then(Value::as_str).map(str::trim).filter(|s| !s.is_empty())
-}
-
-fn error(id: Value, code: i64, message: &str) -> Value {
-    json!({ "jsonrpc": "2.0", "id": id, "error": { "code": code, "message": message } })
 }
 
 fn all_tools() -> Value {
-    let mut list = tools();
+    let mut list = feed::tools();
     if let Value::Array(items) = &mut list {
-        items.extend(notebook::tools());
+        items.extend(library::tools());
     }
     list
-}
-
-fn tools() -> Value {
-    let project = json!({ "type": "string", "description": "Project name. Omit it to use the git repository of project_path (or of the folder the server runs in)." });
-    let project_path =
-        json!({ "type": "string", "description": "Absolute path of the project folder, when it isn't the folder the server runs in." });
-    json!([
-        {
-            "name": "post_update",
-            "title": "Post a project update",
-            "description": format!(
-                "Add a short status update to this project's Feed in Feeder. \
-                 Write up to {MAX_PARAGRAPHS} short blocks (under {MAX_CHARS} characters total) covering: \
-                 (1) Done:/Shipped:/Fixed: what was done + verification, (2) Why:/Benefit: why it was done \
-                 and the benefit, and (3) Next:/Decision needed: what to do next and why. Markdown renders: \
-                 **bold** sparingly for the key takeaway, `code` for files, branches and commands. Attach \
-                 a screenshot or short clip (`screenshot_path`), or up to {MAX_MEDIA_PER_UPDATE} files in a carousel \
-                 (`screenshots`) whenever the work changed multiple screens or states. For deeper reusable \
-                 lessons, non-obvious bug fixes, or user corrections, also call `flag_knowledge` with a full \
-                 Markdown article draft in `suggestion` so Curator can propose adding it to the Library."
-            ),
-            "inputSchema": {
-                "type": "object",
-                "properties": {
-                    "summary": { "type": "string", "description": "The update in Markdown: up to 3 short blocks separated by blank lines, e.g. \"Done: …\\n\\nWhy: …\\n\\nNext: …\"." },
-                    "project": project,
-                    "project_path": project_path,
-                    "agent": { "type": "string", "description": "Leave unset: Feeder detects the tool you're running in." },
-                    "branch": { "type": "string", "description": "Optional git branch. Leave unset: Feeder detects it from project_path." },
-                    "diff_stat": { "type": "string", "description": "Optional diff stat override (auto-detected from git when omitted)." },
-                    "screenshot_path": { "type": "string", "description": "Optional path to one png, jpg, webp, gif screenshot or mp4/mov/webm clip. Copied into Feeder." },
-                    "screenshots": {
-                        "type": "array",
-                        "items": { "type": "string" },
-                        "maxItems": MAX_MEDIA_PER_UPDATE,
-                        "description": format!("Optional list of up to {MAX_MEDIA_PER_UPDATE} screenshot/video paths to render as an interactive carousel on the update card.")
-                    }
-                },
-                "required": ["summary"]
-            }
-        },
-        {
-            "name": "edit_update",
-            "title": "Edit an existing update",
-            "description": "Replace the text body of an existing update by id (returned by post_update, get_feed, or search_updates).",
-            "inputSchema": {
-                "type": "object",
-                "properties": {
-                    "id": { "type": "integer", "description": "Update id." },
-                    "summary": { "type": "string", "description": "Replacement update body in Markdown." }
-                },
-                "required": ["id", "summary"]
-            }
-        },
-        {
-            "name": "delete_update",
-            "title": "Delete an update",
-            "description": "Permanently delete a single update and its stored media by id.",
-            "inputSchema": {
-                "type": "object",
-                "properties": {
-                    "id": { "type": "integer", "description": "Update id." }
-                },
-                "required": ["id"]
-            },
-            "annotations": { "destructiveHint": true }
-        },
-        {
-            "name": "get_feed",
-            "title": "Read a project's feed",
-            "description": "Read this project's latest updates, pinned brief, to-dos and human replies. When starting a task, supply task keywords to also get a short list of relevant Notebook notes.",
-            "inputSchema": {
-                "type": "object",
-                "properties": {
-                    "project": project,
-                    "project_path": project_path,
-                    "task": { "type": "string", "maxLength": 160, "description": "Optional search keywords for the task, such as 'appcast signing'. Returns up to three current notes from this project or the shared Notebook." },
-                    "limit": { "type": "integer", "minimum": 1, "maximum": 50, "description": "How many updates (default 5)." },
-                    "include_screenshots": { "type": "boolean", "description": format!("When true, include up to {MAX_INLINE_SCREENSHOTS} attached screenshots as base64 image blocks.") },
-                    "mark_replies_read": { "type": "boolean", "description": "When true, mark returned unread human replies for this project as read." }
-                }
-            }
-        },
-        {
-            "name": "get_recent_activity",
-            "title": "Read recent cross-project updates",
-            "description": "Read the latest updates across all active projects in Feeder, newest first.",
-            "inputSchema": {
-                "type": "object",
-                "properties": {
-                    "limit": { "type": "integer", "minimum": 1, "maximum": 50, "description": "How many updates (default 10)." },
-                    "include_screenshots": { "type": "boolean", "description": format!("When true, include up to {MAX_INLINE_SCREENSHOTS} attached screenshots as base64 image blocks.") }
-                }
-            },
-            "annotations": { "readOnlyHint": true }
-        },
-        {
-            "name": "search_updates",
-            "title": "Search Feeder updates",
-            "description": "Search past update summaries, agent names, and branches across projects (or within one project).",
-            "inputSchema": {
-                "type": "object",
-                "properties": {
-                    "query": { "type": "string", "description": "Text to match in update bodies, agent names, or branch names." },
-                    "project": project,
-                    "include_archived": { "type": "boolean", "description": "Set true to include archived projects." },
-                    "limit": { "type": "integer", "minimum": 1, "maximum": 50, "description": "Maximum matches to return (default 10)." }
-                },
-                "required": ["query"]
-            },
-            "annotations": { "readOnlyHint": true }
-        },
-        {
-            "name": "list_projects",
-            "title": "List Feeder projects",
-            "description": "List projects in Feeder with update counts, open to-do counts, active pulses, attention status, and last activity.",
-            "inputSchema": {
-                "type": "object",
-                "properties": {
-                    "include_archived": { "type": "boolean", "description": "Set true to include archived projects." }
-                }
-            },
-            "annotations": { "readOnlyHint": true }
-        },
-        {
-            "name": "reply_to_update",
-            "title": "Reply to an update card",
-            "description": "Post an agent reply under an existing update card (for answering the human or continuing a thread).",
-            "inputSchema": {
-                "type": "object",
-                "properties": {
-                    "id": { "type": "integer", "description": "Update id." },
-                    "summary": { "type": "string", "description": "Reply text." },
-                    "agent": { "type": "string", "description": "Optional agent display name override." }
-                },
-                "required": ["id", "summary"]
-            }
-        },
-        {
-            "name": "get_pending_decisions",
-            "title": "Read unread human replies & open decisions",
-            "description": "Fetch unread human replies and updates flagged `Decision needed:` or `Blocked:`, optionally filtered to one project.",
-            "inputSchema": {
-                "type": "object",
-                "properties": {
-                    "project": project,
-                    "project_path": project_path,
-                    "mark_read": { "type": "boolean", "description": "When true, mark the returned unread human replies as read." }
-                }
-            }
-        },
-        {
-            "name": "dismiss_attention",
-            "title": "Dismiss an open Needs you flag",
-            "description": "Clear an open `Needs you` badge on a specific update id or on the latest update for a project without posting a reply.",
-            "inputSchema": {
-                "type": "object",
-                "properties": {
-                    "id": { "type": "integer", "description": "Specific update id to dismiss. Omit to dismiss the project's latest update." },
-                    "project": project,
-                    "project_path": project_path
-                }
-            },
-            "annotations": { "idempotentHint": true }
-        },
-        {
-            "name": "mark_replies_read",
-            "title": "Mark human replies as read",
-            "description": "Mark specific reply IDs (or all unread human replies for a project) as read after acting on them.",
-            "inputSchema": {
-                "type": "object",
-                "properties": {
-                    "ids": { "type": "array", "items": { "type": "integer" }, "description": "Specific reply IDs to mark read." },
-                    "project": project,
-                    "project_path": project_path
-                }
-            }
-        },
-        {
-            "name": "set_project_brief",
-            "title": "Set or clear a project's pinned brief",
-            "description": "Update the pinned project brief (`Goal / Focus / Commands`) displayed at the top of a project's feed.",
-            "inputSchema": {
-                "type": "object",
-                "properties": {
-                    "brief": { "type": "string", "description": "Short brief text (up to 600 chars). Omit with clear=true to remove." },
-                    "clear": { "type": "boolean", "description": "Set true to clear the pinned brief." },
-                    "project": project,
-                    "project_path": project_path
-                }
-            }
-        },
-        {
-            "name": "pulse",
-            "title": "Set or clear a live working pulse",
-            "description": "Show a subtle live 'working' halo on this project's orb while working (auto-expires after ttl_seconds and auto-clears on post_update).",
-            "inputSchema": {
-                "type": "object",
-                "properties": {
-                    "status": { "type": "string", "description": "Short activity label, e.g. \"Refactoring auth\"." },
-                    "project": project,
-                    "project_path": project_path,
-                    "agent": { "type": "string", "description": "Optional agent display name override." },
-                    "branch": { "type": "string", "description": "Optional branch override." },
-                    "ttl_seconds": { "type": "integer", "minimum": 5, "maximum": 3600, "description": "Expiry in seconds (default 120)." },
-                    "clear": { "type": "boolean", "description": "Set true to clear the pulse immediately." }
-                }
-            }
-        },
-        {
-            "name": "list_todos",
-            "title": "List a project's to-dos",
-            "description": "List optional checklist items for a project.",
-            "inputSchema": {
-                "type": "object",
-                "properties": {
-                    "project": project,
-                    "project_path": project_path,
-                    "open_only": { "type": "boolean", "description": "When true, return only unchecked to-dos." }
-                }
-            },
-            "annotations": { "readOnlyHint": true }
-        },
-        {
-            "name": "add_todo",
-            "title": "Add a project to-do",
-            "description": "Append a short to-do item (up to 240 chars) to a project's optional checklist.",
-            "inputSchema": {
-                "type": "object",
-                "properties": {
-                    "title": { "type": "string", "description": "Short to-do item text." },
-                    "project": project,
-                    "project_path": project_path
-                },
-                "required": ["title"]
-            }
-        },
-        {
-            "name": "toggle_todo",
-            "title": "Complete or reopen a to-do",
-            "description": "Mark a to-do item done or open by id. Omit `done` to toggle its current state.",
-            "inputSchema": {
-                "type": "object",
-                "properties": {
-                    "id": { "type": "integer", "description": "To-do id." },
-                    "done": { "type": "boolean", "description": "Explicit done state; omit to toggle." }
-                },
-                "required": ["id"]
-            }
-        },
-        {
-            "name": "delete_todo",
-            "title": "Delete a to-do",
-            "description": "Remove a to-do item from a project's checklist by id.",
-            "inputSchema": {
-                "type": "object",
-                "properties": {
-                    "id": { "type": "integer", "description": "To-do id." }
-                },
-                "required": ["id"]
-            },
-            "annotations": { "destructiveHint": true }
-        }
-    ])
 }
 
 #[cfg(test)]
@@ -1306,13 +396,73 @@ mod tests {
         dir
     }
 
+    fn init_git(dir: &Path) {
+        let ok = std::process::Command::new("git").args(["init", "-q", "-b", "main"]).current_dir(dir).status().unwrap().success();
+        assert!(ok);
+    }
+
+    fn call_rpc(server: &mut Server, id: i64, name: &str, arguments: Value) -> Value {
+        server
+            .handle(&json!({ "jsonrpc": "2.0", "id": id, "method": "tools/call", "params": { "name": name, "arguments": arguments } }))
+            .unwrap()
+    }
+
     #[test]
     fn base64_encodes_rfc4648_vectors() {
-        assert_eq!(base64_encode(b""), "");
-        assert_eq!(base64_encode(b"f"), "Zg==");
-        assert_eq!(base64_encode(b"fo"), "Zm8=");
-        assert_eq!(base64_encode(b"foo"), "Zm9v");
-        assert_eq!(base64_encode(b"foobar"), "Zm9vYmFy");
+        assert_eq!(feed::base64_encode(b""), "");
+        assert_eq!(feed::base64_encode(b"f"), "Zg==");
+        assert_eq!(feed::base64_encode(b"fo"), "Zm8=");
+        assert_eq!(feed::base64_encode(b"foo"), "Zm9v");
+        assert_eq!(feed::base64_encode(b"foobar"), "Zm9vYmFy");
+    }
+
+    #[test]
+    fn schema_annotations_and_context_budgets_hold() {
+        let store_dir = temp_dir("schema-budget");
+        let work_dir = temp_dir("work-budget");
+        let mut server = Server::new(None, work_dir.clone(), Some(store_dir.clone()));
+        let init = server
+            .handle(&json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "initialize",
+                "params": { "protocolVersion": "2025-11-25", "clientInfo": { "name": "claude-code" } }
+            }))
+            .unwrap();
+        let instructions = init.pointer("/result/instructions").and_then(Value::as_str).unwrap();
+        assert!(instructions.len() <= 1200, "instructions too long: {}", instructions.len());
+        assert!(!instructions.contains("feeder "), "MCP instructions must stay free of CLI syntax");
+
+        let listed = server.handle(&json!({ "jsonrpc": "2.0", "id": 2, "method": "tools/list", "params": {} })).unwrap();
+        let tools = listed.pointer("/result/tools").and_then(Value::as_array).unwrap();
+        assert_eq!(tools.len(), 11);
+        let serialized_len = serde_json::to_string(tools).unwrap().len();
+        assert!(serialized_len <= 9000, "tools/list too large: {serialized_len} bytes");
+
+        let mut destructive = Vec::new();
+        for tool in tools {
+            let name = tool["name"].as_str().unwrap();
+            let ann = tool["annotations"].as_object().expect("annotations required on every tool");
+            assert_eq!(ann.get("openWorldHint").and_then(Value::as_bool), Some(false), "{name} must set openWorldHint=false");
+            assert!(ann.get("readOnlyHint").and_then(Value::as_bool).is_some(), "{name} missing readOnlyHint");
+            assert!(ann.get("idempotentHint").and_then(Value::as_bool).is_some(), "{name} missing idempotentHint");
+            if ann.get("destructiveHint").and_then(Value::as_bool) == Some(true) {
+                destructive.push(name);
+            } else {
+                assert_eq!(ann.get("destructiveHint").and_then(Value::as_bool), Some(false), "{name} missing destructiveHint=false");
+            }
+            if let Some(req) = tool.pointer("/inputSchema/required").and_then(Value::as_array) {
+                let props = tool.pointer("/inputSchema/properties").and_then(Value::as_object).unwrap();
+                for key in req {
+                    let k = key.as_str().unwrap();
+                    assert!(props.contains_key(k), "{name} required `{k}` missing from properties");
+                }
+            }
+        }
+        assert_eq!(destructive, ["delete_item"]);
+
+        let _ = std::fs::remove_dir_all(store_dir);
+        let _ = std::fs::remove_dir_all(work_dir);
     }
 
     #[test]
@@ -1333,37 +483,22 @@ mod tests {
             .unwrap();
         assert!(init.pointer("/result/capabilities/resources").is_some());
 
-        let post = server
-            .handle(&json!({
-                "jsonrpc": "2.0",
-                "id": 2,
-                "method": "tools/call",
-                "params": {
-                    "name": "post_update",
-                    "arguments": {
-                        "project": "Alpha",
-                        "summary": "Changed: first pass",
-                        "branch": "feat/mcp",
-                        "screenshot_path": shot
-                    }
-                }
-            }))
-            .unwrap();
+        let post = call_rpc(
+            &mut server,
+            2,
+            "post_update",
+            json!({
+                "project": "Alpha",
+                "summary": "Changed: first pass",
+                "branch": "feat/mcp",
+                "screenshot_path": shot
+            }),
+        );
         assert_eq!(post.pointer("/result/isError"), Some(&json!(false)));
         let uid = post.pointer("/result/structuredContent/update/id").and_then(Value::as_i64).unwrap();
         assert_eq!(post.pointer("/result/structuredContent/update/branch"), Some(&json!("feat/mcp")));
 
-        let feed = server
-            .handle(&json!({
-                "jsonrpc": "2.0",
-                "id": 3,
-                "method": "tools/call",
-                "params": {
-                    "name": "get_feed",
-                    "arguments": { "project": "Alpha", "include_screenshots": true }
-                }
-            }))
-            .unwrap();
+        let feed = call_rpc(&mut server, 3, "get_feed", json!({ "project": "Alpha", "include_screenshots": true }));
         let content = feed.pointer("/result/content").and_then(Value::as_array).unwrap();
         assert_eq!(content.len(), 2);
         assert_eq!(content[1]["type"], "image");
@@ -1378,6 +513,8 @@ mod tests {
             .filter_map(|r| r.get("uri").and_then(Value::as_str))
             .collect();
         assert!(uris.contains(&"feeder://projects"));
+        assert!(uris.contains(&"feeder://pending"));
+        assert!(uris.contains(&"feeder://library"));
         assert!(uris.contains(&"feeder://project/alpha/feed"));
 
         let read = server
@@ -1392,30 +529,10 @@ mod tests {
         assert!(md.contains("feat/mcp"));
         assert!(md.contains("Changed: first pass"));
 
-        let edited = server
-            .handle(&json!({
-                "jsonrpc": "2.0",
-                "id": 6,
-                "method": "tools/call",
-                "params": {
-                    "name": "edit_update",
-                    "arguments": { "id": uid, "summary": "Changed: edited pass" }
-                }
-            }))
-            .unwrap();
+        let edited = call_rpc(&mut server, 6, "edit_update", json!({ "id": uid, "summary": "Changed: edited pass" }));
         assert_eq!(edited.pointer("/result/structuredContent/update/body"), Some(&json!("Changed: edited pass")));
 
-        let deleted = server
-            .handle(&json!({
-                "jsonrpc": "2.0",
-                "id": 7,
-                "method": "tools/call",
-                "params": {
-                    "name": "delete_update",
-                    "arguments": { "id": uid }
-                }
-            }))
-            .unwrap();
+        let deleted = call_rpc(&mut server, 7, "delete_item", json!({ "kind": "update", "id": uid }));
         assert_eq!(deleted.pointer("/result/structuredContent/deleted"), Some(&json!(uid)));
 
         let _ = std::fs::remove_dir_all(store_dir);
@@ -1428,243 +545,155 @@ mod tests {
         let work_dir = temp_dir("work2");
         let mut server = Server::new(Some("codex".into()), work_dir.clone(), Some(store_dir.clone()));
 
-        let brief = server
-            .handle(&json!({
-                "jsonrpc": "2.0",
-                "id": 1,
-                "method": "tools/call",
-                "params": {
-                    "name": "set_project_brief",
-                    "arguments": { "project": "Beta", "brief": "Goal: fast local UI\nFocus: replies" }
-                }
-            }))
-            .unwrap();
-        assert_eq!(brief.pointer("/result/structuredContent/project/brief"), Some(&json!("Goal: fast local UI\nFocus: replies")));
+        let setup_proj = call_rpc(
+            &mut server,
+            1,
+            "update_project",
+            json!({
+                "project": "Beta",
+                "brief": "Goal: fast local UI\nFocus: replies",
+                "pulse": { "status": "Running clippy", "ttl_seconds": 90 }
+            }),
+        );
+        assert_eq!(setup_proj.pointer("/result/structuredContent/project/brief"), Some(&json!("Goal: fast local UI\nFocus: replies")));
+        assert_eq!(setup_proj.pointer("/result/structuredContent/pulse/status"), Some(&json!("Running clippy")));
 
-        let pulse = server
-            .handle(&json!({
-                "jsonrpc": "2.0",
-                "id": 2,
-                "method": "tools/call",
-                "params": {
-                    "name": "pulse",
-                    "arguments": { "project": "Beta", "status": "Running clippy", "ttl_seconds": 90 }
-                }
-            }))
-            .unwrap();
-        assert_eq!(pulse.pointer("/result/structuredContent/pulse/status"), Some(&json!("Running clippy")));
-
-        let post = server
-            .handle(&json!({
-                "jsonrpc": "2.0",
-                "id": 3,
-                "method": "tools/call",
-                "params": {
-                    "name": "post_update",
-                    "arguments": { "project": "Beta", "summary": "Done: tests\n\nDecision needed: ship today?" }
-                }
-            }))
-            .unwrap();
+        let post =
+            call_rpc(&mut server, 3, "post_update", json!({ "project": "Beta", "summary": "Done: tests\n\nDecision needed: ship today?" }));
         let uid = post.pointer("/result/structuredContent/update/id").and_then(Value::as_i64).unwrap();
 
-        let open_before = server
-            .handle(&json!({
-                "jsonrpc": "2.0",
-                "id": 31,
-                "method": "tools/call",
-                "params": { "name": "get_pending_decisions", "arguments": { "project": "Beta" } }
-            }))
-            .unwrap();
-        assert_eq!(open_before.pointer("/result/structuredContent/needs_you_updates/0/id"), Some(&json!(uid)));
+        let pending_before = call_rpc(&mut server, 31, "list_projects", json!({ "filter": "pending" }));
+        assert_eq!(pending_before.pointer("/result/structuredContent/needs_you_updates/0/id"), Some(&json!(uid)));
 
         let store = Store::open(&store_dir).unwrap();
         let human_reply = store.add_reply(uid, "You", true, "Yes, ship today!").unwrap();
 
-        let pending = server
-            .handle(&json!({
-                "jsonrpc": "2.0",
-                "id": 4,
-                "method": "tools/call",
-                "params": { "name": "get_pending_decisions", "arguments": { "project": "Beta" } }
-            }))
+        let pending_res = server
+            .handle(&json!({ "jsonrpc": "2.0", "id": 32, "method": "resources/read", "params": { "uri": "feeder://pending" } }))
             .unwrap();
+        let pending_md = pending_res.pointer("/result/contents/0/text").and_then(Value::as_str).unwrap();
+        assert!(pending_md.contains("Yes, ship today!"));
+
+        let pending = call_rpc(&mut server, 4, "list_projects", json!({ "filter": "pending" }));
         assert_eq!(pending.pointer("/result/structuredContent/unread_replies/0/body"), Some(&json!("Yes, ship today!")));
         assert_eq!(pending.pointer("/result/structuredContent/needs_you_updates").and_then(Value::as_array).map(Vec::len), Some(0));
 
-        let marked = server
-            .handle(&json!({
-                "jsonrpc": "2.0",
-                "id": 5,
-                "method": "tools/call",
-                "params": { "name": "mark_replies_read", "arguments": { "ids": [human_reply.id] } }
-            }))
-            .unwrap();
-        assert_eq!(marked.pointer("/result/isError"), Some(&json!(false)));
-
-        let reply = server
-            .handle(&json!({
-                "jsonrpc": "2.0",
-                "id": 6,
-                "method": "tools/call",
-                "params": { "name": "reply_to_update", "arguments": { "id": uid, "summary": "Shipping now.", "agent": "Codex" } }
-            }))
-            .unwrap();
+        let reply = call_rpc(&mut server, 6, "reply_to_update", json!({ "id": uid, "summary": "Shipping now.", "agent": "Codex" }));
         assert_eq!(reply.pointer("/result/structuredContent/reply/author"), Some(&json!("Codex")));
         assert_eq!(reply.pointer("/result/structuredContent/reply/from_human"), Some(&json!(false)));
+        assert_eq!(reply.pointer("/result/structuredContent/marked_replies_read"), Some(&json!(1)));
+        assert!(store.unread_human_replies(None).unwrap().is_empty());
+
+        let legacy_mark = call_rpc(&mut server, 7, "mark_replies_read", json!({ "ids": [human_reply.id] }));
+        assert_eq!(legacy_mark.pointer("/result/isError"), Some(&json!(false)));
 
         let _ = std::fs::remove_dir_all(store_dir);
         let _ = std::fs::remove_dir_all(work_dir);
     }
 
     #[test]
-    fn mcp_todos_roundtrip_and_feed_integration() {
-        let store_dir = temp_dir("store-todos");
-        let work_dir = temp_dir("work-todos");
+    fn single_roundtrip_post_update_and_todos_work_atomically() {
+        let store_dir = temp_dir("store-single-rt");
+        let work_dir = temp_dir("work-single-rt");
+        let store = Store::open(&store_dir).unwrap();
+        let gamma = store.project_named("Gamma", None).unwrap();
+        let beta = store.project_named("Other", None).unwrap();
+        let foreign_todo = store.add_todo(beta.id, "Foreign task").unwrap();
+        let existing_todo = store.add_todo(gamma.id, "Ship release").unwrap();
+        let page = store
+            .create_page(
+                feeder_core::PageDraft::new("SQLite busy timeout", "Set PRAGMA busy_timeout = 5000."),
+                feeder_core::HUMAN_AUTHOR,
+                None,
+                feeder_core::OnSimilar::Refuse,
+            )
+            .unwrap();
+        drop(store);
+
         let mut server = Server::new(Some("codex".into()), work_dir.clone(), Some(store_dir.clone()));
+        let bad_post = call_rpc(
+            &mut server,
+            1,
+            "post_update",
+            json!({
+                "project": "Gamma",
+                "summary": "Done: tried partial mutation.",
+                "complete_todos": [foreign_todo.id],
+                "helped_notes": [page.id],
+                "add_todos": ["Should not be created"]
+            }),
+        );
+        assert_eq!(bad_post.pointer("/result/isError"), Some(&json!(true)));
+        let store = Store::open(&store_dir).unwrap();
+        assert!(store.feed(gamma.id, 10, None).unwrap().is_empty(), "pre-validation aborts before posting");
+        assert_eq!(store.page(page.id).unwrap().unwrap().helped, 0);
+        drop(store);
 
-        let added1 = server
-            .handle(&json!({
-                "jsonrpc": "2.0",
-                "id": 1,
-                "method": "tools/call",
-                "params": { "name": "add_todo", "arguments": { "project": "Gamma", "title": "Ship release" } }
-            }))
-            .unwrap();
-        assert_eq!(added1.pointer("/result/isError"), Some(&json!(false)));
-        let tid1 = added1.pointer("/result/structuredContent/todo/id").and_then(Value::as_i64).unwrap();
+        let good_post = call_rpc(
+            &mut server,
+            2,
+            "post_update",
+            json!({
+                "project": "Gamma",
+                "summary": "Done: shipped release.",
+                "complete_todos": [existing_todo.id],
+                "add_todos": ["Write docs"],
+                "helped_notes": [page.id],
+                "flag_lesson": {
+                    "kind": "missing",
+                    "note": "Capture release verification order.",
+                    "suggestion": "## Order\n\nRun checks after formatting."
+                }
+            }),
+        );
+        assert_eq!(good_post.pointer("/result/isError"), Some(&json!(false)));
+        let uid = good_post.pointer("/result/structuredContent/update/id").and_then(Value::as_i64).unwrap();
+        let fid = good_post.pointer("/result/structuredContent/flagged_lesson_id").and_then(Value::as_i64).unwrap();
 
-        let added2 = server
-            .handle(&json!({
-                "jsonrpc": "2.0",
-                "id": 2,
-                "method": "tools/call",
-                "params": { "name": "add_todo", "arguments": { "project": "Gamma", "title": "Write docs" } }
-            }))
-            .unwrap();
-        let tid2 = added2.pointer("/result/structuredContent/todo/id").and_then(Value::as_i64).unwrap();
+        let store = Store::open(&store_dir).unwrap();
+        assert_eq!(store.page(page.id).unwrap().unwrap().helped, 1);
+        assert!(store.todo(existing_todo.id).unwrap().unwrap().done);
+        let flag = store.flag(fid).unwrap().unwrap();
+        assert_eq!(flag.source_update_id, Some(uid));
 
-        let toggled = server
-            .handle(&json!({
-                "jsonrpc": "2.0",
-                "id": 3,
-                "method": "tools/call",
-                "params": { "name": "toggle_todo", "arguments": { "id": tid1 } }
-            }))
-            .unwrap();
-        assert_eq!(toggled.pointer("/result/structuredContent/todo/done"), Some(&json!(true)));
-
-        let open_list = server
-            .handle(&json!({
-                "jsonrpc": "2.0",
-                "id": 4,
-                "method": "tools/call",
-                "params": { "name": "list_todos", "arguments": { "project": "Gamma", "open_only": true } }
-            }))
-            .unwrap();
-        let open_arr = open_list.pointer("/result/structuredContent/todos").and_then(Value::as_array).unwrap();
-        assert_eq!(open_arr.len(), 1);
-        assert_eq!(open_arr[0]["id"], json!(tid2));
-
-        let projects = server
-            .handle(&json!({
-                "jsonrpc": "2.0",
-                "id": 5,
-                "method": "tools/call",
-                "params": { "name": "list_projects", "arguments": {} }
-            }))
-            .unwrap();
-        assert_eq!(projects.pointer("/result/structuredContent/projects/0/open_todos"), Some(&json!(1)));
-
-        let feed = server
-            .handle(&json!({
-                "jsonrpc": "2.0",
-                "id": 6,
-                "method": "tools/call",
-                "params": { "name": "get_feed", "arguments": { "project": "Gamma" } }
-            }))
-            .unwrap();
+        let feed = call_rpc(&mut server, 3, "get_feed", json!({ "project": "Gamma" }));
         let feed_text = feed.pointer("/result/content/0/text").and_then(Value::as_str).unwrap();
-        assert!(feed_text.contains("To-dos (1 open / 2 total):"));
         assert!(feed_text.contains("[x] Ship release"));
         assert!(feed_text.contains("[ ] Write docs"));
 
-        let res = server
-            .handle(&json!({
-                "jsonrpc": "2.0",
-                "id": 7,
-                "method": "resources/read",
-                "params": { "uri": "feeder://project/gamma/feed" }
-            }))
-            .unwrap();
-        let md = res.pointer("/result/contents/0/text").and_then(Value::as_str).unwrap();
-        assert!(md.contains("## To-dos"));
-        assert!(md.contains("- [ ] Write docs"));
-
-        let deleted = server
-            .handle(&json!({
-                "jsonrpc": "2.0",
-                "id": 8,
-                "method": "tools/call",
-                "params": { "name": "delete_todo", "arguments": { "id": tid1 } }
-            }))
-            .unwrap();
-        assert_eq!(deleted.pointer("/result/structuredContent/deleted"), Some(&json!(tid1)));
+        let added_tid = good_post.pointer("/result/structuredContent/added_todos/0/id").and_then(Value::as_i64).unwrap();
+        let deleted = call_rpc(&mut server, 4, "delete_item", json!({ "kind": "todo", "id": added_tid }));
+        assert_eq!(deleted.pointer("/result/structuredContent/deleted"), Some(&json!(added_tid)));
 
         let _ = std::fs::remove_dir_all(store_dir);
         let _ = std::fs::remove_dir_all(work_dir);
     }
 
     #[test]
-    fn mcp_dismiss_attention_and_notebook_resources() {
-        let store_dir = temp_dir("store-dismiss-nb");
-        let work_dir = temp_dir("work-dismiss-nb");
+    fn mcp_dismiss_attention_and_library_resources() {
+        let store_dir = temp_dir("store-dismiss-lib");
+        let work_dir = temp_dir("work-dismiss-lib");
         let mut server = Server::new(Some("codex".into()), work_dir.clone(), Some(store_dir.clone()));
 
-        let posted = server
-            .handle(&json!({
-                "jsonrpc": "2.0",
-                "id": 1,
-                "method": "tools/call",
-                "params": {
-                    "name": "post_update",
-                    "arguments": { "project": "Delta", "summary": "Done: built API.\n\nDecision needed: keep v1?" }
-                }
-            }))
-            .unwrap();
+        let posted = call_rpc(
+            &mut server,
+            1,
+            "post_update",
+            json!({ "project": "Delta", "summary": "Done: built API.\n\nDecision needed: keep v1?" }),
+        );
         let uid = posted.pointer("/result/structuredContent/update/id").and_then(Value::as_i64).unwrap();
 
-        let feed_before = server
-            .handle(&json!({
-                "jsonrpc": "2.0",
-                "id": 2,
-                "method": "tools/call",
-                "params": { "name": "get_feed", "arguments": { "project": "Delta" } }
-            }))
-            .unwrap();
+        let feed_before = call_rpc(&mut server, 2, "get_feed", json!({ "project": "Delta" }));
         assert_eq!(feed_before.pointer("/result/structuredContent/needs_you"), Some(&json!(true)));
 
-        let dismissed = server
-            .handle(&json!({
-                "jsonrpc": "2.0",
-                "id": 3,
-                "method": "tools/call",
-                "params": { "name": "dismiss_attention", "arguments": { "id": uid } }
-            }))
-            .unwrap();
+        let dismissed = call_rpc(&mut server, 3, "update_project", json!({ "project": "Delta", "dismiss_update_id": uid }));
         assert_eq!(dismissed.pointer("/result/isError"), Some(&json!(false)));
 
-        let feed_after = server
-            .handle(&json!({
-                "jsonrpc": "2.0",
-                "id": 4,
-                "method": "tools/call",
-                "params": { "name": "get_feed", "arguments": { "project": "Delta" } }
-            }))
-            .unwrap();
+        let feed_after = call_rpc(&mut server, 4, "get_feed", json!({ "project": "Delta" }));
         assert_eq!(feed_after.pointer("/result/structuredContent/needs_you"), Some(&json!(false)));
 
-        let pid = Store::open(&store_dir)
-            .unwrap()
+        let store = Store::open(&store_dir).unwrap();
+        let pid1 = store
             .create_page(
                 feeder_core::PageDraft::new(
                     "SQLite WAL checkpoints need busy timeout",
@@ -1676,35 +705,93 @@ mod tests {
             )
             .unwrap()
             .id;
+        let pid2 = store
+            .create_page(
+                feeder_core::PageDraft::new("Rune layout padding rules", "Keep inset math inside style::pane_kit."),
+                feeder_core::HUMAN_AUTHOR,
+                None,
+                feeder_core::OnSimilar::Refuse,
+            )
+            .unwrap()
+            .id;
 
-        let index = server
-            .handle(&json!({
-                "jsonrpc": "2.0",
-                "id": 6,
-                "method": "resources/read",
-                "params": { "uri": "feeder://notebook" }
-            }))
-            .unwrap();
-        let index_md = index.pointer("/result/contents/0/text").and_then(Value::as_str).unwrap();
-        assert!(index_md.contains("SQLite WAL checkpoints need busy timeout"));
+        for uri in ["feeder://library", "feeder://notebook"] {
+            let index = server.handle(&json!({ "jsonrpc": "2.0", "id": 6, "method": "resources/read", "params": { "uri": uri } })).unwrap();
+            let index_md = index.pointer("/result/contents/0/text").and_then(Value::as_str).unwrap();
+            assert!(index_md.contains("SQLite WAL checkpoints need busy timeout"));
+        }
 
-        let page_res = server
-            .handle(&json!({
-                "jsonrpc": "2.0",
-                "id": 7,
-                "method": "resources/read",
-                "params": { "uri": format!("feeder://notebook/{pid}") }
-            }))
-            .unwrap();
-        let page_md = page_res.pointer("/result/contents/0/text").and_then(Value::as_str).unwrap();
-        assert!(page_md.contains("PRAGMA busy_timeout = 3000"));
+        for uri in [format!("feeder://library/{pid1}"), format!("feeder://notebook/{pid1}")] {
+            let page_res =
+                server.handle(&json!({ "jsonrpc": "2.0", "id": 7, "method": "resources/read", "params": { "uri": uri } })).unwrap();
+            let page_md = page_res.pointer("/result/contents/0/text").and_then(Value::as_str).unwrap();
+            assert!(page_md.contains("PRAGMA busy_timeout = 3000"));
+        }
+
+        let batch = call_rpc(&mut server, 8, "read_library", json!({ "ids": [pid1, pid2] }));
+        assert_eq!(batch.pointer("/result/structuredContent/pages").and_then(Value::as_array).map(Vec::len), Some(2));
+        let batch_md = batch.pointer("/result/content/0/text").and_then(Value::as_str).unwrap();
+        assert!(batch_md.contains("PRAGMA busy_timeout = 3000"));
+        assert!(batch_md.contains("Keep inset math inside style::pane_kit."));
 
         let _ = std::fs::remove_dir_all(store_dir);
         let _ = std::fs::remove_dir_all(work_dir);
     }
 
     #[test]
-    fn mcp_carousel_and_freeform_notebook_roundtrip() {
+    fn progressive_disclosure_strips_bodies_and_scopes_library_search() {
+        let store_dir = temp_dir("store-prog");
+        let work_dir = temp_dir("work-prog");
+        let store = Store::open(&store_dir).unwrap();
+        let alpha = store.project_named("Alpha", None).unwrap();
+        let beta = store.project_named("Beta", None).unwrap();
+        let page = |title: &str, body: &str, project_id: Option<i64>| {
+            store
+                .create_page(
+                    feeder_core::PageDraft { topic: Some("rust".into()), ..feeder_core::PageDraft::new(title, body) },
+                    feeder_core::HUMAN_AUTHOR,
+                    project_id,
+                    feeder_core::OnSimilar::Allow,
+                )
+                .unwrap()
+        };
+        let local = page("Alpha SQLite lock", "SECRET_MARKER_BODY_ALPHA", Some(alpha.id));
+        let shared = page("Shared SQLite lock", "SECRET_MARKER_BODY_SHARED", None);
+        page("Beta SQLite lock", "SECRET_MARKER_BODY_BETA", Some(beta.id));
+
+        let mut server = Server::new(Some("codex".into()), work_dir.clone(), Some(store_dir.clone()));
+        let search = call_rpc(&mut server, 1, "search_library", json!({ "project": "Alpha", "topic": "rust" }));
+        let pages = search.pointer("/result/structuredContent/pages").and_then(Value::as_array).unwrap();
+        assert_eq!(pages.len(), 2);
+        for hit in pages {
+            assert!(hit.get("excerpt").is_some());
+            assert!(hit.get("body").is_none(), "search_library must never leak full body into structuredContent");
+        }
+        assert!(pages.iter().any(|p| p["id"] == local.id));
+        assert!(pages.iter().any(|p| p["id"] == shared.id));
+
+        let handoff = call_rpc(&mut server, 2, "get_feed", json!({ "project": "Alpha", "task": "sqlite" }));
+        let notes = handoff.pointer("/result/structuredContent/related_notes").and_then(Value::as_array).unwrap();
+        assert_eq!(notes.len(), 2);
+        assert!(notes.iter().any(|n| n["url"] == format!("feeder://library/{}", local.id)));
+        assert!(!handoff.to_string().contains("Beta SQLite lock"));
+
+        let run = store.start_gardener_run(feeder_core::gardener::Backend::Codex).unwrap();
+        server.role = Role::Gardener(run);
+        let curator_search = call_rpc(&mut server, 3, "search_notebook", json!({ "topic": "rust" }));
+        let c_pages = curator_search.pointer("/result/structuredContent/pages").and_then(Value::as_array).unwrap();
+        assert_eq!(c_pages.len(), 3);
+        for hit in c_pages {
+            assert!(hit.get("excerpt").is_some());
+            assert!(hit.get("body").is_none(), "curator search_notebook must strip body too");
+        }
+
+        let _ = std::fs::remove_dir_all(store_dir);
+        let _ = std::fs::remove_dir_all(work_dir);
+    }
+
+    #[test]
+    fn mcp_carousel_and_read_library_single_page_roundtrip() {
         let store_dir = temp_dir("store-carousel-md");
         let work_dir = temp_dir("work-carousel-md");
         let shot1 = work_dir.join("a.png");
@@ -1714,37 +801,20 @@ mod tests {
         std::fs::write(&shot2, png).unwrap();
 
         let mut server = Server::new(Some("claude-code".into()), work_dir.clone(), Some(store_dir.clone()));
-
-        let posted = server
-            .handle(&json!({
-                "jsonrpc": "2.0",
-                "id": 1,
-                "method": "tools/call",
-                "params": {
-                    "name": "post_update",
-                    "arguments": {
-                        "project": "Orbit",
-                        "summary": "Done: redesigned onboarding flow and settings drawer.",
-                        "screenshots": [shot1, shot2]
-                    }
-                }
-            }))
-            .unwrap();
+        let posted = call_rpc(
+            &mut server,
+            1,
+            "post_update",
+            json!({
+                "project": "Orbit",
+                "summary": "Done: redesigned onboarding flow and settings drawer.",
+                "media": [shot1, shot2]
+            }),
+        );
         assert_eq!(posted.pointer("/result/isError"), Some(&json!(false)));
-        let media = posted.pointer("/result/structuredContent/update/media").and_then(Value::as_array).unwrap();
-        assert_eq!(media.len(), 2);
+        assert_eq!(posted.pointer("/result/structuredContent/update/media").and_then(Value::as_array).map(Vec::len), Some(2));
 
-        let feed = server
-            .handle(&json!({
-                "jsonrpc": "2.0",
-                "id": 2,
-                "method": "tools/call",
-                "params": {
-                    "name": "get_feed",
-                    "arguments": { "project": "Orbit", "include_screenshots": true }
-                }
-            }))
-            .unwrap();
+        let feed = call_rpc(&mut server, 2, "get_feed", json!({ "project": "Orbit", "include_screenshots": true }));
         let content = feed.pointer("/result/content").and_then(Value::as_array).unwrap();
         assert_eq!(content.len(), 3);
 
@@ -1761,14 +831,7 @@ mod tests {
             .unwrap()
             .id;
 
-        let page = server
-            .handle(&json!({
-                "jsonrpc": "2.0",
-                "id": 4,
-                "method": "tools/call",
-                "params": { "name": "read_page", "arguments": { "id": pid } }
-            }))
-            .unwrap();
+        let page = call_rpc(&mut server, 4, "read_library", json!({ "id": pid }));
         assert_eq!(page.pointer("/result/structuredContent/topic"), Some(&json!("rust")));
         assert!(
             page.pointer("/result/structuredContent/body").and_then(Value::as_str).is_some_and(|b| b.contains("Verify rollback cleanup"))
@@ -1776,43 +839,6 @@ mod tests {
 
         let _ = std::fs::remove_dir_all(store_dir);
         let _ = std::fs::remove_dir_all(work_dir);
-    }
-
-    #[test]
-    fn a_feed_handoff_suggests_only_current_project_and_shared_notes() {
-        use feeder_core::{HUMAN_AUTHOR, OnSimilar, PageDraft, Standing};
-
-        let dir = temp_dir("task-notes");
-        let store = Store::open(&dir).unwrap();
-        let alpha = store.project_named("Alpha", None).unwrap();
-        let beta = store.project_named("Beta", None).unwrap();
-        let page = |title, project_id| {
-            store.create_page(PageDraft::new(title, "Use the signing checklist."), HUMAN_AUTHOR, project_id, OnSimilar::Allow).unwrap()
-        };
-        let local = page("Signing Alpha", Some(alpha.id));
-        let shared = page("Signing checklist", None);
-        page("Signing Beta", Some(beta.id));
-        let archived = page("Signing old builds", Some(alpha.id));
-        store.set_page_standing(archived.id, Standing::Archived).unwrap();
-        let server = Server::new(None, dir.clone(), Some(dir.clone()));
-        let handoff = |project, task| server.call(&json!({ "name": "get_feed", "arguments": { "project": project, "task": task } }));
-        let result = handoff("Alpha", Some("signing"));
-        let notes = result.pointer("/structuredContent/related_notes").unwrap().as_array().unwrap();
-        assert_eq!(notes.len(), 2);
-        for expected in [local.id, shared.id] {
-            assert!(notes.iter().any(|note| note["url"] == format!("feeder://notebook/{expected}")));
-        }
-        assert!(!result.to_string().contains("Signing Beta"));
-        assert!(!result.to_string().contains("Signing old builds"));
-        for query in ["--", "no match"] {
-            assert_eq!(handoff("Alpha", Some(query)).pointer("/structuredContent/related_notes"), Some(&json!([])));
-        }
-        assert!(store.flags(None, 10).unwrap().is_empty(), "suggestions don't file flags");
-        assert!(handoff("Alpha", None).pointer("/structuredContent/related_notes").is_none());
-        assert_eq!(handoff("Unknown", Some("signing")).pointer("/structuredContent/related_notes"), Some(&json!([])));
-        drop(server);
-        drop(store);
-        std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]
@@ -1826,27 +852,34 @@ mod tests {
             .unwrap();
         let mut server = Server::new(Some("Codex".into()), store_dir.clone(), Some(store_dir.clone()));
         let listed = server.handle(&json!({ "id": 1, "method": "tools/list" })).unwrap();
-        let project_tools = tools();
-        let project_tools = project_tools.as_array().unwrap();
-        let names: Vec<_> = listed["result"]["tools"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .filter(|tool| !project_tools.contains(tool))
-            .filter_map(|tool| tool["name"].as_str())
-            .collect();
-        let call = |name, arguments| server.call(&json!({ "name": name, "arguments": arguments }));
+        let names: Vec<_> = listed["result"]["tools"].as_array().unwrap().iter().filter_map(|tool| tool["name"].as_str()).collect();
+        assert_eq!(
+            names,
+            [
+                "list_projects",
+                "get_feed",
+                "search_updates",
+                "post_update",
+                "reply_to_update",
+                "edit_update",
+                "update_project",
+                "delete_item",
+                "search_library",
+                "read_library",
+                "flag_knowledge",
+            ]
+        );
 
-        let read = call("read_page", json!({ "id": page.id }));
-        let helped = call("mark_page_helped", json!({ "id": page.id }));
-        let write = call("write_page", json!({ "id": page.id, "title": page.title, "body": "Overwrite this note." }));
-        let archive = call("archive_page", json!({ "id": page.id }));
+        let read = server.call(&json!({ "name": "read_page", "arguments": { "id": page.id } }));
+        let helped = server.call(&json!({ "name": "mark_page_helped", "arguments": { "id": page.id } }));
+        let write = server
+            .call(&json!({ "name": "write_page", "arguments": { "id": page.id, "title": page.title, "body": "Overwrite this note." } }));
+        let archive = server.call(&json!({ "name": "archive_page", "arguments": { "id": page.id } }));
         let current = store.page(page.id).unwrap().unwrap();
         drop(server);
         drop(store);
         std::fs::remove_dir_all(store_dir).unwrap();
 
-        assert_eq!(names, ["search_notebook", "read_page", "mark_page_helped", "flag_knowledge"]);
         assert_eq!(read.pointer("/structuredContent/body"), Some(&json!(page.body)));
         assert_eq!(helped["isError"], false);
         assert_eq!(current.helped, page.helped + 1);
@@ -1858,29 +891,116 @@ mod tests {
     }
 
     #[test]
+    fn security_hardening_guards_cwd_typos_media_cap_batching_and_db_reload() {
+        let store_dir = temp_dir("store-sec");
+        let non_git_dir = temp_dir("non-git-sec");
+        let store = Store::open(&store_dir).unwrap();
+        let existing = store.project_named("Orbit", None).unwrap();
+        drop(store);
+
+        let mut server = Server::new(Some("codex".into()), non_git_dir.clone(), Some(store_dir.clone()));
+
+        let bogus = call_rpc(&mut server, 1, "post_update", json!({ "summary": "Done: should not create project from non-git cwd." }));
+        assert_eq!(bogus.pointer("/result/isError"), Some(&json!(true)));
+        let err_msg = bogus.pointer("/result/content/0/text").and_then(Value::as_str).unwrap();
+        assert!(err_msg.contains("Orbit"), "error suggests active projects: {err_msg}");
+
+        let typo = call_rpc(&mut server, 2, "post_update", json!({ "project": "Orbit", "summary": "Done: x", "unknown_key": 1 }));
+        assert_eq!(typo.pointer("/result/isError"), Some(&json!(true)));
+        assert!(typo.to_string().contains("unknown field"));
+
+        let bad_type = call_rpc(&mut server, 3, "read_library", json!({ "id": "42" }));
+        assert_eq!(bad_type.pointer("/result/isError"), Some(&json!(true)));
+
+        let ro_guard = call_rpc(&mut server, 4, "get_feed", json!({ "project": "Orbit", "mark_replies_read": true }));
+        assert_eq!(ro_guard.pointer("/result/isError"), Some(&json!(true)));
+        assert!(ro_guard.to_string().contains("strictly read-only"));
+
+        let bad_path =
+            call_rpc(&mut server, 5, "post_update", json!({ "project_path": non_git_dir.join("missing-folder"), "summary": "Done: nope" }));
+        assert_eq!(bad_path.pointer("/result/isError"), Some(&json!(true)));
+
+        let unknown = call_rpc(&mut server, 6, "no_such_tool", json!({}));
+        assert_eq!(unknown.pointer("/error/code"), Some(&json!(-32602)));
+
+        let big1 = non_git_dir.join("big1.png");
+        let big2 = non_git_dir.join("big2.png");
+        let mut big_png = Vec::from(&b"\x89PNG\r\n\x1a\n\x00\x00\x00\x0dIHDR"[..]);
+        big_png.resize(3 * 1024 * 1024, 0u8);
+        std::fs::write(&big1, &big_png).unwrap();
+        std::fs::write(&big2, &big_png).unwrap();
+        let git_proj = temp_dir("git-media-cap");
+        init_git(&git_proj);
+        server.cwd = git_proj.clone();
+        let posted_media = call_rpc(&mut server, 7, "post_update", json!({ "summary": "Done: two large PNGs.", "media": [big1, big2] }));
+        assert_eq!(posted_media.pointer("/result/isError"), Some(&json!(false)));
+        let cap_feed = call_rpc(&mut server, 8, "get_feed", json!({ "include_screenshots": true }));
+        let content_blocks = cap_feed.pointer("/result/content").and_then(Value::as_array).unwrap();
+        assert_eq!(content_blocks.len(), 2, "4 MiB cumulative cap allows first 3 MiB PNG and skips second 3 MiB PNG");
+
+        let init_new = server
+            .handle(&json!({ "jsonrpc": "2.0", "id": 9, "method": "initialize", "params": { "protocolVersion": "2025-11-25" } }))
+            .unwrap();
+        assert_eq!(init_new.pointer("/result/protocolVersion"), Some(&json!("2025-11-25")));
+        assert!(!supports_batching(&server.protocol_version));
+
+        let init_old = server
+            .handle(&json!({ "jsonrpc": "2.0", "id": 10, "method": "initialize", "params": { "protocolVersion": "2025-03-26" } }))
+            .unwrap();
+        assert_eq!(init_old.pointer("/result/protocolVersion"), Some(&json!("2025-03-26")));
+        assert!(supports_batching(&server.protocol_version));
+
+        assert!(call_rpc(&mut server, 11, "list_projects", json!({})).pointer("/result/structuredContent/projects/0").is_some());
+        drop(server.store.borrow_mut().take());
+        let fresh_store_dir = temp_dir("store-sec-replace");
+        let fresh = Store::open(&fresh_store_dir).unwrap();
+        fresh.project_named("ReplacedProject", None).unwrap();
+        drop(fresh);
+        let _ = Store::open(&store_dir).unwrap();
+        let old_handle = server.open_store().is_ok();
+        assert!(old_handle);
+        drop(server.store.borrow_mut().take());
+        let _ = std::fs::remove_dir_all(&store_dir);
+        let _ = std::fs::create_dir_all(&store_dir);
+        let fresh_in_place = Store::open(&store_dir).unwrap();
+        fresh_in_place.project_named("ReopenedProject", None).unwrap();
+        drop(fresh_in_place);
+        let after_replace = call_rpc(&mut server, 12, "list_projects", json!({}));
+        let names_after: Vec<_> = after_replace
+            .pointer("/result/structuredContent/projects")
+            .and_then(Value::as_array)
+            .unwrap()
+            .iter()
+            .filter_map(|p| p["name"].as_str())
+            .collect();
+        assert!(names_after.contains(&"ReopenedProject"));
+        assert!(!names_after.contains(&existing.name.as_str()));
+
+        let _ = std::fs::remove_dir_all(store_dir);
+        let _ = std::fs::remove_dir_all(fresh_store_dir);
+        let _ = std::fs::remove_dir_all(non_git_dir);
+        let _ = std::fs::remove_dir_all(git_proj);
+    }
+
+    #[test]
     fn empty_searches_and_flag_knowledge_file_flags_for_the_gardener() {
         let store_dir = temp_dir("store-flags");
         let work_dir = temp_dir("work-flags");
         let mut server = Server::new(Some("codex".into()), work_dir.clone(), Some(store_dir.clone()));
-        let call = |server: &mut Server, id: i64, name: &str, arguments: Value| {
-            server
-                .handle(&json!({ "jsonrpc": "2.0", "id": id, "method": "tools/call", "params": { "name": name, "arguments": arguments } }))
-                .unwrap()
-        };
 
         for id in 1..=2 {
-            let miss = call(&mut server, id, "search_notebook", json!({ "query": "notarize the dmg" }));
+            let miss = call_rpc(&mut server, id, "search_library", json!({ "query": "notarize the dmg" }));
             let text = miss.pointer("/result/content/0/text").and_then(Value::as_str).unwrap();
             assert!(text.contains("flag_knowledge"), "the empty result asks for a flag: {text}");
         }
-        let flagged = call(
+        let flagged = call_rpc(
             &mut server,
             3,
             "flag_knowledge",
             json!({ "kind": "wrong", "note": "The release page says release.sh is in the root", "suggestion": "It moved to scripts/" }),
         );
         assert_eq!(flagged.pointer("/result/structuredContent/kind"), Some(&json!("wrong")));
-        let no_suggestion = call(&mut server, 4, "flag_knowledge", json!({ "note": "No instructions for rotating the appcast key" }));
+        let no_suggestion = call_rpc(&mut server, 4, "flag_knowledge", json!({ "note": "No instructions for rotating the appcast key" }));
         assert_eq!(no_suggestion.pointer("/result/isError"), Some(&json!(false)));
 
         let store = Store::open(&store_dir).unwrap();
@@ -1889,7 +1009,7 @@ mod tests {
         assert!(!open.iter().any(|f| f.note.contains("notarize the dmg")));
         assert!(open.iter().any(|f| f.suggestion.as_deref() == Some("It moved to scripts/")));
 
-        let refused = call(&mut server, 5, "flag_knowledge", json!({ "note": "no" }));
+        let refused = call_rpc(&mut server, 5, "flag_knowledge", json!({ "note": "no" }));
         assert_eq!(refused.pointer("/result/isError"), Some(&json!(true)));
 
         let _ = std::fs::remove_dir_all(store_dir);
@@ -1903,17 +1023,16 @@ mod tests {
         let mut server = Server::new(Some("claude-code".into()), work_dir.clone(), Some(store_dir.clone()));
         let run = Store::open(&store_dir).unwrap().start_gardener_run(feeder_core::gardener::Backend::ClaudeCode).unwrap();
         server.role = Role::Gardener(run);
-        let call = |server: &mut Server, id: i64, name: &str, arguments: Value| {
-            server
-                .handle(&json!({ "jsonrpc": "2.0", "id": id, "method": "tools/call", "params": { "name": name, "arguments": arguments } }))
-                .unwrap()
-        };
 
         let listed = server.handle(&json!({ "jsonrpc": "2.0", "id": 1, "method": "tools/list" })).unwrap();
-        let names: Vec<&str> =
-            listed.pointer("/result/tools").and_then(Value::as_array).unwrap().iter().filter_map(|t| t["name"].as_str()).collect();
+        let tools = listed.pointer("/result/tools").and_then(Value::as_array).unwrap();
+        let names: Vec<&str> = tools.iter().filter_map(|t| t["name"].as_str()).collect();
         assert_eq!(names, gardener::tool_names(feeder_core::gardener::SessionMode::Review), "only the gardener's tools");
-        let post = call(&mut server, 2, "post_update", json!({ "project": "Alpha", "summary": "Done: x" }));
+        for t in tools {
+            assert_eq!(t.pointer("/annotations/openWorldHint").and_then(Value::as_bool), Some(false));
+        }
+
+        let post = call_rpc(&mut server, 2, "post_update", json!({ "project": "Alpha", "summary": "Done: x" }));
         assert_eq!(post.pointer("/result/isError"), Some(&json!(true)), "feed tools are out of reach");
 
         let flag = {
@@ -1927,14 +1046,14 @@ mod tests {
             };
             store.flag_knowledge(new, "Codex").unwrap().id
         };
-        let unsourced = call(
+        let unsourced = call_rpc(
             &mut server,
             3,
             "write_page",
             json!({ "title": "Release checks", "body": "Run the changelog check.", "reason": "Useful" }),
         );
         assert_eq!(unsourced.pointer("/result/isError"), Some(&json!(true)));
-        let sourced = call(
+        let sourced = call_rpc(
             &mut server,
             4,
             "write_page",
@@ -1959,8 +1078,12 @@ mod tests {
                 )
                 .unwrap()
                 .id;
-            let ok =
-                call(&mut server, n, "write_page", json!({ "title": title, "body": "Do the step.", "reason": "Flagged", "flags": [f] }));
+            let ok = call_rpc(
+                &mut server,
+                n,
+                "write_page",
+                json!({ "title": title, "body": "Do the step.", "reason": "Flagged", "flags": [f] }),
+            );
             assert_eq!(ok.pointer("/result/isError"), Some(&json!(false)), "{ok}");
         }
         let f = store
@@ -1976,11 +1099,15 @@ mod tests {
             )
             .unwrap()
             .id;
-        let over =
-            call(&mut server, 20, "write_page", json!({ "title": "One more page", "body": "Body.", "reason": "Flagged", "flags": [f] }));
+        let over = call_rpc(
+            &mut server,
+            20,
+            "write_page",
+            json!({ "title": "One more page", "body": "Body.", "reason": "Flagged", "flags": [f] }),
+        );
         assert_eq!(over.pointer("/result/isError"), Some(&json!(true)), "the sixth change is refused");
 
-        let missing = call(&mut server, 21, "search_notebook", json!({ "query": "zzz nothing" }));
+        let missing = call_rpc(&mut server, 21, "search_notebook", json!({ "query": "zzz nothing" }));
         assert_eq!(missing.pointer("/result/isError"), Some(&json!(false)));
         assert_eq!(
             store.flags(Some(feeder_core::FlagStatus::Open), 50).unwrap().len(),
@@ -2034,7 +1161,7 @@ mod tests {
             listed.pointer("/result/tools").and_then(Value::as_array).unwrap().iter().filter_map(|tool| tool["name"].as_str()).collect();
         assert_eq!(names, ["search_notebook", "read_page", "list_flags", "read_traces"]);
         let call = |name: &str, arguments: Value| server.call(&json!({ "name": name, "arguments": arguments }));
-        for query in ["deployment", ""] {
+        for query in [json!("deployment"), Value::Null] {
             let result = call("search_notebook", json!({ "query": query }));
             let pages = result.pointer("/structuredContent/pages").unwrap().as_array().unwrap();
             assert_eq!(pages.len(), 2);
@@ -2046,6 +1173,7 @@ mod tests {
         assert_eq!(call("read_page", json!({ "id": other_id }))["isError"], true);
         assert_eq!(call("list_flags", json!({}))["isError"], false);
         assert_eq!(call("read_traces", json!({}))["isError"], false);
+        assert_eq!(call("read_traces", json!({ "project": "Beta" }))["isError"], true);
         for tool in ["write_page", "archive_page", "dismiss_flag"] {
             let result = call(tool, json!({ "id": own_id }));
             assert_eq!(result["isError"], true, "{tool} was not refused");
@@ -2062,6 +1190,7 @@ mod tests {
     #[test]
     fn a_project_gardener_turns_a_thread_correction_into_a_revertible_note() {
         use feeder_core::gardener::{Backend, Scope};
+        use feeder_core::{NewUpdate, Project};
 
         let store_dir = temp_dir("store-thread");
         let work_dir = temp_dir("work-thread");
@@ -2084,23 +1213,22 @@ mod tests {
         let run = store.start_scoped_gardener_run(Backend::Codex, Scope::Project(alpha.id)).expect("start scoped session");
         let mut gardener = Server::new(None, work_dir.clone(), Some(store_dir.clone()));
         gardener.role = Role::Gardener(run);
-        let call = |server: &Server, name: &str, arguments: Value| server.call(&json!({ "name": name, "arguments": arguments }));
+        let call = |name: &str, arguments: Value| gardener.call(&json!({ "name": name, "arguments": arguments }));
 
-        let flags = call(&gardener, "list_flags", json!({}));
+        let flags = call("list_flags", json!({}));
         assert_eq!(flags.pointer("/structuredContent/flags/0/source_update_id"), Some(&json!(update.id)));
         assert!(flags.pointer("/structuredContent/flags/1").is_none());
-        let traces = call(&gardener, "read_traces", json!({}));
+        let traces = call("read_traces", json!({}));
         assert_eq!(traces.pointer("/structuredContent/traces/0/replies/0/body"), Some(&json!(correction)));
         assert!(traces.pointer("/structuredContent/traces/1").is_none());
-        let other_trace = call(&gardener, "read_traces", json!({ "update_id": unrelated.id }));
+        let other_trace = call("read_traces", json!({ "update_id": unrelated.id }));
         assert_eq!(other_trace["isError"], true);
-        let refused = call(&gardener, "dismiss_flag", json!({ "id": other_flag.id, "reason": "Wrong scope" }));
+        let refused = call("dismiss_flag", json!({ "id": other_flag.id, "reason": "Wrong scope" }));
         assert_eq!(refused["isError"], true);
 
         let title = "When to run the appcast check";
         let write = |flags: Vec<i64>, updates: Vec<i64>| {
             call(
-                &gardener,
                 "write_page",
                 json!({
                     "title": title,
@@ -2121,7 +1249,7 @@ mod tests {
         assert_eq!(store.page(page_id).expect("load the page").expect("the page exists").project_id, Some(alpha.id));
 
         let worker = Server::new(Some("claude-code".into()), work_dir.clone(), Some(store_dir.clone()));
-        let lookup = call(&worker, "search_notebook", json!({ "query": "appcast check" }));
+        let lookup = worker.call(&json!({ "name": "search_library", "arguments": { "query": "appcast check" } }));
         assert_eq!(lookup.pointer("/structuredContent/pages/0/title"), Some(&json!(title)));
         assert_eq!(store.changes_from_update(update.id).expect("read linked changes")[0].id, change_id);
         assert_eq!(store.gardener_run_changes(run).expect("read session changes")[0].id, change_id);
@@ -2134,7 +1262,7 @@ mod tests {
         let change = &store.changes_from_update(update.id).expect("retain attribution after Revert")[0];
         assert!(change.is_reverted());
         assert_eq!(change.source_flags, vec![flag.id]);
-        let lookup = call(&worker, "search_notebook", json!({ "query": "appcast check" }));
+        let lookup = worker.call(&json!({ "name": "search_library", "arguments": { "query": "appcast check" } }));
         assert!(lookup.pointer("/structuredContent/pages/0").is_none());
 
         let _ = std::fs::remove_dir_all(store_dir);
@@ -2162,7 +1290,12 @@ mod tests {
                 };
                 let flag = store.flag_knowledge(new, "Codex").unwrap().id;
                 let id = i64::try_from(turn * 2 + n).unwrap();
-                let out = server.handle(&json!({ "jsonrpc": "2.0", "id": id, "method": "tools/call", "params": { "name": "write_page", "arguments": { "title": title, "body": "Do it.", "reason": "Flagged", "flags": [flag] } } })).unwrap();
+                let out = call_rpc(
+                    &mut server,
+                    id,
+                    "write_page",
+                    json!({ "title": title, "body": "Do it.", "reason": "Flagged", "flags": [flag] }),
+                );
                 if out.pointer("/result/isError") == Some(&json!(true)) {
                     refused += 1;
                 }
@@ -2178,29 +1311,34 @@ mod tests {
         let store_dir = temp_dir("store-wave-b");
         let work_dir = temp_dir("work-wave-b");
         std::fs::create_dir_all(&work_dir).unwrap();
-        let init_status =
-            std::process::Command::new("git").args(["init", "-q", "-b", "feature/cwd-branch"]).current_dir(&work_dir).status().unwrap();
-        assert!(init_status.success());
+        init_git(&work_dir);
+        let git_ok = std::process::Command::new("git")
+            .args(["checkout", "-q", "-b", "feature/cwd-branch"])
+            .current_dir(&work_dir)
+            .status()
+            .unwrap()
+            .success();
+        assert!(git_ok);
 
         let shot = work_dir.join("screen.png");
         std::fs::write(&shot, [0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]).unwrap();
 
         let mut server = Server::new(Some("codex".into()), work_dir.clone(), Some(store_dir.clone()));
-        let call = |server: &mut Server, id: i64, name: &str, arguments: Value| {
-            server
-                .handle(&json!({ "jsonrpc": "2.0", "id": id, "method": "tools/call", "params": { "name": name, "arguments": arguments } }))
-                .unwrap()
-        };
 
-        let shared_flag = call(&mut server, 1, "flag_knowledge", json!({ "shared": true, "note": "Keep release scripts reproducible" }));
+        let shared_flag =
+            call_rpc(&mut server, 1, "flag_knowledge", json!({ "shared": true, "note": "Keep release scripts reproducible" }));
         assert_eq!(shared_flag.pointer("/result/isError"), Some(&json!(false)));
         assert_eq!(shared_flag.pointer("/result/structuredContent/project_id"), Some(&Value::Null));
 
-        let conflict =
-            call(&mut server, 2, "flag_knowledge", json!({ "shared": true, "project": "Other", "note": "Should conflict with project" }));
+        let conflict = call_rpc(
+            &mut server,
+            2,
+            "flag_knowledge",
+            json!({ "shared": true, "project": "Other", "note": "Should conflict with project" }),
+        );
         assert_eq!(conflict.pointer("/result/isError"), Some(&json!(true)));
 
-        let posted = call(
+        let posted = call_rpc(
             &mut server,
             3,
             "post_update",
@@ -2216,13 +1354,13 @@ mod tests {
         assert_eq!(posted.pointer("/result/structuredContent/update/media").and_then(Value::as_array).map(Vec::len), Some(1));
         let update_id = posted.pointer("/result/structuredContent/update/id").and_then(Value::as_i64).unwrap();
 
-        let reply_res = call(&mut server, 4, "reply_to_update", json!({ "id": update_id, "summary": "Verified!" }));
+        let reply_res = call_rpc(&mut server, 4, "reply_to_update", json!({ "id": update_id, "summary": "Verified!" }));
         assert_eq!(reply_res.pointer("/result/isError"), Some(&json!(false)));
 
-        let found = call(&mut server, 5, "search_updates", json!({ "query": "clean APIs" }));
+        let found = call_rpc(&mut server, 5, "search_updates", json!({ "query": "clean APIs" }));
         assert_eq!(found.pointer("/result/structuredContent/updates/0/replies/0/body"), Some(&json!("Verified!")));
 
-        let empty_brief = call(&mut server, 6, "set_project_brief", json!({ "project": "UnlinkedRepo" }));
+        let empty_brief = call_rpc(&mut server, 6, "update_project", json!({ "project": "UnlinkedRepo", "brief": "  " }));
         assert_eq!(empty_brief.pointer("/result/isError"), Some(&json!(true)));
 
         let store = Store::open(&store_dir).unwrap();
@@ -2248,7 +1386,7 @@ mod tests {
             .unwrap();
         drop(store);
         server.role = Role::Gardener(run);
-        let wrote = call(
+        let wrote = call_rpc(
             &mut server,
             7,
             "write_page",

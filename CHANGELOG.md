@@ -3,6 +3,14 @@
 What changed in each version of Feeder, newest first. Each section is copied from
 `release-notes/<version>.md` by `scripts/changelog.sh`; edit those files, not this one.
 
+## 0.5.13
+
+- Feeder preserves your custom agent guides and existing command line tools. Uninstall removes the unedited guides and command line links Feeder installed.
+- The optional web companion requires a token when listening outside localhost.
+- Feeder explains what connecting a tool changes and what Curator sends to the model provider. The README covers backup and restore.
+- The welcome screen and empty states make it easier to connect a tool and post your first update.
+- Agents can catch up on unread replies and open tasks, search the Library, and update project briefs and checklists through fewer Feeder tools.
+
 ## 0.5.12
 
 - **A welcome screen for new installs.** Home walks you through connecting your coding tools, copying a prompt for your first update, and turning on Curator.

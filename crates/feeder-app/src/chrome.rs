@@ -6,9 +6,7 @@ use rune::{
     ClipboardImage, Cursor, Drag, El, Icon, Key, KeyEvent, ScrollSpec, SurfaceFit, Transition, Tx, col, el, oklch, row, text, text_input,
 };
 use rune_kit::search::Fold;
-use rune_kit::{
-    Button, ButtonVariant, ControlSize, Kit, Menu, MenuItem, Placement, Preview, SegmentedControl, Switch, Toast, ToastRegion, Toolbar,
-};
+use rune_kit::{Button, ButtonVariant, ControlSize, Kit, Menu, MenuItem, Placement, Preview, SegmentedControl, Switch, Toast, Toolbar};
 
 use crate::connect::{CliStatus, Link, ToolAction};
 use crate::style::{self, Palette};
@@ -956,12 +954,18 @@ pub fn palette(s: &State, p: &Palette, _k: &Kit) -> Option<El> {
     )
 }
 
-pub fn toasts(s: &State, k: &Kit) -> Option<El> {
+pub fn toasts(s: &State, p: &Palette, k: &Kit) -> Option<El> {
     let entries = s.toasts.entries();
     if entries.is_empty() {
         return None;
     }
-    let mut region = ToastRegion::new();
+    let mut toast_kit = k.clone();
+    toast_kit.c.layer_01 = p.card;
+    toast_kit.elevation.floating = vec![
+        rune::Shadow { y: 2.0, blur: 10.0, color: oklch(0.0, 0.0, 0.0).alpha(if p.dark { 0.24 } else { 0.06 }), ..rune::Shadow::default() },
+        rune::Shadow { spread: 0.5, color: p.hairline, ..rune::Shadow::default() },
+    ];
+    let mut items = Vec::new();
     for entry in entries.iter().rev().take(3).rev() {
         let tid = entry.id;
         let mut t = Toast::new(format!("toast-{tid}"), entry.options.title.clone());
@@ -970,13 +974,13 @@ pub fn toasts(s: &State, k: &Kit) -> Option<El> {
         }
         match entry.options.kind {
             ToastKind::UndoArchive { project_id, was_archived } => {
-                t = t.icon(k, k.glyph.check).action(k, "Undo", true, move |s: &mut State, _tx: &mut Tx| {
+                t = t.icon(&toast_kit, toast_kit.glyph.check).action(&toast_kit, "Undo", true, move |s: &mut State, _tx: &mut Tx| {
                     s.dismiss_toast(tid);
                     s.set_archived_inner(project_id, was_archived, false);
                 });
             }
             ToastKind::UndoNoteArchive { page_id, was_archived } => {
-                t = t.icon(k, k.glyph.check).action(k, "Undo", true, move |s: &mut State, _tx: &mut Tx| {
+                t = t.icon(&toast_kit, toast_kit.glyph.check).action(&toast_kit, "Undo", true, move |s: &mut State, _tx: &mut Tx| {
                     s.dismiss_toast(tid);
                     let standing = if was_archived { Standing::Archived } else { Standing::Current };
                     if let Some(page) = s.notebook.pages.iter_mut().find(|p| p.id == page_id) {
@@ -990,28 +994,32 @@ pub fn toasts(s: &State, k: &Kit) -> Option<El> {
                 });
             }
             ToastKind::UndoDismiss { update_id } => {
-                t = t.icon(k, k.glyph.check).action(k, "Undo", true, move |s: &mut State, _tx: &mut Tx| {
+                t = t.icon(&toast_kit, toast_kit.glyph.check).action(&toast_kit, "Undo", true, move |s: &mut State, _tx: &mut Tx| {
                     s.dismiss_toast(tid);
                     s.undismiss_attention(update_id);
                 });
             }
             ToastKind::Flagged { project_id } => {
-                t = t.icon(k, k.glyph.check).action(k, "Review", true, move |s: &mut State, tx: &mut Tx| {
+                t = t.icon(&toast_kit, toast_kit.glyph.check).action(&toast_kit, "Review", true, move |s: &mut State, tx: &mut Tx| {
                     s.dismiss_toast(tid);
                     s.open_flag_review(project_id, tx);
                 });
             }
             ToastKind::Error => {
-                t = t.icon(k, k.glyph.circle_x);
+                t = t.icon(&toast_kit, toast_kit.glyph.circle_x);
             }
             ToastKind::Info => {
-                t = t.icon(k, k.glyph.check);
+                t = t.icon(&toast_kit, toast_kit.glyph.check);
             }
         }
         t = t.on_close(move |s: &mut State| s.dismiss_toast(tid));
-        region = region.toast(t.build(k));
+        items.push(t.build(&toast_kit).radius(12.0));
     }
-    Some(region.build(k))
+    #[cfg(feeder_sparkle)]
+    let bottom = if s.updates.is_visible() { 52.0 } else { 16.0 };
+    #[cfg(not(feeder_sparkle))]
+    let bottom = 16.0;
+    Some(col().key("toast-region").role("region").label("Notifications").pin(None, None, Some(16.0), Some(bottom)).gap(8.0).children(items))
 }
 
 pub fn delete_confirm(s: &State, p: &Palette, k: &Kit) -> Option<El> {
@@ -1160,7 +1168,7 @@ pub fn settings(s: &State, p: &Palette, k: &Kit, layer: &mut Vec<El>) {
             .child(curator_settings::header(
                 p,
                 "Connected Tools",
-                "Tools connected here can post updates to Feeder and read the Library. This doesn’t give Curator your subscription.",
+                "Connect adds Feeder to the tool’s settings. Connected tools can read and change your Feed and Library.",
             ))
             .child(agents_section(s, p, k))
             .child(cli_section(s, p, k)),
@@ -1422,9 +1430,10 @@ fn uninstall_section(s: &State, p: &Palette, k: &Kit) -> El {
     let note = |t: &str| text(t.to_string()).font(style::META).color(p.text_3).wrap();
     let any_connected = s.agents.rows.iter().flatten().any(|(_, l)| matches!(l, Link::Connected | Link::Outdated | Link::Disconnecting));
     let any_failed = s.agents.rows.iter().flatten().any(|(_, l)| matches!(l, Link::Failed { .. }));
-    let mut rows = vec![note(
-        "Removing Feeder from your tools deletes its MCP server and skills from their settings. Each file keeps a .feeder-backup copy.",
-    )];
+    let mut rows = vec![note("This removes Feeder’s connection, its unedited managed skills, and the command line link it installed.")];
+    if let CliStatus::Failed(reason) = &s.agents.cli {
+        rows.push(note(&format!("Command line tool: {reason}")));
+    }
     if s.agents.uninstalled && !any_connected && !any_failed {
         rows.push(note("Feeder is out of your tools. Quit Feeder and move it to the Trash. To delete your projects and library too, delete the data folder above."));
     } else {

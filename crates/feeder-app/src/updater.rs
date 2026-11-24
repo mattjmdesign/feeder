@@ -1,10 +1,8 @@
 use std::ffi::{CStr, c_char};
 use std::sync::OnceLock;
 
-use rune::{El, Icon, ScrollSpec, Waker, col, row, text};
-use rune_kit::{
-    Button, ButtonVariant, ControlSize, IconButton, IconButtonVariant, Kit, Markdown, Progress, ProgressCircle, popover::raised, scrim,
-};
+use rune::{El, Icon, ScrollSpec, Waker, col, oklch, row, text};
+use rune_kit::{Button, ButtonVariant, ControlSize, IconButton, IconButtonVariant, Kit, Markdown, Progress, ProgressCircle, scrim};
 
 use crate::{State, ToastItem, ToastKind, feed, style};
 
@@ -118,10 +116,33 @@ struct Snapshot {
 pub struct Updates {
     snapshot: Snapshot,
     requested: bool,
+    preview: bool,
     pub open: bool,
 }
 
+impl Updates {
+    pub fn is_visible(&self) -> bool {
+        self.snapshot.phase.status().is_some()
+    }
+
+    pub fn demo_available(&mut self) {
+        self.preview = true;
+        self.snapshot = Snapshot {
+            phase: Phase::Available,
+            progress: None,
+            version: "0.5.13".into(),
+            notes: "## What's new\n\n- Cleaner onboarding steps and quieter update notices.".into(),
+            message: String::new(),
+            can_advance: true,
+        };
+        self.open = true;
+    }
+}
+
 pub fn poll(s: &mut State) -> bool {
+    if s.updates.preview {
+        return false;
+    }
     let (native, [version, notes, message]) = native_snapshot();
     let phase = Phase::try_from(native.phase).unwrap_or(Phase::Idle);
     let snapshot = Snapshot {
@@ -196,7 +217,7 @@ pub fn view(s: &State, p: &style::Palette, k: &Kit, layer: &mut Vec<El>) {
     }
     .key("feeder-update-button")
     .expanded(s.updates.open);
-    let dock = col().key("feeder-updates").pin(None, None, Some(18.0), Some(16.0)).items_end().gap(8.0);
+    let dock = col().key("feeder-updates").pin(None, None, Some(16.0), Some(16.0)).items_end().gap(8.0);
     if !s.updates.open {
         layer.push(dock.child(trigger));
         return;
@@ -219,9 +240,9 @@ pub fn view(s: &State, p: &style::Palette, k: &Kit, layer: &mut Vec<El>) {
         .role("dialog")
         .label(title)
         .focus_return("feeder-update-button")
-        .w(304.0)
-        .padding(12.0)
-        .gap(10.0)
+        .w(320.0)
+        .padding(16.0)
+        .gap(12.0)
         .child(header);
     if !update.notes.is_empty() && matches!(update.phase, Phase::Available | Phase::Ready) {
         content = content.child(
@@ -254,6 +275,11 @@ pub fn view(s: &State, p: &style::Palette, k: &Kit, layer: &mut Vec<El>) {
                 .child(Button::new(label).variant(ButtonVariant::Contrast).on_press(|_: &mut State| advance()).build(k)),
         );
     }
+    let card = content.radius(12.0).fill(p.card).border(1.0, p.hairline).shadow(
+        4.0,
+        14.0,
+        oklch(0.0, 0.0, 0.0).alpha(if p.dark { 0.24 } else { 0.06 }),
+    );
     layer.push(scrim("feeder-update-dismiss", |s: &mut State| s.updates.open = false));
-    layer.push(dock.child(raised(k, content, k.radius.lg)).child(trigger));
+    layer.push(dock.child(card).child(trigger));
 }

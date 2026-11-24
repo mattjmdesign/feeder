@@ -13,6 +13,7 @@ const MAX_VIDEO_BYTES: u64 = 50 * 1024 * 1024;
 const MAX_BRIEF_CHARS: usize = 600;
 const MAX_REPLY_CHARS: usize = 900;
 pub const MAX_TODO_CHARS: usize = 240;
+pub const MAX_PULSE_CHARS: usize = 120;
 pub const MAX_MEDIA_PER_UPDATE: usize = 8;
 const IMAGE_TYPES: [&str; 5] = ["png", "jpg", "jpeg", "webp", "gif"];
 const VIDEO_TYPES: [&str; 4] = ["mp4", "mov", "webm", "m4v"];
@@ -984,6 +985,13 @@ impl Store {
         Ok(())
     }
 
+    pub fn mark_update_replies_read(&self, update_id: i64) -> Result<usize> {
+        Ok(self.conn.execute(
+            "UPDATE replies SET read_at = ?1 WHERE update_id = ?2 AND from_human = 1 AND read_at IS NULL",
+            params![now_ms(), update_id],
+        )?)
+    }
+
     pub fn set_pulse(&self, project_id: i64, agent: &str, branch: Option<&str>, status: &str, ttl_ms: i64) -> Result<Pulse> {
         if self.project(project_id)?.is_none() {
             return Err(Error::NotFound(format!("no project {project_id}")));
@@ -992,6 +1000,11 @@ impl Store {
         let agent = if agent.is_empty() { "Agent" } else { agent };
         let status = status.trim();
         let status = if status.is_empty() { "Working" } else { status };
+        let chars = status.chars().count();
+        if chars > MAX_PULSE_CHARS {
+            return Err(Error::Invalid(format!("pulse status is {chars} characters; keep it to {MAX_PULSE_CHARS} or fewer")));
+        }
+        reject_secret(status)?;
         let branch = branch.map(str::trim).filter(|b| !b.is_empty()).map(str::to_string);
         let updated_at = now_ms();
         let expires_at = updated_at + ttl_ms.clamp(5_000, 3_600_000);
@@ -1197,21 +1210,65 @@ impl Store {
             })?;
         let is_video = VIDEO_TYPES.contains(&ext.as_str());
         let max_bytes = if is_video { MAX_VIDEO_BYTES } else { MAX_IMAGE_BYTES };
-        let meta = std::fs::symlink_metadata(src).map_err(|e| Error::Invalid(format!("can't read media {}: {e}", src.display())))?;
-        if meta.file_type().is_symlink() {
-            return Err(Error::Invalid(format!("{} is a symlink; pass a regular media file", src.display())));
+        let mut open_src = std::fs::OpenOptions::new();
+        open_src.read(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            open_src.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
         }
+        let mut src_file = match open_src.open(src) {
+            Ok(f) => f,
+            Err(e) => {
+                #[cfg(unix)]
+                if e.raw_os_error() == Some(libc::ELOOP) {
+                    return Err(Error::Invalid(format!("{} is a symlink; pass a regular media file", src.display())));
+                }
+                return Err(Error::Invalid(format!("can't read media {}: {e}", src.display())));
+            }
+        };
+        let meta = src_file.metadata().map_err(|e| Error::Invalid(format!("can't read media {}: {e}", src.display())))?;
         if !meta.is_file() {
             return Err(Error::Invalid(format!("{} is not a file", src.display())));
         }
         if meta.len() > max_bytes {
             return Err(Error::Invalid(format!("media must be under {} MB", max_bytes / 1024 / 1024)));
         }
-        if !matches_media_magic(src, &ext) {
+        let mut head = [0u8; 16];
+        let mut read_head = 0usize;
+        while read_head < head.len() {
+            let n =
+                src_file.read(&mut head[read_head..]).map_err(|e| Error::Invalid(format!("can't read media {}: {e}", src.display())))?;
+            if n == 0 {
+                break;
+            }
+            read_head += n;
+        }
+        if !matches_media_magic_bytes(&head[..read_head], &ext) {
             return Err(Error::Invalid(format!("{} does not look like a valid .{ext} file", src.display())));
         }
+        src_file.seek(SeekFrom::Start(0))?;
         let rel = format!("media/{}-{}-{:08x}.{ext}", project.slug, created_at, fastrand::u32(..));
-        std::fs::copy(src, self.dir.join(&rel))?;
+        let dest = self.dir.join(&rel);
+        let mut open_dst = std::fs::OpenOptions::new();
+        open_dst.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            open_dst.mode(0o600);
+        }
+        let mut dst_file = open_dst.open(&dest)?;
+        let copied = match std::io::copy(&mut src_file.by_ref().take(max_bytes + 1), &mut dst_file) {
+            Ok(bytes) => bytes,
+            Err(e) => {
+                let _ = std::fs::remove_file(&dest);
+                return Err(e.into());
+            }
+        };
+        if copied > max_bytes {
+            let _ = std::fs::remove_file(&dest);
+            return Err(Error::Invalid(format!("media must be under {} MB", max_bytes / 1024 / 1024)));
+        }
         Ok(rel)
     }
 
@@ -1227,10 +1284,8 @@ fn reject_secret(text: &str) -> Result<()> {
     Ok(())
 }
 
-fn matches_media_magic(path: &Path, ext: &str) -> bool {
-    let Ok(mut f) = File::open(path) else { return false };
-    let mut head = [0u8; 16];
-    let Ok(n) = f.read(&mut head) else { return false };
+fn matches_media_magic_bytes(head: &[u8], ext: &str) -> bool {
+    let n = head.len();
     match ext {
         "png" => n >= 8 && &head[0..8] == b"\x89PNG\r\n\x1a\n",
         "jpg" | "jpeg" => n >= 3 && head[0..3] == [0xff, 0xd8, 0xff],
@@ -1473,6 +1528,7 @@ fn normalize_todo_title(raw: &str) -> Result<String> {
     if chars > MAX_TODO_CHARS {
         return Err(Error::Invalid(format!("to-do is {chars} characters; keep it to {MAX_TODO_CHARS} or fewer")));
     }
+    reject_secret(&cleaned)?;
     Ok(cleaned)
 }
 
@@ -2002,6 +2058,47 @@ mod tests {
 
         s.delete_update(posted.id).unwrap();
         assert!(stored_paths.iter().all(|path| !path.exists()));
+
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn pulse_and_todo_reject_secrets_and_mark_update_replies_read_is_scoped() {
+        let (s, dir) = temp_store("hardening");
+        let p = s.project_named("Shield", None).unwrap();
+        let secret = "sk-abcdefghijklmnopqrstuvwxyz123456";
+        assert!(s.set_pulse(p.id, "Codex", None, &format!("Using {secret}"), 60_000).is_err());
+        assert!(s.set_pulse(p.id, "Codex", None, &"x".repeat(MAX_PULSE_CHARS + 1), 60_000).is_err());
+        assert!(s.add_todo(p.id, &format!("Rotate {secret}")).is_err());
+
+        let u1 = s.post(p.id, note("Done: first update.")).unwrap();
+        let u2 = s.post(p.id, note("Done: second update.")).unwrap();
+        let _r1 = s.add_reply(u1.id, "You", true, "Question on first").unwrap();
+        let r2 = s.add_reply(u2.id, "You", true, "Question on second").unwrap();
+        assert_eq!(s.mark_update_replies_read(u1.id).unwrap(), 1);
+        let remaining = s.unread_human_replies(Some(p.id)).unwrap();
+        assert_eq!(remaining.len(), 1);
+        assert_eq!(remaining[0].id, r2.id);
+
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn copied_media_sets_private_permissions() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let (s, dir) = temp_store("media-perms");
+        let p = s.project_named("MediaPerms", None).unwrap();
+        let src = dir.join("shot.png");
+        let mut png = Vec::from(&b"\x89PNG\r\n\x1a\n\x00\x00\x00\x0dIHDR"[..]);
+        png.extend_from_slice(&100u32.to_be_bytes());
+        png.extend_from_slice(&100u32.to_be_bytes());
+        std::fs::write(&src, &png).unwrap();
+
+        let posted = s.post(p.id, NewUpdate { screenshot: Some(src), ..note("Done: stored privately.") }).unwrap();
+        let mode = std::fs::metadata(&posted.media[0].path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600);
 
         std::fs::remove_dir_all(dir).ok();
     }

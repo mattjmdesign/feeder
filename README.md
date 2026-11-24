@@ -24,6 +24,9 @@ so it opens instantly and stays small. Your Feed and Library are stored on your 
 
 Supported tools: Claude Code, Claude Desktop, Codex, Cursor, Antigravity, T3 Code and OpenCode.
 For any other tool, **Copy Config** gives you a snippet to paste into its MCP settings.
+Connect adds Feeder to the tool's settings and installs Feeder's agent guides. Connected tools
+can read and change your Feed and Library. Feeder keeps the first copy of settings files it
+edits directly as a `.feeder-backup` file beside the original.
 
 Feeder checks for new versions and offers to install them. [CHANGELOG.md](CHANGELOG.md) lists
 what changed in each one.
@@ -52,8 +55,8 @@ In the app:
 
 The **Feed** records what happened. The **Library** keeps what you'll want to know next time.
 If an update or its replies explain a reusable fix or decision, choose **Flag for Library**.
-Working agents can search and read the Library (`search_notebook`, `read_page`), record when a
-page helped (`mark_page_helped`), and report gaps (`flag_knowledge`). They can include a verified
+Working agents can search and read the Library (`search_library`, `read_library`), record helpful notes
+via `helped_notes` on `post_update`, and report gaps (`flag_knowledge`). They can include a verified
 fix as a `suggestion` for Curator to review. You can edit notes directly in the Library.
 
 When an agent starts or resumes work, it can pass task keywords to `get_feed` to get up to three
@@ -63,7 +66,7 @@ shared Library. Project notes keep their project scope regardless of category.
 
 Open **Curator** (⌘4, or click its orb in the top-right corner) to ask a question from saved notes or review those flags:
 
-- **Ask** searches the Library and links to the pages it used. It can't edit notes or read Feed threads.
+- **Ask** searches the Library and reads relevant Feed updates and open flags without editing anything.
 - **Review Open Flags** reads flags and relevant Feed replies. It uses that evidence to propose new
   or updated notes, citing the updates they came from. Press **Apply** to save a proposal to the
   Library or **Dismiss** to skip it. Curator checks for an existing note first and leaves gaps open
@@ -106,11 +109,26 @@ Mac. Feeder has no account and collects no telemetry. It checks for new versions
 hour. When you start Curator, the messages you send and the sources it reads go to the model
 provider used by the selected CLI, under that account's terms.
 
+### Optional web companion
+
+`feeder serve` listens on localhost by default. For remote access, keep it on localhost
+behind an HTTPS proxy and set a strong `--token`. A non-loopback bind requires a token.
+Use HTTPS for the browser connection so the token and your project data stay encrypted in transit.
+
+## Backup and restore
+
+1. Quit Feeder and stop any connected agents or web companion using its data.
+2. Copy the entire `~/Library/Application Support/feeder` folder to your backup location. Keep the database and attachments together.
+3. To restore, quit those same tools, move the current data folder aside, and put the backed-up folder in its place. Open Feeder and check your Feed and Library before discarding the old folder.
+
 ## Uninstall
 
 1. In Feeder, open **Settings → Storage** and choose **Remove Feeder from All Tools**.
 2. Quit Feeder and move it to the Trash.
 3. To delete your updates too, delete `~/Library/Application Support/feeder`.
+
+Uninstall removes links and unedited guides recorded by Feeder. On older installs you may also
+have a CLI link or agent guide that you can remove manually after checking its location.
 
 ## Contributing
 

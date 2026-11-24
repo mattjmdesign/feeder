@@ -611,7 +611,14 @@ fn intro(s: &State, p: &Palette, k: &Kit) -> El {
         .gap(4.0)
         .max_w(440.0)
         .child(text("Ask about anything across your Library and Feed.").font(style::BODY).color(p.text_2).align(rune::Align::Center))
-        .child(text(sub).font(style::BODY).color(p.text_3).wrap().align(rune::Align::Center));
+        .child(text(sub).font(style::BODY).color(p.text_3).wrap().align(rune::Align::Center))
+        .child(
+            text("Curator sends your message and the sources it reads to the selected model provider.")
+                .font(style::META)
+                .color(p.text_2)
+                .wrap()
+                .align(rune::Align::Center),
+        );
     let mut actions = row().gap(8.0).center_y();
     let mut has_actions = false;
     if n > 0 {

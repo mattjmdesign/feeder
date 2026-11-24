@@ -310,7 +310,31 @@ pub(crate) fn page_json_with(p: &Page, project: Option<&str>) -> Value {
     })
 }
 
+pub(crate) fn page_summary_json_with(p: &Page, project: Option<&str>) -> Value {
+    json!({
+        "id": p.id,
+        "kind": p.kind.as_str(),
+        "topic": p.topic,
+        "topic_label": p.topic_label(),
+        "title": p.title,
+        "tags": p.tags,
+        "excerpt": p.excerpt(160),
+        "project": project,
+        "agent": p.agent,
+        "revision": p.revision,
+        "helped": p.helped,
+        "archived": p.is_archived(),
+        "created_at": p.created_at,
+        "updated_at": p.updated_at,
+    })
+}
+
 pub(crate) fn pages_json(store: &Store, pages: &[Page]) -> Result<Vec<Value>, String> {
     let projects = store.project_names().map_err(|e| e.to_string())?;
     Ok(pages.iter().map(|p| page_json_with(p, p.project_id.and_then(|id| projects.get(&id).map(String::as_str)))).collect())
+}
+
+pub(crate) fn page_summaries_json(store: &Store, pages: &[Page]) -> Result<Vec<Value>, String> {
+    let projects = store.project_names().map_err(|e| e.to_string())?;
+    Ok(pages.iter().map(|p| page_summary_json_with(p, p.project_id.and_then(|id| projects.get(&id).map(String::as_str)))).collect())
 }

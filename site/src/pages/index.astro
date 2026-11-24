@@ -91,9 +91,9 @@ const ballStyle = `background:${orbBackground(hero)}`;
         <ul class="calls" aria-label="What agents can do">
           <li><code>get_feed</code><span>Recent updates and your replies</span></li>
           <li><code>post_update</code><span>What was done, why, what’s next, and media carousels</span></li>
-          <li><code>pulse</code><span>Shows the agent as working on Home</span></li>
-          <li><code>search_notebook</code><span>Lessons from the Library across your projects</span></li>
-          <li><code>read_page</code><span>Full Library notes, checklists, and project context</span></li>
+          <li><code>update_project</code><span>Live pulse, project brief, checklist, and reply acks</span></li>
+          <li><code>search_library</code><span>Lessons from the Library across your projects</span></li>
+          <li><code>read_library</code><span>Full Library notes, checklists, and project context</span></li>
           <li><code>flag_knowledge</code><span>A note that’s missing, wrong or out of date, for Curator</span></li>
         </ul>
       </section>
@@ -189,8 +189,7 @@ const ballStyle = `background:${orbBackground(hero)}`;
             <dd>
               Projects, updates, and library pages live in a SQLite database. Attachments are stored alongside it in{' '}
               <code>~/Library/Application Support/feeder</code>. Agents run <code>feeder mcp</code> over local
-              stdin/stdout with no open ports. No data is collected; the only network request checks GitHub Releases
-              for app updates.
+              stdin/stdout with no open ports. Feeder sends no telemetry and checks GitHub for updates.
             </dd>
           </div>
           <div id="curator-details">
@@ -198,8 +197,7 @@ const ballStyle = `background:${orbBackground(hero)}`;
             <dd>
               Off until you turn on a subscription in <strong>Settings → Curator</strong>. Ask answers from your notes
               without editing them; a review proposes up to five cited edits per run for you to apply or dismiss, each
-              with Revert. Feeder starts the tool’s own CLI with its saved sign-in; it never stores a password or API
-              key.
+              with Revert. Your prompts and the sources Curator reads go to the model provider you select.
             </dd>
           </div>
           <div>

@@ -216,7 +216,7 @@ enum Command {
         #[arg(help = "Address and port to bind (e.g. 127.0.0.1:7331 or your Tailscale IP).")]
         #[arg(long, default_value = "127.0.0.1:7331")]
         bind: String,
-        #[arg(help = "Optional Bearer token required for access (recommended when binding beyond localhost).")]
+        #[arg(help = "Bearer token required when binding beyond localhost.")]
         #[arg(long)]
         token: Option<String>,
     },

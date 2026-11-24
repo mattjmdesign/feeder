@@ -25,11 +25,10 @@ pub fn serve(bind: &str, token: Option<&str>) -> Result<(), String> {
     let listener = TcpListener::bind(bind).map_err(|e| format!("failed to bind {bind}: {e}"))?;
     let addr = listener.local_addr().map_err(|e| e.to_string())?;
     let loopback = addr.ip().is_loopback();
+    require_remote_auth(addr.ip(), token)?;
     eprintln!("Feeder companion listening on http://{addr}");
     if token.is_some() {
         eprintln!("Auth: Bearer token required (or open /?token=...)");
-    } else if !loopback {
-        eprintln!("Warning: bound to non-loopback address without --token");
     }
     let token = token.map(str::to_string);
     let active = Arc::new(AtomicUsize::new(0));
@@ -47,6 +46,13 @@ pub fn serve(bind: &str, token: Option<&str>) -> Result<(), String> {
             let _guard = ConnGuard(counter);
             let _ = handle_connection(stream, tok.as_deref(), loopback);
         });
+    }
+    Ok(())
+}
+
+fn require_remote_auth(ip: std::net::IpAddr, token: Option<&str>) -> Result<(), String> {
+    if !ip.is_loopback() && token.is_none() {
+        return Err("A non-loopback address requires --token. Use localhost behind an HTTPS proxy for remote access.".into());
     }
     Ok(())
 }
@@ -1150,6 +1156,18 @@ setInterval(() => load(true), 30000);
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn companion_requires_auth_when_listening_beyond_loopback() {
+        for ip in ["127.0.0.1", "::1"] {
+            assert!(require_remote_auth(ip.parse().unwrap(), None).is_ok());
+        }
+        for ip in ["0.0.0.0", "::", "192.0.2.5"] {
+            let ip = ip.parse().unwrap();
+            assert!(require_remote_auth(ip, None).is_err());
+            assert!(require_remote_auth(ip, Some("test-only")).is_ok());
+        }
+    }
 
     #[test]
     fn percent_decoding_and_auth_check_work() {

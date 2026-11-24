@@ -480,23 +480,61 @@ pub fn install_cli_link(bin: &Path) -> std::io::Result<(PathBuf, bool)> {
     push_unique_dirs(&mut path_dirs, env_path_dirs());
     push_unique_dirs(&mut path_dirs, probed_shell_paths());
     push_unique_dirs(&mut path_dirs, etc_paths_dirs());
-    let preferred =
-        [home().join(".local/bin"), home().join(".cargo/bin"), PathBuf::from("/opt/homebrew/bin"), PathBuf::from("/usr/local/bin")];
-    let target_dir = preferred
+    let target_dir = cli_link_dirs()
         .iter()
         .find(|dir| dir_in_paths(&path_dirs, dir) && dir_writable(dir))
         .cloned()
         .unwrap_or_else(|| home().join(".local/bin"));
-    std::fs::create_dir_all(&target_dir)?;
-    let link = target_dir.join("feeder");
-    let tmp = target_dir.join(format!(".feeder-link-{}-{:08x}", std::process::id(), fastrand::u32(..)));
-    std::os::unix::fs::symlink(bin, &tmp)?;
-    if let Err(e) = std::fs::rename(&tmp, &link) {
-        let _ = std::fs::remove_file(&tmp);
-        return Err(e);
+    let link = install_cli_link_in(&target_dir, bin)?;
+    Ok((link, dir_in_paths(&path_dirs, &target_dir)))
+}
+
+fn cli_link_dirs() -> [PathBuf; 4] {
+    [home().join(".local/bin"), home().join(".cargo/bin"), PathBuf::from("/opt/homebrew/bin"), PathBuf::from("/usr/local/bin")]
+}
+
+fn install_cli_link_in(dir: &Path, bin: &Path) -> std::io::Result<PathBuf> {
+    std::fs::create_dir_all(dir)?;
+    let link = dir.join("feeder");
+    let bin = std::path::absolute(bin)?;
+    match std::os::unix::fs::symlink(&bin, &link) {
+        Ok(()) => {
+            let receipt = dir.join(".feeder-cli-link");
+            let expected = bin.as_os_str().as_encoded_bytes();
+            if let Err(error) = write_private_new(&receipt, expected)
+                && !read_regular_file(&receipt).is_some_and(|previous| previous == expected)
+            {
+                if std::fs::read_link(&link).is_ok_and(|target| target == bin) {
+                    let _ = std::fs::remove_file(&link);
+                }
+                return Err(error);
+            }
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+            if !std::fs::read_link(&link).is_ok_and(|target| target == bin) {
+                return Err(std::io::Error::new(e.kind(), format!("A command already exists at {}.", link.display())));
+            }
+        }
+        Err(e) => return Err(e),
     }
-    let on_path = dir_in_paths(&path_dirs, &target_dir);
-    Ok((link, on_path))
+    Ok(link)
+}
+
+pub fn remove_cli_links() -> std::io::Result<()> {
+    for dir in cli_link_dirs() {
+        remove_cli_link_in(&dir)?;
+    }
+    Ok(())
+}
+
+fn remove_cli_link_in(dir: &Path) -> std::io::Result<()> {
+    let receipt = dir.join(".feeder-cli-link");
+    let Some(installed) = read_regular_file(&receipt) else { return Ok(()) };
+    let link = dir.join("feeder");
+    if std::fs::read_link(&link).is_ok_and(|target| target.as_os_str().as_encoded_bytes() == installed) {
+        std::fs::remove_file(&link)?;
+    }
+    std::fs::remove_file(receipt)
 }
 
 fn dir_writable(dir: &Path) -> bool {
@@ -782,7 +820,6 @@ fn remove_toml_table(text: &str, name: &str) -> Option<String> {
 }
 
 fn write_with_backup(path: &Path, contents: &str) -> std::io::Result<()> {
-    use std::io::Write;
     let target = if path.is_symlink() { std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf()) } else { path.to_path_buf() };
     if let Some(dir) = target.parent() {
         std::fs::create_dir_all(dir)?;
@@ -792,24 +829,12 @@ fn write_with_backup(path: &Path, contents: &str) -> std::io::Result<()> {
         let existing = std::fs::read(&target)?;
         write_private_new(&backup, &existing)?;
     }
-    let tmp = PathBuf::from(format!("{}.feeder-tmp-{}-{:08x}", target.display(), std::process::id(), fastrand::u32(..)));
-    let write_res = (|| -> std::io::Result<()> {
-        let mut opts = std::fs::OpenOptions::new();
-        opts.write(true).create_new(true);
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::OpenOptionsExt;
-            opts.mode(0o600);
-        }
-        let mut file = opts.open(&tmp)?;
-        file.write_all(contents.as_bytes())?;
-        file.sync_all()
-    })();
-    if let Err(e) = write_res {
-        let _ = std::fs::remove_file(&tmp);
-        return Err(e);
-    }
-    std::fs::rename(&tmp, &target).inspect_err(|_| {
+    replace_private_file(&target, contents.as_bytes())
+}
+
+fn replace_private_file(target: &Path, contents: &[u8]) -> std::io::Result<()> {
+    let tmp = target.with_file_name(format!(".feeder-tmp-{}-{:08x}", std::process::id(), fastrand::u32(..)));
+    write_private_new(&tmp, contents).and_then(|()| std::fs::rename(&tmp, target)).inspect_err(|_| {
         let _ = std::fs::remove_file(&tmp);
     })
 }
@@ -828,35 +853,72 @@ fn write_private_new(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
     file.sync_all()
 }
 
+fn skill_bodies() -> [(&'static str, String); 2] {
+    [("feeder-update", crate::skill_markdown()), ("feeder-notebook", crate::notebook_skill_markdown())]
+}
+
+fn read_regular_file(path: &Path) -> Option<Vec<u8>> {
+    std::fs::symlink_metadata(path).ok()?.is_file().then(|| std::fs::read(path).ok()).flatten()
+}
+
+fn sync_managed_skill(dir: &Path, body: &[u8]) -> Option<()> {
+    if !std::fs::symlink_metadata(dir).ok()?.is_dir() {
+        return None;
+    }
+    let file = dir.join("SKILL.md");
+    let receipt = dir.join(".feeder-installed");
+    let installed = read_regular_file(&receipt)?;
+    if installed == body || read_regular_file(&file)? != installed {
+        return None;
+    }
+    replace_private_file(&file, body).ok()?;
+    replace_private_file(&receipt, body).ok()
+}
+
+fn install_managed_skill(dir: &Path, body: &[u8]) -> Option<()> {
+    std::fs::create_dir_all(dir).ok()?;
+    if !std::fs::symlink_metadata(dir).ok()?.is_dir() {
+        return None;
+    }
+    let receipt = dir.join(".feeder-installed");
+    if std::fs::symlink_metadata(&receipt).is_ok() {
+        return sync_managed_skill(dir, body);
+    }
+    write_private_new(&dir.join("SKILL.md"), body).ok()?;
+    write_private_new(&receipt, body).ok()
+}
+
+fn remove_managed_skill(dir: &Path) -> Option<()> {
+    if !std::fs::symlink_metadata(dir).ok()?.is_dir() {
+        return None;
+    }
+    let file = dir.join("SKILL.md");
+    let receipt = dir.join(".feeder-installed");
+    if read_regular_file(&file)? != read_regular_file(&receipt)? {
+        return None;
+    }
+    std::fs::remove_file(file).ok()?;
+    std::fs::remove_file(receipt).ok()?;
+    let _ = std::fs::remove_dir(dir);
+    Some(())
+}
+
 pub fn install_skills() -> Vec<PathBuf> {
-    let skills = [("feeder-update", crate::skill_markdown()), ("feeder-notebook", crate::notebook_skill_markdown())];
+    let skills = skill_bodies();
     skill_roots()
         .into_iter()
         .filter(|r| r.is_dir() || r.parent().is_some_and(Path::is_dir))
         .flat_map(|r| skills.iter().map(move |(name, body)| (r.join(name), body)))
-        .filter_map(|(dir, body)| {
-            std::fs::create_dir_all(&dir).ok()?;
-            std::fs::write(dir.join("SKILL.md"), body).ok()?;
-            Some(dir)
-        })
+        .filter_map(|(dir, body)| install_managed_skill(&dir, body.as_bytes()).map(|()| dir))
         .collect()
 }
 
 pub fn sync_installed_skills() -> Vec<PathBuf> {
-    let skills = [("feeder-update", crate::skill_markdown()), ("feeder-notebook", crate::notebook_skill_markdown())];
+    let skills = skill_bodies();
     skill_roots()
         .into_iter()
-        .filter(|r| r.is_dir())
         .flat_map(|r| skills.iter().map(move |(name, body)| (r.join(name), body)))
-        .filter_map(|(dir, body)| {
-            let file = dir.join("SKILL.md");
-            let existing = std::fs::read_to_string(&file).ok()?;
-            if existing == *body {
-                return None;
-            }
-            std::fs::write(&file, body).ok()?;
-            Some(dir)
-        })
+        .filter_map(|(dir, body)| sync_managed_skill(&dir, body.as_bytes()).map(|()| dir))
         .collect()
 }
 
@@ -864,7 +926,7 @@ pub fn remove_skills() -> Vec<PathBuf> {
     skill_roots()
         .into_iter()
         .flat_map(|r| ["feeder-update", "feeder-notebook"].map(|name| r.join(name)))
-        .filter(|dir| dir.join("SKILL.md").is_file() && std::fs::remove_dir_all(dir).is_ok())
+        .filter(|dir| remove_managed_skill(dir).is_some())
         .collect()
 }
 
@@ -943,6 +1005,68 @@ fn skill_roots() -> Vec<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    struct SetupScratch(PathBuf);
+
+    impl SetupScratch {
+        fn new() -> Self {
+            let dir = std::env::temp_dir().join(format!("feeder-setup-{:016x}", fastrand::u64(..)));
+            std::fs::create_dir(&dir).unwrap();
+            Self(dir)
+        }
+
+        fn path(&self) -> &Path {
+            &self.0
+        }
+    }
+
+    impl Drop for SetupScratch {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    #[test]
+    fn cli_link_preserves_existing_commands_and_removes_only_managed_links() {
+        let dir = SetupScratch::new();
+        let target = dir.path().join("Feeder.app/Contents/Helpers/feeder");
+        let command = dir.path().join("feeder");
+        std::fs::write(&command, "existing command").unwrap();
+        assert_eq!(install_cli_link_in(dir.path(), &target).unwrap_err().kind(), std::io::ErrorKind::AlreadyExists);
+        assert_eq!(std::fs::read_to_string(&command).unwrap(), "existing command");
+
+        std::fs::remove_file(&command).unwrap();
+        std::os::unix::fs::symlink(&target, &command).unwrap();
+        install_cli_link_in(dir.path(), &target).unwrap();
+        remove_cli_link_in(dir.path()).unwrap();
+        assert_eq!(std::fs::read_link(&command).unwrap(), target);
+
+        std::fs::remove_file(&command).unwrap();
+        install_cli_link_in(dir.path(), &target).unwrap();
+        install_cli_link_in(dir.path(), &target).unwrap();
+        remove_cli_link_in(dir.path()).unwrap();
+        assert!(std::fs::symlink_metadata(&command).is_err());
+    }
+
+    #[test]
+    fn skill_updates_and_uninstall_preserve_user_files() {
+        let root = SetupScratch::new();
+        let dir = root.path().join("feeder-update");
+        let file = dir.join("SKILL.md");
+        install_managed_skill(&dir, b"original").unwrap();
+        sync_managed_skill(&dir, b"updated").unwrap();
+        assert_eq!(std::fs::read(&file).unwrap(), b"updated");
+        let extra = dir.join("notes.md");
+        std::fs::write(&extra, "my notes").unwrap();
+        std::fs::write(&file, "my guide").unwrap();
+        assert!(install_managed_skill(&dir, b"replacement").is_none());
+        assert!(remove_managed_skill(&dir).is_none());
+        assert_eq!(std::fs::read(&file).unwrap(), b"my guide");
+        std::fs::write(&file, "updated").unwrap();
+        remove_managed_skill(&dir).unwrap();
+        assert!(!file.exists());
+        assert_eq!(std::fs::read(&extra).unwrap(), b"my notes");
+    }
 
     #[test]
     fn tool_names_parse_with_aliases() {

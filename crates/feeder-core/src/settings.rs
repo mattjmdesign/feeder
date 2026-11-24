@@ -68,11 +68,19 @@ pub struct Settings {
     pub order: Order,
     pub show_folders: bool,
     pub notify_updates: bool,
+    pub onboarding_skipped: bool,
 }
 
 impl Default for Settings {
     fn default() -> Self {
-        Settings { theme: Theme::System, orb_size: OrbSize::Medium, order: Order::Recent, show_folders: true, notify_updates: false }
+        Settings {
+            theme: Theme::System,
+            orb_size: OrbSize::Medium,
+            order: Order::Recent,
+            show_folders: true,
+            notify_updates: false,
+            onboarding_skipped: false,
+        }
     }
 }
 
@@ -117,7 +125,14 @@ mod tests {
     fn settings_round_trip_and_missing_fields_take_defaults() {
         let dir = std::env::temp_dir().join(format!("feeder-settings-{}", std::process::id()));
         assert_eq!(Settings::load(&dir), Settings::default());
-        let s = Settings { theme: Theme::Light, orb_size: OrbSize::Large, order: Order::Name, show_folders: false, notify_updates: true };
+        let s = Settings {
+            theme: Theme::Light,
+            orb_size: OrbSize::Large,
+            order: Order::Name,
+            show_folders: false,
+            notify_updates: true,
+            onboarding_skipped: true,
+        };
         s.save(&dir).unwrap();
         assert_eq!(Settings::load(&dir), s);
         std::fs::write(dir.join("settings.json"), r#"{"theme":"dark","menubar":true}"#).unwrap();

@@ -301,7 +301,14 @@ const PROPOSAL_COLS: &str = "id, run_id, action, page_id, project_id, kind, topi
 
 impl Store {
     pub fn flag_knowledge(&self, flag: NewFlag, agent: &str) -> Result<Flag> {
-        self.insert_flag(flag, agent, None)
+        self.flag_knowledge_with_source(flag, agent, None)
+    }
+
+    pub fn flag_knowledge_with_source(&self, flag: NewFlag, agent: &str, source_update_id: Option<i64>) -> Result<Flag> {
+        if let Some(uid) = source_update_id {
+            self.update(uid)?.ok_or_else(|| Error::NotFound(format!("no Feed update {uid}")))?;
+        }
+        self.insert_flag(flag, agent, source_update_id)
     }
 
     pub fn flag_update_for_notebook(&self, update_id: i64, author: &str) -> Result<Flag> {
@@ -1635,5 +1642,37 @@ mod tests {
             &Provenance { reason: "Beta update".into(), flags: vec![], updates: vec![beta_update.id] },
         );
         assert!(cross_project.is_err(), "project-specific notes reject foreign project evidence");
+    }
+
+    #[test]
+    fn flag_knowledge_with_source_links_update_and_rejects_missing_update() {
+        let t = temp_store("flag-source-update");
+        let s = &t.store;
+        let p = s.project_named("Alpha", None).unwrap();
+        let u = s
+            .post(p.id, crate::NewUpdate { agent: "Codex".into(), body: "Done: fixed SQLite lock.".into(), ..Default::default() })
+            .unwrap();
+        let flagged = s
+            .flag_knowledge_with_source(
+                NewFlag {
+                    kind: FlagKind::Missing,
+                    page_id: None,
+                    project_id: Some(p.id),
+                    note: "Record the busy_timeout rule.".into(),
+                    suggestion: Some("Always set PRAGMA busy_timeout = 5000.".into()),
+                },
+                "Codex",
+                Some(u.id),
+            )
+            .unwrap();
+        assert_eq!(flagged.source_update_id, Some(u.id));
+        assert_eq!(flagged.project_id, Some(p.id));
+
+        let missing_update = s.flag_knowledge_with_source(
+            NewFlag { kind: FlagKind::Missing, page_id: None, project_id: Some(p.id), note: "Missing update".into(), suggestion: None },
+            "Codex",
+            Some(999_999),
+        );
+        assert!(matches!(missing_update, Err(Error::NotFound(_))));
     }
 }

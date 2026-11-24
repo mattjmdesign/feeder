@@ -39,11 +39,11 @@ Example:
 - Skip media for pure backend, refactor, test, or config changes.
 
 ## Collaborating with the user
-- Read recent updates, open project to-dos, and any unread human replies first with `get_feed` (or `feeder feed -n 3`).
+- Read recent updates, open project to-dos, and any unread human replies first with `get_feed` (or `feeder feed -n 3`), or check `list_projects` with `filter: "pending"` for unread replies across projects.
 - Use `Decision needed:` or `Blocked:` in block 3 whenever you want the user to answer or unblock something (bare `Decision:` does not flag **Needs you**); Feeder highlights open cards so the user can reply inline or dismiss them.
-- If a flagged decision or blocker was resolved out-of-band without a new update, clear the badge with `dismiss_attention` (or `feeder dismiss`).
-- When a project has open to-dos you completed (or want to track), check them off via `toggle_todo` (or `feeder todo done <id>`).
-- Emit a brief `pulse` while working on a longer task so the project's orb shows live activity.
+- If a flagged decision or blocker was resolved out-of-band without a new update, clear the badge with `update_project` (`dismiss_attention: true`, or `feeder dismiss`).
+- When a project has open to-dos you completed (or want to track), check them off via `post_update` (`complete_todos`), `update_project`, or `feeder todo done <id>`.
+- Emit a brief pulse via `update_project` (or `feeder pulse`) while working on a longer task so the project's orb shows live activity.
 
 ## Posting
 Project, branch, commit SHA, diff stat, and agent are detected automatically from where you run; omit them unless asked.
@@ -56,7 +56,7 @@ CLI (from the project folder):
 
     Next: …" --screenshot ./before.png --screenshot ./after.png
 
-MCP: call `post_update` with `summary` (and `screenshots` or `screenshot_path` when visible).
+MCP: call `post_update` with `summary` (and `media` paths when visible).
 "#;
 
 pub const NOTEBOOK_GUIDE: &str = r#"# Feeder's Library: a shared Markdown knowledge library across projects
@@ -69,21 +69,21 @@ library, so what you learn once pays off everywhere.
 ## Look before you dig
 When starting or resuming work, pass a few task keywords to `get_feed`, for example
 `{"project":"Orbit","task":"appcast signing"}`. It includes up to three relevant current
-notes from that project and the shared Library. Open the ones you need with `read_page`.
+notes from that project and the shared Library. Open the ones you need with `read_library`.
 
 Search the library before non-trivial debugging, before picking an approach for something tricky,
 and whenever an error message isn't immediately familiar:
 
-    feeder notebook search "sqlite busy timeout"        (MCP: search_notebook)
+    feeder notebook search "sqlite busy timeout"        (MCP: search_library)
 
 Results show each article's title and excerpt. Open one in full with `feeder notebook show 12`
-(MCP: `read_page`). If an article helped, record it with `feeder notebook helped 12`
-(MCP: `mark_page_helped`) so the most useful notes rise in search.
+(MCP: `read_library`). If an article helped, pass its ID in `helped_notes` on `post_update` or
+`flag_knowledge` (CLI: `feeder notebook helped 12`) so useful notes rise in search.
 
 ## Flag lessons and corrections for Curator
-Use `flag_knowledge` whenever the user corrects a mistake you made, when you solve a non-obvious
-bug, or when an existing Library note is missing, wrong, or outdated. Include the affected
-`page_id` if a note exists.
+Use `flag_knowledge` (or `flag_lesson` inside `post_update`) whenever the user corrects a mistake
+you made, when you solve a non-obvious bug, or when an existing Library note is missing, wrong, or
+outdated. Include `page_id` if a note exists and `update_id` if tied to a Feed update.
 
 Put a **full Markdown lesson draft** (up to 10,000 characters) in `suggestion`:
 - What went wrong or what the symptom/mistake was

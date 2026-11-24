@@ -34,8 +34,8 @@ pub use notebook::{
 pub use orb::{Orb, Pattern};
 pub use settings::{OrbSize, Order, Settings, Theme};
 pub use store::{
-    FeedUpdate, MAX_MEDIA_PER_UPDATE, MAX_TODO_CHARS, MediaAttachment, MediaKind, NewUpdate, Project, ProjectSummary, Pulse, Reply, Store,
-    TodoItem, data_dir, image_dimensions, media_kind_for_path,
+    FeedUpdate, MAX_MEDIA_PER_UPDATE, MAX_PULSE_CHARS, MAX_TODO_CHARS, MediaAttachment, MediaKind, NewUpdate, Project, ProjectSummary,
+    Pulse, Reply, Store, TodoItem, data_dir, image_dimensions, media_kind_for_path,
 };
 pub use time::{ago, day_key, day_label, now_ms, relative_time};
 pub use update::{AttentionKind, MAX_CHARS, MAX_PARAGRAPHS, UpdateError, extract_block, parse_attention, update_blocks, validate_body};

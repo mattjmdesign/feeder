@@ -113,6 +113,17 @@ impl Agents {
                             }
                             if all_disconnected {
                                 setup::remove_skills();
+                                match setup::remove_cli_links() {
+                                    Ok(()) => {
+                                        let status = setup::cli_on_path(&bin)
+                                            .map_or(CliStatus::NotInstalled, |(path, on_path)| CliStatus::Installed { path, on_path });
+                                        send(&inbox, wake.as_ref(), Msg::Cli(status));
+                                    }
+                                    Err(error) => {
+                                        all_disconnected = false;
+                                        send(&inbox, wake.as_ref(), Msg::Cli(CliStatus::Failed(error.to_string())));
+                                    }
+                                }
                             }
                             send(&inbox, wake.as_ref(), Msg::Uninstalled(all_disconnected));
                         }
