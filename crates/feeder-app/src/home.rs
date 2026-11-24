@@ -1,10 +1,11 @@
 use feeder_core::{Order, ProjectSummary, ago, extract_block};
 use rune::tok::motion;
-use rune::{Cursor, El, ScrollSpec, Spring, Transition, Tx, col, el, row, text};
-use rune_kit::{Kit, MenuItem, context_menu};
+use rune::{Color, Cursor, El, ScrollSpec, Spring, Transition, Tx, col, el, row, text};
+use rune_kit::{Button, ButtonVariant, ControlSize, Kit, MenuItem, Spinner, context_menu};
 
+use crate::connect::{Link, ToolAction};
 use crate::style::{self, Palette};
-use crate::{HomeFilter, State, agents, chrome, feed, orb};
+use crate::{CopyTarget, HomeFilter, State, agents, chrome, feed, orb};
 
 pub fn view(s: &State, p: &Palette, k: &Kit, reduced_motion: bool, layer: &mut Vec<El>) -> El {
     let body = if let Some(err) = &s.error {
@@ -12,7 +13,7 @@ pub fn view(s: &State, p: &Palette, k: &Kit, reduced_motion: bool, layer: &mut V
     } else if !s.loaded {
         el().key("loading").grow(1.0)
     } else if s.projects.is_empty() {
-        empty(p, s.settings.orb_size.points())
+        empty(s, p, k)
     } else {
         shelf(s, p, k, reduced_motion, layer)
     };
@@ -59,7 +60,7 @@ fn shelf(s: &State, p: &Palette, k: &Kit, reduced_motion: bool, layer: &mut Vec<
     } else {
         let mut filter_slot = row().key("home-filters-slot").h(28.0).center();
         if needs_count > 0 || working_count > 0 || s.home_filter != HomeFilter::All {
-            let chip = |key: &str, label: String, active: bool, dot: Option<rune::Color>| {
+            let chip = |key: &str, label: String, active: bool, dot: Option<Color>| {
                 let mut r = row()
                     .key(key.to_string())
                     .role("button")
@@ -346,29 +347,282 @@ fn all_archived(p: &Palette, size: f32, count: usize) -> El {
         )
 }
 
-fn empty(p: &Palette, size: f32) -> El {
-    let ghost = el().size(size, size).radius(size / 2.0).border(1.0, p.hairline).radial_gradient(
-        [0.35, 0.25],
-        size * 0.5,
-        [(0.0, p.hairline), (1.0, p.bg.alpha(0.0))],
-    );
-    col()
-        .key("empty")
-        .grow(1.0)
-        .w_full()
+const WELCOME_ORB: feeder_core::Orb =
+    feeder_core::Orb { seed: 3, hues: [220.0, 265.0, 195.0], chroma: 0.14, angle: 0.9, pattern: feeder_core::Pattern::Pearl };
+
+fn step_badge(num: &str, done: bool, p: &Palette) -> El {
+    el().size(22.0, 22.0)
+        .radius(11.0)
         .center()
-        .gap(18.0)
-        .pb(52.0)
-        .child(ghost)
-        .child(text("No projects yet").font(style::NAME).color(p.text))
+        .fill(if done { p.live.alpha(0.16) } else { p.hover })
+        .child(text(if done { "✓".to_string() } else { num.to_string() }).font(style::META).color(if done { p.live } else { p.text_2 }))
+}
+
+fn onboarding_card(key: &str, p: &Palette, child: El) -> El {
+    col().key(key.to_string()).w_full().padding(16.0).gap(12.0).radius(14.0).fill(p.card).border(1.0, p.hairline).child(child)
+}
+
+fn onboarding_tool_row(s: &State, p: &Palette, k: &Kit, tool: feeder_core::setup::Tool, link: &Link) -> El {
+    let action = |label: &str, variant: ButtonVariant, connect: bool| {
+        Button::new(label.to_string())
+            .variant(variant)
+            .control_size(ControlSize::Small)
+            .on_press(move |s: &mut State| {
+                let wake = s.wake.clone();
+                if connect {
+                    s.agents.connect(tool, wake.as_ref());
+                } else {
+                    s.agents.disconnect(tool, wake.as_ref());
+                }
+            })
+            .build(k)
+            .key(format!("home-agent-action-{}", tool.id()))
+    };
+    let busy = |t: &str| text(t.to_string()).font(style::META).color(p.text_3);
+    let control = match link {
+        Link::Connected => row()
+            .gap(6.0)
+            .center_y()
+            .child(el().size(6.0, 6.0).radius(3.0).fill(p.live))
+            .child(text("Connected").font(style::META).color(p.text_2)),
+        Link::Missing => action("Connect", ButtonVariant::Outline, true),
+        Link::Outdated => action("Update", ButtonVariant::Outline, true),
+        Link::Failed { action: failed_action, .. } => action("Try Again", ButtonVariant::Outline, *failed_action == ToolAction::Connect),
+        Link::Connecting => busy("Connecting…"),
+        Link::Disconnecting => busy("Disconnecting…"),
+    };
+    let mut words = col().grow(1.0).min_w(0.0).gap(2.0).child(text(tool.name()).font(style::NAME).color(p.text).truncate());
+    match link {
+        Link::Outdated => words = words.child(text("Set up for another copy of Feeder").font(style::META).color(p.text_3).truncate()),
+        Link::Failed { reason, .. } => {
+            words = words
+                .child(text(format!("Couldn’t connect: {reason}")).font(style::META).color(k.c.danger.fg).truncate().help(reason.clone()));
+        }
+        _ => {}
+    }
+    row()
+        .key(format!("home-agent-{}", tool.id()))
+        .w_full()
+        .min_h(28.0)
+        .gap(10.0)
+        .center_y()
+        .child(el().size(18.0, 18.0).center().child(agents::mark(tool.name(), p, 16.0, s.agent_icon(tool.name()))))
+        .child(words)
+        .child(control)
+}
+
+fn welcome_hero(p: &Palette) -> El {
+    col()
+        .items_center()
+        .gap(10.0)
+        .pb(4.0)
+        .child(orb::orb(&WELCOME_ORB, 56.0))
+        .child(text("Welcome to Feeder").font(style::DISPLAY).color(p.text))
         .child(
-            text("Connect the coding tools you use, then ask an agent in any project to post a Feeder update.")
+            text("Connect the coding tools you use, then ask an agent to post an update.")
+                .font(style::BODY)
+                .color(p.text_2)
+                .wrap()
+                .max_w(440.0)
+                .align(rune::Align::Center),
+        )
+}
+
+fn connect_step(s: &State, p: &Palette, k: &Kit) -> El {
+    let scanning = s.agents.is_scanning();
+    let rescan_btn = Button::new(if scanning { "Scanning…" } else { "Scan Again" })
+        .variant(ButtonVariant::GhostMuted)
+        .control_size(ControlSize::Small)
+        .disabled(scanning)
+        .on_press(|s: &mut State| s.rescan_clis())
+        .build(k)
+        .key("home-rescan");
+
+    let step1_head = row()
+        .w_full()
+        .gap(10.0)
+        .center_y()
+        .child(step_badge("1", s.agents.has_connected(), p))
+        .child(text("Connect your coding tools").font(style::NAME).color(p.text))
+        .child(rune::spacer())
+        .child(rescan_btn);
+
+    let step1_body = match &s.agents.rows {
+        None => row()
+            .gap(8.0)
+            .center_y()
+            .py(4.0)
+            .child(Spinner::new().size(13.0).color(p.text_3).build(k))
+            .child(text("Looking for coding tools on this Mac…").font(style::META).color(p.text_3)),
+        Some(found) if found.is_empty() => {
+            text("No coding tools were detected automatically. Copy the MCP config below to connect any tool.")
                 .font(style::META)
                 .color(p.text_3)
                 .wrap()
-                .max_w(380.0),
+        }
+        Some(found) => {
+            let mut list = col().w_full().gap(8.0);
+            for (tool, link) in found {
+                list = list.child(onboarding_tool_row(s, p, k, *tool, link));
+            }
+            list
+        }
+    };
+
+    let mcp_label = if s.is_copied(CopyTarget::McpConfig) { "Copied" } else { "Copy MCP Config" };
+    let step1_footer = row()
+        .w_full()
+        .center_y()
+        .gap(8.0)
+        .child(
+            Button::new(mcp_label)
+                .variant(ButtonVariant::GhostMuted)
+                .control_size(ControlSize::Small)
+                .on_press_tx(|s: &mut State, tx: &mut Tx| {
+                    tx.copy(feeder_core::setup::mcp_json(&feeder_core::setup::feeder_binary()));
+                    s.mark_copied(CopyTarget::McpConfig);
+                })
+                .build(k)
+                .key("home-copy-mcp"),
         )
-        .child(chrome::bar_button("connect-tools", "Connect Your Tools", p).border(1.0, p.hairline).on_press_tx(chrome::open_agent_setup))
+        .child(rune::spacer())
+        .child(
+            Button::new("All Tool Settings…")
+                .variant(ButtonVariant::GhostMuted)
+                .control_size(ControlSize::Small)
+                .on_press_tx(chrome::open_agent_setup)
+                .build(k)
+                .key("home-all-tools"),
+        );
+
+    onboarding_card(
+        "home-step-1",
+        p,
+        col().w_full().gap(12.0).child(step1_head).child(step1_body).child(rune::rule(1.0, p.hairline)).child(step1_footer),
+    )
+}
+
+pub fn starter_prompt(s: &State, p: &Palette, k: &Kit, fill: Color, key: &'static str) -> El {
+    let prompt_label = if s.is_copied(CopyTarget::StarterPrompt) { "Copied" } else { "Copy Prompt" };
+
+    row()
+        .w_full()
+        .px(12.0)
+        .py(8.0)
+        .gap(10.0)
+        .center_y()
+        .radius(8.0)
+        .fill(fill)
+        .border(1.0, p.hairline)
+        .child(text(crate::STARTER_PROMPT).font(style::BODY).color(p.text).selectable(true).grow(1.0).min_w(0.0))
+        .child(
+            Button::new(prompt_label)
+                .variant(ButtonVariant::Outline)
+                .control_size(ControlSize::Small)
+                .on_press_tx(|s: &mut State, tx: &mut Tx| {
+                    tx.copy(crate::STARTER_PROMPT.to_string());
+                    s.mark_copied(CopyTarget::StarterPrompt);
+                })
+                .build(k)
+                .key(key),
+        )
+}
+
+fn first_update_step(s: &State, p: &Palette, k: &Kit) -> El {
+    onboarding_card(
+        "home-step-2",
+        p,
+        col()
+            .w_full()
+            .gap(10.0)
+            .child(
+                row()
+                    .w_full()
+                    .gap(10.0)
+                    .center_y()
+                    .child(step_badge("2", false, p))
+                    .child(text("Ask an agent for your first update").font(style::NAME).color(p.text)),
+            )
+            .child(starter_prompt(s, p, k, p.bg, "home-copy-prompt"))
+            .child(
+                text("Restart a tool after connecting it, then send that prompt in any project. Projects appear here automatically.")
+                    .font(style::META)
+                    .color(p.text_3)
+                    .wrap(),
+            ),
+    )
+}
+
+fn curator_step(s: &State, p: &Palette, k: &Kit) -> El {
+    let curator_ready = crate::curator_settings::selected(s);
+    let backends = &s.notebook.gardener.backends;
+    let step3_control = if let Some(b) = curator_ready {
+        row()
+            .gap(6.0)
+            .center_y()
+            .child(el().size(6.0, 6.0).radius(3.0).fill(p.live))
+            .child(text(format!("Using {}", s.curator.prefs.name(b))).font(style::META).color(p.text_2))
+    } else {
+        let label = if backends.is_empty() { "Curator Settings…" } else { "Choose Subscription…" };
+        Button::new(label)
+            .variant(ButtonVariant::Outline)
+            .control_size(ControlSize::Small)
+            .on_press(crate::curator_settings::open_settings)
+            .build(k)
+            .key("home-curator-setup")
+    };
+    let step3_note = if curator_ready.is_some() {
+        "Optional. Ready to turn flagged lessons and Feed updates into Library notes.".to_string()
+    } else if !backends.is_empty() {
+        let names: Vec<&str> = backends.iter().map(|b| b.label()).collect();
+        format!("Optional. Found {} on this Mac. Turn on a subscription to keep your Library updated.", crate::gardener::join_names(&names))
+    } else {
+        "Optional. Curator keeps your Library updated using Claude Code, Codex, OpenCode, or Antigravity.".to_string()
+    };
+
+    onboarding_card(
+        "home-step-3",
+        p,
+        col()
+            .w_full()
+            .gap(6.0)
+            .child(
+                row()
+                    .w_full()
+                    .gap(8.0)
+                    .center_y()
+                    .child(step_badge("3", curator_ready.is_some(), p))
+                    .child(text("Turn on Curator").font(style::NAME).color(p.text))
+                    .child(rune::spacer())
+                    .child(step3_control),
+            )
+            .child(text(step3_note).font(style::META).color(p.text_3).wrap().pl(30.0)),
+    )
+}
+
+fn empty(s: &State, p: &Palette, k: &Kit) -> El {
+    let stack = col()
+        .key("empty")
+        .w_full()
+        .max_w(540.0)
+        .items_center()
+        .gap(14.0)
+        .child(welcome_hero(p))
+        .child(connect_step(s, p, k))
+        .child(first_update_step(s, p, k))
+        .child(curator_step(s, p, k));
+    col().key("empty-scroll").w_full().grow(1.0).min_h(0.0).child(
+        col()
+            .w_full()
+            .min_h(0.0)
+            .grow(1.0)
+            .items_center()
+            .px(32.0)
+            .pt(40.0)
+            .pb(64.0)
+            .child(stack)
+            .scroll(ScrollSpec { stick_bottom: false }),
+    )
 }
 
 fn message(p: &Palette, title: &str, detail: &str) -> El {

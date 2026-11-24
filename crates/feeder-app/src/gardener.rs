@@ -491,6 +491,15 @@ pub fn scoped_flags(s: &State) -> Vec<&Flag> {
         .collect()
 }
 
+pub fn join_names(names: &[&str]) -> String {
+    match names {
+        [] => String::new(),
+        [a] => (*a).to_string(),
+        [a, b] => format!("{a} and {b}"),
+        [head @ .., last] => format!("{}, and {last}", head.join(", ")),
+    }
+}
+
 fn intro(s: &State, p: &Palette, k: &Kit) -> El {
     const ORB: f32 = 64.0;
     let shadow = el().w(ORB * 0.7).h(8.0).radius(4.0).radial_gradient(
@@ -498,24 +507,113 @@ fn intro(s: &State, p: &Palette, k: &Kit) -> El {
         ORB * 0.35,
         [(0.0, rune::oklch(0.0, 0.0, 0.0).alpha(if p.dark { 0.55 } else { 0.18 })), (1.0, rune::oklch(0.0, 0.0, 0.0).alpha(0.0))],
     );
+    let orb_wrap = col().items_center().gap(10.0).child(crate::orb::orb(&chrome::CURATOR_ORB, ORB)).child(shadow);
+    let backends = &s.notebook.gardener.backends;
+    let scanning = s.curator_sign_in.is_scanning();
+    let rescan_btn = |variant: ButtonVariant| {
+        Button::new(if scanning { "Scanning…" } else { "Scan Again" })
+            .variant(variant)
+            .control_size(ControlSize::Small)
+            .disabled(scanning)
+            .on_press(|s: &mut State| s.rescan_clis())
+            .build(k)
+            .key("gardener-rescan")
+    };
+
+    if backends.is_empty() {
+        let actions = row().gap(8.0).center_y().child(rescan_btn(ButtonVariant::Contrast)).child(
+            Button::new("Curator Settings…")
+                .variant(ButtonVariant::Outline)
+                .control_size(ControlSize::Small)
+                .on_press(crate::curator_settings::open_settings)
+                .build(k)
+                .key("gardener-open-settings"),
+        );
+        return col()
+            .key("gardener-intro")
+            .items_center()
+            .gap(14.0)
+            .pb(24.0)
+            .child(orb_wrap)
+            .child(
+                col()
+                    .items_center()
+                    .gap(6.0)
+                    .max_w(440.0)
+                    .child(text("No Curator CLI detected").font(style::SECTION_TITLE).color(p.text).align(rune::Align::Center))
+                    .child(
+                        text("Curator runs on your own Claude Code, Codex, OpenCode, or Antigravity CLI.")
+                            .font(style::BODY)
+                            .color(p.text_2)
+                            .wrap()
+                            .align(rune::Align::Center),
+                    ),
+            )
+            .child(actions);
+    }
+
+    if selected_backend(s).is_none() {
+        let names: Vec<&str> = backends.iter().map(|b| b.label()).collect();
+        let actions = row()
+            .gap(8.0)
+            .center_y()
+            .child(
+                Button::new("Choose Subscription…")
+                    .variant(ButtonVariant::Contrast)
+                    .control_size(ControlSize::Small)
+                    .on_press(crate::curator_settings::open_settings)
+                    .build(k)
+                    .key("intro-choose-subscription"),
+            )
+            .child(rescan_btn(ButtonVariant::Outline));
+        return col()
+            .key("gardener-intro")
+            .items_center()
+            .gap(14.0)
+            .pb(24.0)
+            .child(orb_wrap)
+            .child(
+                col()
+                    .items_center()
+                    .gap(6.0)
+                    .max_w(440.0)
+                    .child(
+                        text("Turn on a subscription to use Curator").font(style::SECTION_TITLE).color(p.text).align(rune::Align::Center),
+                    )
+                    .child(
+                        text(format!(
+                            "Found {} on this Mac. Turn one on in Settings to ask questions or draft Library notes.",
+                            join_names(&names)
+                        ))
+                        .font(style::BODY)
+                        .color(p.text_2)
+                        .wrap()
+                        .align(rune::Align::Center),
+                    ),
+            )
+            .child(actions);
+    }
+
     let waiting = scoped_flags(s);
     let n = waiting.len();
-    let ready = selected_backend(s).is_some() && s.notebook.gardener.running.is_none();
-    let needs_sub = selected_backend(s).is_none() && !s.notebook.gardener.backends.is_empty();
+    let ready = s.notebook.gardener.running.is_none();
     let sub = if n == 1 {
         "1 flagged lesson is waiting for review.".to_string()
     } else if n > 1 {
         format!("{n} flagged lessons are waiting for review.")
+    } else if s.projects.is_empty() {
+        "Connect a coding tool and post a project update so Curator can turn lessons into Library notes.".to_string()
     } else {
         "It turns flagged lessons and Feed updates into notes your agents read next time.".to_string()
     };
     let words = col()
         .items_center()
-        .gap(2.0)
+        .gap(4.0)
         .max_w(440.0)
-        .child(text("Ask about anything across your Library and Feed.").font(style::BODY).color(p.text_3).align(rune::Align::Center))
-        .child(text(sub).font(style::BODY).color(p.text_3).align(rune::Align::Center));
+        .child(text("Ask about anything across your Library and Feed.").font(style::BODY).color(p.text_2).align(rune::Align::Center))
+        .child(text(sub).font(style::BODY).color(p.text_3).wrap().align(rune::Align::Center));
     let mut actions = row().gap(8.0).center_y();
+    let mut has_actions = false;
     if n > 0 {
         let label = if n == 1 { "Review 1 Flagged Lesson".to_string() } else { format!("Review {n} Flagged Lessons") };
         actions = actions.child(
@@ -527,23 +625,32 @@ fn intro(s: &State, p: &Palette, k: &Kit) -> El {
                 .build(k)
                 .key("gardener-review-flags"),
         );
+        has_actions = true;
     }
-    actions = actions.child(
-        Button::new("Check Recent Feed Updates")
-            .variant(ButtonVariant::Outline)
-            .control_size(ControlSize::Small)
-            .disabled(!ready)
-            .on_press(|s: &mut State| s.gardener_check_recent_updates())
-            .build(k)
-            .key("gardener-check-updates"),
-    );
-    let mut root = col()
-        .key("gardener-intro")
-        .items_center()
-        .gap(14.0)
-        .pb(24.0)
-        .child(col().items_center().gap(10.0).child(crate::orb::orb(&chrome::CURATOR_ORB, ORB)).child(shadow))
-        .child(words);
+    if !s.projects.is_empty() {
+        actions = actions.child(
+            Button::new("Check Recent Feed Updates")
+                .variant(ButtonVariant::Outline)
+                .control_size(ControlSize::Small)
+                .disabled(!ready)
+                .on_press(|s: &mut State| s.gardener_check_recent_updates())
+                .build(k)
+                .key("gardener-check-updates"),
+        );
+        has_actions = true;
+    } else if !s.tools_connected() {
+        actions = actions.child(
+            Button::new("Connect Your Tools")
+                .variant(ButtonVariant::Outline)
+                .control_size(ControlSize::Small)
+                .on_press_tx(chrome::open_agent_setup)
+                .build(k)
+                .key("gardener-connect-tools"),
+        );
+        has_actions = true;
+    }
+
+    let mut root = col().key("gardener-intro").items_center().gap(14.0).pb(24.0).child(orb_wrap).child(words);
     if !waiting.is_empty() {
         let mut preview = col().w_full().max_w(460.0).gap(6.0);
         for flag in waiting.iter().take(3) {
@@ -563,28 +670,10 @@ fn intro(s: &State, p: &Palette, k: &Kit) -> El {
         }
         root = root.child(preview);
     }
-    if needs_sub {
-        root = root.child(
-            row()
-                .gap(10.0)
-                .px(12.0)
-                .py(8.0)
-                .center_y()
-                .radius(8.0)
-                .fill(k.c.layer_01)
-                .border(1.0, k.c.border_muted)
-                .child(text("Turn on a subscription to run Curator.").font(style::META).color(p.text_2))
-                .child(
-                    Button::new("Choose Subscription…")
-                        .variant(ButtonVariant::Outline)
-                        .control_size(ControlSize::Small)
-                        .on_press(crate::curator_settings::open_settings)
-                        .build(k)
-                        .key("intro-choose-subscription"),
-                ),
-        );
+    if has_actions {
+        root = root.child(actions);
     }
-    root.child(actions)
+    root
 }
 
 pub fn selected_backend(s: &State) -> Option<Backend> {
@@ -719,7 +808,6 @@ fn status_line(s: &State, p: &Palette) -> Option<El> {
     }
     let backend = chat.backend.or_else(|| g.backends.first().copied());
     let line = match (backend, &g.running, &g.last_run) {
-        (None, _, _) if g.backends.is_empty() => "Install Claude Code, Codex, OpenCode, or Antigravity to use Curator.".to_string(),
         (None, _, _) => return None,
         (_, Some(run), _) => format!("Active run started {}", ago(run.started_at, s.now)),
         (_, None, Some(run)) if run.status == RunStatus::Failed => {
@@ -782,7 +870,7 @@ pub fn composer(s: &State, p: &Palette, k: &Kit, max_w: f32, layer: &mut Vec<El>
     toolbar = toolbar.child(rune::spacer());
     if let Some(picker) = provider_picker(s, p, k, layer) {
         toolbar = toolbar.child(picker);
-    } else if !s.notebook.gardener.backends.is_empty() {
+    } else if !s.notebook.gardener.backends.is_empty() && !is_empty_idle(s) {
         toolbar = toolbar.child(
             Button::new("Choose Subscription…")
                 .variant(ButtonVariant::Outline)
@@ -1396,7 +1484,7 @@ pub fn shell_view(s: &State, p: &Palette, k: &Kit, inset: f32, reduced_motion: b
         .sidebar_toggle(SidebarToggle::new().in_header().past_lights(10.0))
         .sidebar_peek(SidebarPeek::new())
         .reduced_motion(reduced_motion)
-        .build(&style::open_pane_kit(k))
+        .build(&style::open_pane_kit(k, p))
 }
 
 fn toolbar_breadcrumb(s: &State, p: &Palette, k: &Kit) -> El {

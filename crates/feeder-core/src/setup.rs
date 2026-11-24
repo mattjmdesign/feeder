@@ -1,6 +1,12 @@
+use std::ffi::OsString;
+use std::io::Read;
 use std::os::unix::fs::PermissionsExt;
+use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Child, Command, Stdio};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Mutex, PoisonError};
+use std::time::{Duration, Instant};
 
 use serde_json::{Value, json};
 
@@ -130,19 +136,284 @@ pub fn app_path(tool: Tool) -> Option<PathBuf> {
     tool.app_names().iter().flat_map(|name| [Path::new("/Applications").join(name), h.join("Applications").join(name)]).find(|p| p.exists())
 }
 
+const PATH_PROBE_START: &str = "__FEEDER_PATH_START__";
+const PATH_PROBE_END: &str = "__FEEDER_PATH_END__";
+const PATH_PROBE_BYTES: usize = 64 * 1024;
+
+static SEARCH_PATH_GENERATION: AtomicU64 = AtomicU64::new(0);
+static SHELL_PATH_CACHE: Mutex<Option<(u64, Vec<PathBuf>)>> = Mutex::new(None);
+
+pub fn refresh_search_paths() {
+    SEARCH_PATH_GENERATION.fetch_add(1, Ordering::Relaxed);
+}
+
+fn probed_shell_paths() -> Vec<PathBuf> {
+    if cfg!(test) {
+        return Vec::new();
+    }
+    let generation = SEARCH_PATH_GENERATION.load(Ordering::Relaxed);
+    let mut cache = SHELL_PATH_CACHE.lock().unwrap_or_else(PoisonError::into_inner);
+    if let Some((cached, paths)) = cache.as_ref()
+        && *cached == generation
+    {
+        return paths.clone();
+    }
+    let paths = probe_login_shell_path();
+    *cache = Some((generation, paths.clone()));
+    paths
+}
+
+fn is_executable_file(path: &Path) -> bool {
+    path.metadata().is_ok_and(|meta| meta.is_file() && meta.permissions().mode() & 0o111 != 0)
+}
+
+fn login_shell() -> Option<PathBuf> {
+    if let Some(shell) = std::env::var_os("SHELL").map(PathBuf::from).filter(|p| is_executable_file(p)) {
+        return Some(shell);
+    }
+    [Path::new("/bin/zsh"), Path::new("/bin/sh")].into_iter().map(Path::to_path_buf).find(|p| is_executable_file(p))
+}
+
+fn probe_login_shell_path() -> Vec<PathBuf> {
+    let Some(shell) = login_shell() else {
+        return Vec::new();
+    };
+    let is_fish = shell.file_name().and_then(|n| n.to_str()) == Some("fish");
+    let script = if is_fish {
+        format!("printf '{PATH_PROBE_START}%s{PATH_PROBE_END}' (string join : $PATH)")
+    } else {
+        format!("printf '{PATH_PROBE_START}%s{PATH_PROBE_END}' \"$PATH\"")
+    };
+    run_path_probe(&shell, &["-l", "-i", "-c", &script], Duration::from_millis(1500))
+        .or_else(|| run_path_probe(&shell, &["-l", "-c", &script], Duration::from_millis(1000)))
+        .unwrap_or_default()
+}
+
+fn kill_process_group(child: &mut Child) {
+    if let Ok(group) = libc::pid_t::try_from(child.id())
+        && group > 0
+    {
+        unsafe { libc::kill(-group, libc::SIGKILL) };
+    }
+    let _ = child.kill();
+    let _ = child.wait();
+}
+
+fn run_path_probe(shell: &Path, args: &[&str], timeout: Duration) -> Option<Vec<PathBuf>> {
+    let mut cmd = Command::new(shell);
+    cmd.args(args)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .env("TERM", "dumb")
+        .env("NO_COLOR", "1")
+        .env("ZSH_TMUX_AUTOSTART", "false");
+    unsafe {
+        cmd.pre_exec(|| if libc::setsid() == -1 { Err(std::io::Error::last_os_error()) } else { Ok(()) });
+    }
+    let mut child = cmd.spawn().ok()?;
+    let stdout = child.stdout.take()?;
+    let (tx, rx) = std::sync::mpsc::sync_channel(1);
+    if std::thread::Builder::new()
+        .name("feeder-path-probe".into())
+        .spawn(move || {
+            let mut buf = Vec::new();
+            let mut chunk = [0u8; 4096];
+            let mut reader = stdout;
+            while buf.len() < PATH_PROBE_BYTES {
+                let limit = (PATH_PROBE_BYTES - buf.len()).min(chunk.len());
+                let Ok(n) = reader.read(&mut chunk[..limit]) else {
+                    break;
+                };
+                if n == 0 {
+                    break;
+                }
+                buf.extend_from_slice(&chunk[..n]);
+                if String::from_utf8_lossy(&buf).contains(PATH_PROBE_END) {
+                    break;
+                }
+            }
+            let _ = tx.send(buf);
+        })
+        .is_err()
+    {
+        kill_process_group(&mut child);
+        return None;
+    }
+
+    let start = Instant::now();
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break Some(status),
+            Ok(None) if start.elapsed() < timeout => std::thread::sleep(Duration::from_millis(15)),
+            Ok(None) | Err(_) => {
+                kill_process_group(&mut child);
+                break None;
+            }
+        }
+    }?;
+    if !status.success() {
+        return None;
+    }
+    let bytes = match rx.recv_timeout(Duration::from_millis(100)) {
+        Ok(bytes) => bytes,
+        Err(_) => {
+            kill_process_group(&mut child);
+            return None;
+        }
+    };
+    parse_path_probe(&String::from_utf8_lossy(&bytes))
+}
+
+fn parse_path_probe(output: &str) -> Option<Vec<PathBuf>> {
+    let (_, rest) = output.split_once(PATH_PROBE_START)?;
+    let (raw, _) = rest.split_once(PATH_PROBE_END)?;
+    let dirs: Vec<PathBuf> = std::env::split_paths(raw).filter(|p| !p.as_os_str().is_empty()).collect();
+    (!dirs.is_empty()).then_some(dirs)
+}
+
+fn parse_etc_paths(text: &str) -> Vec<PathBuf> {
+    text.lines().map(str::trim).filter(|line| !line.is_empty() && !line.starts_with('#')).map(PathBuf::from).collect()
+}
+
+fn etc_paths_dirs() -> Vec<PathBuf> {
+    let mut dirs = std::fs::read_to_string("/etc/paths").map(|t| parse_etc_paths(&t)).unwrap_or_default();
+    if let Ok(entries) = std::fs::read_dir("/etc/paths.d") {
+        let mut files: Vec<PathBuf> = entries.flatten().map(|e| e.path()).filter(|p| p.is_file()).collect();
+        files.sort();
+        for file in files {
+            if let Ok(text) = std::fs::read_to_string(file) {
+                dirs.extend(parse_etc_paths(&text));
+            }
+        }
+    }
+    dirs
+}
+
+fn parse_semver_dir(name: &str) -> Option<(u64, u64, u64)> {
+    let trimmed = name.strip_prefix('v').unwrap_or(name);
+    let mut parts = trimmed.split(['.', '-', '+']);
+    let major = parts.next()?.parse().ok()?;
+    let minor = parts.next().and_then(|p| p.parse().ok()).unwrap_or(0);
+    let patch = parts.next().and_then(|p| p.parse().ok()).unwrap_or(0);
+    Some((major, minor, patch))
+}
+
+fn versioned_node_bins(home: &Path) -> Vec<PathBuf> {
+    let roots = [
+        (home.join(".nvm/versions/node"), Path::new("bin")),
+        (home.join("Library/Application Support/fnm/node-versions"), Path::new("installation/bin")),
+        (home.join(".local/share/fnm/node-versions"), Path::new("installation/bin")),
+        (home.join(".fnm/node-versions"), Path::new("installation/bin")),
+        (home.join(".local/share/mise/installs/node"), Path::new("bin")),
+        (PathBuf::from("/usr/local/n/versions/node"), Path::new("bin")),
+    ];
+    let mut bins = Vec::new();
+    for (root, suffix) in roots {
+        let Ok(entries) = std::fs::read_dir(&root) else {
+            continue;
+        };
+        let mut versions: Vec<((u64, u64, u64), PathBuf)> = entries
+            .flatten()
+            .filter_map(|entry| {
+                let name = entry.file_name();
+                let ver = parse_semver_dir(name.to_str()?)?;
+                let bin_dir = entry.path().join(suffix);
+                bin_dir.is_dir().then_some((ver, bin_dir))
+            })
+            .collect();
+        versions.sort_by_key(|a| std::cmp::Reverse(a.0));
+        bins.extend(versions.into_iter().map(|(_, p)| p));
+    }
+    bins
+}
+
+fn fallback_dirs(home: &Path) -> Vec<PathBuf> {
+    let mut dirs = vec![
+        home.join(".local/bin"),
+        home.join(".opencode/bin"),
+        home.join(".claude/local"),
+        home.join(".claude/local/node_modules/.bin"),
+        home.join(".antigravity/antigravity/bin"),
+        home.join(".codex/bin"),
+        home.join(".codex/packages/standalone/current/bin"),
+        home.join(".bun/bin"),
+        home.join(".volta/bin"),
+        home.join(".local/share/mise/shims"),
+        home.join(".mise/shims"),
+        home.join(".asdf/shims"),
+        home.join(".nodenv/shims"),
+        home.join("Library/pnpm"),
+        home.join(".local/share/pnpm"),
+        home.join(".npm-global/bin"),
+        home.join(".npm/bin"),
+        home.join(".yarn/bin"),
+        home.join(".config/yarn/global/node_modules/.bin"),
+        home.join(".cargo/bin"),
+        home.join("bin"),
+        home.join(".n/bin"),
+    ];
+    dirs.extend(versioned_node_bins(home));
+    dirs.extend([
+        PathBuf::from("/Applications/Antigravity.app/Contents/Resources/app/bin"),
+        home.join("Applications/Antigravity.app/Contents/Resources/app/bin"),
+        PathBuf::from("/Applications/Cursor.app/Contents/Resources/app/bin"),
+        home.join("Applications/Cursor.app/Contents/Resources/app/bin"),
+        PathBuf::from("/Applications/Codex.app/Contents/Resources"),
+        home.join("Applications/Codex.app/Contents/Resources"),
+        PathBuf::from("/opt/homebrew/bin"),
+        PathBuf::from("/opt/homebrew/sbin"),
+        PathBuf::from("/usr/local/bin"),
+        PathBuf::from("/usr/local/sbin"),
+    ]);
+    if !cfg!(test) {
+        dirs.extend(etc_paths_dirs());
+    }
+    dirs
+}
+
+fn push_unique_dirs(out: &mut Vec<PathBuf>, dirs: impl IntoIterator<Item = PathBuf>) {
+    for dir in dirs {
+        if !dir.as_os_str().is_empty() && !out.contains(&dir) {
+            out.push(dir);
+        }
+    }
+}
+
+pub(crate) fn search_dirs() -> Vec<PathBuf> {
+    let mut dirs = Vec::new();
+    if let Some(env_path) = std::env::var_os("PATH") {
+        push_unique_dirs(&mut dirs, std::env::split_paths(&env_path));
+    }
+    push_unique_dirs(&mut dirs, probed_shell_paths());
+    push_unique_dirs(&mut dirs, fallback_dirs(&home()));
+    dirs
+}
+
+fn search_path_env_from(extra_front: Option<&Path>, dirs: Vec<PathBuf>) -> OsString {
+    let mut combined = Vec::new();
+    if let Some(front) = extra_front {
+        push_unique_dirs(&mut combined, [front.to_path_buf()]);
+    }
+    push_unique_dirs(&mut combined, dirs);
+    std::env::join_paths(combined).unwrap_or_else(|_| std::env::var_os("PATH").unwrap_or_default())
+}
+
+pub(crate) fn search_path_env(extra_front: Option<&Path>) -> OsString {
+    search_path_env_from(extra_front, search_dirs())
+}
+
 pub(crate) fn which(cmd: &str) -> Option<PathBuf> {
-    let path = std::env::var_os("PATH");
-    let dirs = path.iter().flat_map(std::env::split_paths);
-    let fallback =
-        [home().join(".local/bin"), home().join(".cargo/bin"), PathBuf::from("/opt/homebrew/bin"), PathBuf::from("/usr/local/bin")];
-    find_executable(cmd, dirs.chain(fallback))
+    let env_dirs: Vec<PathBuf> = std::env::var_os("PATH").map(|p| std::env::split_paths(&p).collect()).unwrap_or_default();
+    find_executable(cmd, env_dirs)
+        .or_else(|| find_executable(cmd, probed_shell_paths()))
+        .or_else(|| find_executable(cmd, fallback_dirs(&home())))
 }
 
 fn find_executable(cmd: &str, dirs: impl IntoIterator<Item = PathBuf>) -> Option<PathBuf> {
     dirs.into_iter().find_map(|dir| {
         let candidate = dir.join(cmd);
-        let meta = candidate.metadata().ok()?;
-        if !meta.is_file() || meta.permissions().mode() & 0o111 == 0 {
+        if !is_executable_file(&candidate) {
             return None;
         }
         std::path::absolute(candidate).ok()
@@ -221,12 +492,24 @@ pub fn cli_on_path(bin: &Path) -> Option<(PathBuf, bool)> {
     Some((found.clone(), same_file(&found, bin)))
 }
 
+fn dir_in_paths(paths: &[PathBuf], target: &Path) -> bool {
+    paths.iter().any(|dir| same_file(dir, target))
+}
+
 pub fn install_cli_link(bin: &Path) -> std::io::Result<(PathBuf, bool)> {
-    let path_dirs: Vec<PathBuf> = std::env::var_os("PATH").map(|p| std::env::split_paths(&p).collect()).unwrap_or_default();
+    let mut path_dirs: Vec<PathBuf> = Vec::new();
+    if let Some(env_path) = std::env::var_os("PATH") {
+        push_unique_dirs(&mut path_dirs, std::env::split_paths(&env_path));
+    }
+    push_unique_dirs(&mut path_dirs, probed_shell_paths());
+    push_unique_dirs(&mut path_dirs, etc_paths_dirs());
     let preferred =
         [home().join(".local/bin"), home().join(".cargo/bin"), PathBuf::from("/opt/homebrew/bin"), PathBuf::from("/usr/local/bin")];
-    let target_dir =
-        preferred.iter().find(|dir| path_dirs.contains(dir) && dir_writable(dir)).cloned().unwrap_or_else(|| home().join(".local/bin"));
+    let target_dir = preferred
+        .iter()
+        .find(|dir| dir_in_paths(&path_dirs, dir) && dir_writable(dir))
+        .cloned()
+        .unwrap_or_else(|| home().join(".local/bin"));
     std::fs::create_dir_all(&target_dir)?;
     let link = target_dir.join("feeder");
     let tmp = target_dir.join(format!(".feeder-link-{}-{:08x}", std::process::id(), fastrand::u32(..)));
@@ -235,7 +518,7 @@ pub fn install_cli_link(bin: &Path) -> std::io::Result<(PathBuf, bool)> {
         let _ = std::fs::remove_file(&tmp);
         return Err(e);
     }
-    let on_path = path_dirs.contains(&target_dir);
+    let on_path = dir_in_paths(&path_dirs, &target_dir);
     Ok((link, on_path))
 }
 
@@ -422,9 +705,10 @@ fn apply(config: Config, bin: &Path) -> (String, Outcome) {
                 return (place, Outcome::Already);
             }
             let Some(claude) = which("claude") else { return (place, Outcome::Skipped("the claude CLI isn't installed".into())) };
+            let env_path = search_path_env(claude.parent());
             let run = |args: &[&str]| {
                 let mut cmd = Command::new(&claude);
-                cmd.args(args);
+                cmd.env("PATH", &env_path).args(args);
                 if let Some(d) = &config_dir {
                     cmd.env("CLAUDE_CONFIG_DIR", d);
                 }
@@ -623,8 +907,8 @@ fn unapply(config: Config) -> (String, Outcome) {
                 return (place, Outcome::Already);
             }
             let Some(claude) = which("claude") else { return (place, Outcome::Skipped("the claude CLI isn't installed".into())) };
-            let mut cmd = Command::new(claude);
-            cmd.args(["mcp", "remove", "--scope", "user", "feeder"]);
+            let mut cmd = Command::new(&claude);
+            cmd.env("PATH", search_path_env(claude.parent())).args(["mcp", "remove", "--scope", "user", "feeder"]);
             if let Some(d) = &config_dir {
                 cmd.env("CLAUDE_CONFIG_DIR", d);
             }
@@ -793,5 +1077,53 @@ mod tests {
         assert_eq!(text.matches("[mcp_servers.feeder]").count(), 1);
         assert!(text.contains("/new/feeder") && !text.contains("/old/feeder") && text.contains("[mcp_servers.other]"));
         std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn parse_path_probe_ignores_shell_noise_and_extracts_dirs() {
+        let output =
+            format!("Last login: Mon Nov 23\nmotd\n{PATH_PROBE_START}/Users/a/.local/bin:/opt/homebrew/bin:{PATH_PROBE_END}\nbye\n");
+        assert_eq!(parse_path_probe(&output), Some(vec![PathBuf::from("/Users/a/.local/bin"), PathBuf::from("/opt/homebrew/bin")]));
+        assert_eq!(parse_path_probe("no markers here"), None);
+        assert_eq!(parse_path_probe(&format!("{PATH_PROBE_START}{PATH_PROBE_END}")), None);
+    }
+
+    #[test]
+    fn versioned_node_bins_prefers_newest_semver() {
+        let base = std::env::temp_dir().join(format!("feeder-nvm-{}-{:08x}", std::process::id(), fastrand::u32(..)));
+        let node = base.join(".nvm/versions/node");
+        for ver in ["v18.19.0", "v22.2.1", "v20.11.0", "system"] {
+            std::fs::create_dir_all(node.join(ver).join("bin")).unwrap();
+        }
+        let found = versioned_node_bins(&base);
+        std::fs::remove_dir_all(&base).ok();
+        assert_eq!(found, vec![node.join("v22.2.1/bin"), node.join("v20.11.0/bin"), node.join("v18.19.0/bin")]);
+    }
+
+    #[test]
+    fn parse_etc_paths_skips_blank_lines() {
+        assert_eq!(
+            parse_etc_paths("\n  /usr/local/bin  \n# comment\n\n/usr/bin\n"),
+            vec![PathBuf::from("/usr/local/bin"), PathBuf::from("/usr/bin")]
+        );
+    }
+
+    #[test]
+    fn search_path_env_prepends_extra_without_duplicates() {
+        let joined = search_path_env_from(
+            Some(Path::new("/extra/bin")),
+            vec![PathBuf::from("/first/bin"), PathBuf::from("/extra/bin"), PathBuf::from("/second/bin")],
+        );
+        let parsed: Vec<PathBuf> = std::env::split_paths(&joined).collect();
+        assert_eq!(parsed, vec![PathBuf::from("/extra/bin"), PathBuf::from("/first/bin"), PathBuf::from("/second/bin")]);
+    }
+
+    #[test]
+    fn fallback_dirs_include_opencode_and_claude_local() {
+        let h = Path::new("/tmp/feeder-home");
+        let dirs = fallback_dirs(h);
+        assert!(dirs.contains(&h.join(".opencode/bin")));
+        assert!(dirs.contains(&h.join(".claude/local")));
+        assert!(dirs.contains(&h.join(".local/bin")));
     }
 }

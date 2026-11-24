@@ -669,6 +669,7 @@ pub fn markdown_excerpt(md: &str, max_chars: usize) -> String {
     }
     let mut in_fence = false;
     let mut parts = Vec::new();
+    let mut headings = Vec::new();
     for raw in md.lines() {
         let trimmed = raw.trim();
         if trimmed.starts_with("```") || trimmed.starts_with("~~~") {
@@ -679,6 +680,10 @@ pub fn markdown_excerpt(md: &str, max_chars: usize) -> String {
             continue;
         }
         if trimmed.starts_with('|') && trimmed.chars().all(|c| matches!(c, '|' | '-' | ':' | ' ' | '\t')) {
+            continue;
+        }
+        if is_atx_heading(trimmed) {
+            headings.push(strip_markdown_line(trimmed));
             continue;
         }
         let line_for_strip = if trimmed.starts_with('>') {
@@ -706,6 +711,9 @@ pub fn markdown_excerpt(md: &str, max_chars: usize) -> String {
             }
         }
     }
+    if parts.is_empty() {
+        parts = headings.into_iter().filter(|h| !h.is_empty()).collect();
+    }
     let joined = parts.join(" ");
     let mut chars = joined.chars();
     let head: String = chars.by_ref().take(max_chars).collect();
@@ -717,12 +725,17 @@ pub fn markdown_excerpt(md: &str, max_chars: usize) -> String {
     }
 }
 
+fn is_atx_heading(line: &str) -> bool {
+    let rest = line.trim_start_matches('#');
+    rest.len() < line.len() && line.len() - rest.len() <= 6 && (rest.is_empty() || rest.starts_with([' ', '\t']))
+}
+
 fn strip_markdown_line(line: &str) -> String {
     let mut s = line.trim();
     while let Some(rest) = s.strip_prefix('>') {
         s = rest.trim_start();
     }
-    if s.starts_with('#') {
+    if is_atx_heading(s) {
         s = s.trim_start_matches('#').trim_start();
     }
     for prefix in ["- [ ] ", "- [x] ", "- [X] ", "* [ ] ", "* [x] ", "* [X] ", "- ", "* ", "+ "] {
@@ -1276,6 +1289,12 @@ mod tests {
             markdown_excerpt("Set `busy_timeout` in ~/Library/db and ~~old~~ _italic_ text.", 120),
             "Set busy_timeout in ~/Library/db and old italic text."
         );
+        assert_eq!(
+            markdown_excerpt("## What happened\n\nExports lost their order.\n\n## Why\n\nA HashMap.", 120),
+            "Exports lost their order. A HashMap."
+        );
+        assert_eq!(markdown_excerpt("# Only a heading", 120), "Only a heading");
+        assert_eq!(markdown_excerpt("#hashtag stays", 120), "#hashtag stays");
         let by_topic = s.search_pages("", &PageFilter { topic: Some("Rust".into()), ..PageFilter::default() }, 5).unwrap();
         assert_eq!(by_topic.len(), 2);
         let substring = s.search_pages("viewpo", &PageFilter::default(), 5).unwrap();

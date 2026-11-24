@@ -17,8 +17,9 @@ pub(super) fn command(backend: Backend, binary: &Path, data: &Path) -> Result<Co
     cmd.env_clear().current_dir(&profile);
 
     cmd.env("HOME", dirs::home_dir().unwrap_or_else(|| profile.clone()));
+    cmd.env("PATH", crate::setup::search_path_env(binary.parent()));
 
-    for var in ["PATH", "LANG", "LC_ALL", "TERM", "USER", "LOGNAME", "TMPDIR"] {
+    for var in ["LANG", "LC_ALL", "TERM", "USER", "LOGNAME", "TMPDIR"] {
         if let Some(value) = std::env::var_os(var) {
             cmd.env(var, value);
         }

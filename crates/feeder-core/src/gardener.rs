@@ -138,9 +138,17 @@ impl Backend {
         if cmd.status()?.success() { Ok(()) } else { Err(Error::Invalid(format!("{} sign-in did not finish", self.label()))) }
     }
 
+    pub fn cli_name(self) -> &'static str {
+        match self {
+            Backend::ClaudeCode => "claude",
+            Backend::Codex => "codex",
+            Backend::OpenCode => "opencode",
+            Backend::Antigravity => "agy",
+        }
+    }
+
     pub fn binary(self) -> Option<PathBuf> {
-        let program = if self == Self::Antigravity { "agy" } else { self.as_str() };
-        setup::which(program)
+        setup::which(self.cli_name())
     }
 
     pub fn installed() -> Vec<Backend> {

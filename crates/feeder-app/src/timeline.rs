@@ -4,7 +4,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 
 use feeder_core::{FeedUpdate, ProjectSummary, ago, day_key, day_label};
 use rune::{Cursor, El, GrowthSpec, Key, KeyEvent, ScrollPos, ScrollSpec, Transition, Tx, col, el, memo, row, text, text_input};
-use rune_kit::{Divider, Kit, MarkdownStyle, Menu, MenuItem, Placement, Spinner, scroll_bar};
+use rune_kit::{Button, ButtonVariant, ControlSize, Divider, Kit, MarkdownStyle, Menu, MenuItem, Placement, Spinner, scroll_bar};
 
 use crate::style::{self, Palette};
 use crate::watch::TIMELINE_PAGE;
@@ -22,6 +22,48 @@ pub fn view(s: &State, p: &Palette, k: &Kit, layer: &mut Vec<El>) -> El {
     let unfiltered = s.branch_filter.is_none() && query.is_empty();
     let more = unfiltered && (visible.len() as i64) < total;
 
+    let anyone_working = s.projects.iter().any(|p| !p.project.archived && p.active_pulse.is_some());
+    if s.loaded && total == 0 && unfiltered && !anyone_working {
+        let tools_action = if s.tools_connected() {
+            Button::new("Connected Tools…")
+                .variant(ButtonVariant::GhostMuted)
+                .control_size(ControlSize::Small)
+                .on_press_tx(chrome::open_agent_setup)
+                .build(k)
+                .key("timeline-empty-tools")
+        } else {
+            Button::new("Connect Your Tools")
+                .variant(ButtonVariant::Contrast)
+                .control_size(ControlSize::Regular)
+                .on_press_tx(chrome::open_agent_setup)
+                .build(k)
+                .key("timeline-empty-connect")
+        };
+        let empty = col()
+            .key("timeline-empty")
+            .w_full()
+            .max_w(440.0)
+            .items_center()
+            .gap(14.0)
+            .child(text("No updates yet").font(style::SECTION_TITLE).color(p.text))
+            .child(
+                text("Updates from your coding agents across all projects will stream in here.")
+                    .font(style::BODY)
+                    .color(p.text_2)
+                    .wrap()
+                    .align(rune::Align::Center),
+            )
+            .child(crate::home::starter_prompt(s, p, k, p.card, "timeline-empty-copy"))
+            .child(tools_action.mt(4.0));
+        return col()
+            .key("timeline")
+            .w_full()
+            .grow(1.0)
+            .min_h(0.0)
+            .transition(Transition::none())
+            .child(col().w_full().grow(1.0).center().px(24.0).pb(48.0).child(empty));
+    }
+
     let filter_bar = filter_row(s, p);
     let waiting = unfiltered.then(|| needs_you_now(s, p)).flatten();
     let live = unfiltered.then(|| working_now(s, p, k)).flatten();
@@ -31,9 +73,18 @@ pub fn view(s: &State, p: &Palette, k: &Kit, layer: &mut Vec<El>) -> El {
     let footer = if !s.loaded {
         el()
     } else if visible.is_empty() {
-        let msg =
-            if unfiltered { "No updates yet. Updates from active projects will appear here." } else { "No updates match these filters." };
-        text(msg).font(style::META).color(p.text_3)
+        col().items_center().gap(10.0).py(12.0).child(text("No updates match these filters.").font(style::META).color(p.text_3)).child(
+            Button::new("Clear Filters")
+                .variant(ButtonVariant::Outline)
+                .control_size(ControlSize::Small)
+                .on_press(|s: &mut State| {
+                    s.feed_search.text.clear();
+                    s.branch_filter = None;
+                    s.sync_search();
+                })
+                .build(k)
+                .key("timeline-clear-filters"),
+        )
     } else if !query.is_empty() && s.search_snapshot_query == query {
         let n = visible.len();
         text(format!("{n} match{} across full history", if n == 1 { "" } else { "es" })).font(style::META).color(p.text_3)

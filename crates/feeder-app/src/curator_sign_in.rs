@@ -71,6 +71,10 @@ impl SignIn {
         self.connected_backend.take()
     }
 
+    pub fn is_scanning(&self) -> bool {
+        self.scan_rx.is_some()
+    }
+
     pub fn follow_accounts(&mut self, open: bool, wake: Option<&Waker>) {
         if !open {
             self.scan_fresh = false;
@@ -80,6 +84,18 @@ impl SignIn {
             return;
         }
         self.scan_fresh = true;
+        self.spawn_scan(wake);
+    }
+
+    pub fn rescan(&mut self, wake: Option<&Waker>) {
+        if self.scan_rx.is_some() {
+            return;
+        }
+        self.scan_fresh = true;
+        self.spawn_scan(wake);
+    }
+
+    fn spawn_scan(&mut self, wake: Option<&Waker>) {
         let (tx, rx) = mpsc::channel();
         let wake = wake.cloned();
         if std::thread::Builder::new()
@@ -167,6 +183,7 @@ impl SignIn {
         if let Some(rx) = &self.scan_rx {
             match rx.try_recv() {
                 Ok((installed, results)) => {
+                    self.scanned.retain(|backend, _| installed.contains(backend));
                     self.installed_update = Some(installed);
                     for (backend, account) in results {
                         self.scanned.insert(backend, account);

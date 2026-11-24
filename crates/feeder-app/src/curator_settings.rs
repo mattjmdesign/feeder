@@ -238,7 +238,7 @@ pub fn pane(s: &State, p: &Palette, k: &Kit, layer: &mut Vec<El>) -> El {
 
     let rows: Vec<El> = if installed.is_empty() {
         vec![
-            text("Install Claude Code, Codex, OpenCode, or Antigravity to use Curator.")
+            text("No supported CLIs detected yet. Install Claude Code, Codex, OpenCode, or Antigravity, then click Scan Again.")
                 .font(style::BODY)
                 .color(p.text_3)
                 .wrap()
@@ -248,7 +248,42 @@ pub fn pane(s: &State, p: &Palette, k: &Kit, layer: &mut Vec<El>) -> El {
     } else {
         installed.iter().map(|b| subscription(s, *b, p, k, layer)).collect()
     };
-    pane.child(group(p, Some("Subscriptions on this Mac"), rows))
+    let scanning = s.curator_sign_in.is_scanning();
+    let rescan = Button::new(if scanning { "Scanning…" } else { "Scan Again" })
+        .variant(ButtonVariant::GhostMuted)
+        .control_size(ControlSize::Small)
+        .disabled(scanning)
+        .on_press(|s: &mut State| s.rescan_clis())
+        .build(k)
+        .key("curator-rescan");
+    pane = pane.child(group_with_action(p, "Subscriptions on this Mac", rescan, rows));
+
+    let missing: Vec<Backend> = Backend::ALL.into_iter().filter(|b| !installed.contains(b)).collect();
+    if !missing.is_empty() {
+        let missing_rows: Vec<El> = missing
+            .into_iter()
+            .map(|b| {
+                row()
+                    .key(format!("curator-missing-{}", b.as_str()))
+                    .w_full()
+                    .gap(12.0)
+                    .center_y()
+                    .px(16.0)
+                    .py(10.0)
+                    .child(el().size(20.0, 20.0).center().opacity(0.55).child(agents::mark(b.label(), p, 18.0, s.agent_icon(b.label()))))
+                    .child(
+                        col().grow(1.0).min_w(0.0).gap(2.0).child(text(b.label()).font(style::NAME).color(p.text_2).truncate()).child(
+                            text(format!("Couldn’t find the {} command on this Mac", b.cli_name()))
+                                .font(style::META)
+                                .color(p.text_3)
+                                .truncate(),
+                        ),
+                    )
+            })
+            .collect();
+        pane = pane.child(group(p, Some("Not detected on this Mac"), missing_rows));
+    }
+    pane
 }
 
 fn toggle_select(s: &mut State, key: &str) {
@@ -799,6 +834,14 @@ pub fn header(p: &Palette, title: &str, lede: &str) -> El {
 }
 
 pub fn group(p: &Palette, title: Option<&str>, rows: Vec<El>) -> El {
+    group_header(p, title, None, rows)
+}
+
+pub fn group_with_action(p: &Palette, title: &str, action: El, rows: Vec<El>) -> El {
+    group_header(p, Some(title), Some(action), rows)
+}
+
+fn group_header(p: &Palette, title: Option<&str>, action: Option<El>, rows: Vec<El>) -> El {
     let mut list = col().w_full().radius(12.0).border(1.0, p.hairline).clip_rounded(12.0);
     let count = rows.len();
     for (i, r) in rows.into_iter().enumerate() {
@@ -809,7 +852,11 @@ pub fn group(p: &Palette, title: Option<&str>, rows: Vec<El>) -> El {
     }
     let mut out = col().w_full().gap(10.0);
     if let Some(t) = title {
-        out = out.child(text(t.to_string()).font(style::NAME).color(p.text_2));
+        let mut head = row().w_full().center_y().gap(8.0).child(text(t.to_string()).font(style::NAME).color(p.text_2));
+        if let Some(a) = action {
+            head = head.child(rune::spacer()).child(a);
+        }
+        out = out.child(head);
     }
     out.child(list)
 }

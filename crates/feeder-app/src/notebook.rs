@@ -90,6 +90,7 @@ pub struct Notebook {
     pub chat: crate::gardener::Chat,
     pub preview_chats: Option<Vec<feeder_core::gardener::ChatSummary>>,
     pub preview_changes: Option<Vec<feeder_core::Change>>,
+    pub preview_backends: Option<Vec<feeder_core::gardener::Backend>>,
     pub curator_backend: Option<feeder_core::gardener::Backend>,
     pub provider_open: bool,
 }
@@ -113,6 +114,7 @@ impl Default for Notebook {
             chat: crate::gardener::Chat::default(),
             preview_chats: None,
             preview_changes: None,
+            preview_backends: None,
             curator_backend: None,
             provider_open: false,
         }
@@ -640,7 +642,7 @@ pub fn view(s: &State, p: &Palette, k: &Kit, inset: f32, reduced_motion: bool, l
         .sidebar_toggle(SidebarToggle::new().in_header().past_lights(10.0))
         .sidebar_peek(SidebarPeek::new())
         .reduced_motion(reduced_motion)
-        .build(&if reading { style::pane_kit(k) } else { style::open_pane_kit(k) })
+        .build(&if reading { style::pane_kit(k, p) } else { style::open_pane_kit(k, p) })
 }
 
 pub(crate) const CRUMB_PAD: f32 = 10.0;
@@ -813,7 +815,7 @@ fn sidebar_view(s: &State, p: &Palette, k: &Kit) -> El {
 fn index_view(s: &State, p: &Palette, k: &Kit) -> El {
     let nb = &s.notebook;
     if nb.pages.is_empty() && s.loaded {
-        return col().w_full().max_w(INDEX_MAX_W).child(empty_notebook(p, k));
+        return col().w_full().max_w(INDEX_MAX_W).child(empty_notebook(s, p, k));
     }
 
     let searching = !nb.query.text.trim().is_empty() && !matches!(nb.shelf, Shelf::Archived);
@@ -2307,32 +2309,54 @@ fn decorate_inline(text: &str, base: usize, p: &Palette, dim: Color, code_bg: Co
     }
 }
 
-fn empty_notebook(p: &Palette, k: &Kit) -> El {
+fn empty_notebook(s: &State, p: &Palette, k: &Kit) -> El {
+    let primary = Button::new("Write a Note")
+        .icon(&PLUS_ICON)
+        .variant(ButtonVariant::Contrast)
+        .control_size(ControlSize::Regular)
+        .on_press(|s: &mut State| s.notebook_new_page())
+        .build(k)
+        .key("nb-empty-new");
+
+    let secondary = if !s.tools_connected() {
+        Button::new("Connect Your Tools")
+            .variant(ButtonVariant::Outline)
+            .control_size(ControlSize::Regular)
+            .on_press_tx(chrome::open_agent_setup)
+            .build(k)
+            .key("nb-empty-connect")
+    } else if crate::gardener::selected_backend(s).is_none() {
+        Button::new("Set Up Curator")
+            .variant(ButtonVariant::Outline)
+            .control_size(ControlSize::Regular)
+            .on_press(crate::curator_settings::open_settings)
+            .build(k)
+            .key("nb-empty-curator-setup")
+    } else {
+        Button::new("Open Curator")
+            .variant(ButtonVariant::Outline)
+            .control_size(ControlSize::Regular)
+            .on_press_tx(|s: &mut State, tx: &mut Tx| s.open_curator(tx))
+            .build(k)
+            .key("nb-empty-curator")
+    };
+
     col()
         .key("nb-empty")
         .w_full()
         .items_center()
         .pt(88.0)
         .gap(14.0)
-        .child(text("Your knowledge library is empty").font(style::DISPLAY).color(p.text))
+        .child(text("Your Library is empty").font(style::DISPLAY).color(p.text))
         .child(
-            text("Write freeform Markdown notes or let agents save architecture decisions, gotchas, and patterns here.")
-                .font(style::PROSE)
+            text("Save decisions, fixes, and gotchas once so every coding agent reads them next time.")
+                .font(style::BODY)
                 .color(p.text_2)
                 .wrap()
-                .max_w(480.0)
+                .max_w(440.0)
                 .align(rune::Align::Center),
         )
-        .child(
-            Button::new("Write the First Note")
-                .icon(&PLUS_ICON)
-                .variant(ButtonVariant::Contrast)
-                .control_size(ControlSize::Large)
-                .on_press(|s: &mut State| s.notebook_new_page())
-                .build(k)
-                .mt(8.0)
-                .key("nb-empty-new"),
-        )
+        .child(row().gap(8.0).mt(4.0).center_y().child(primary).child(secondary))
 }
 
 #[cfg(test)]

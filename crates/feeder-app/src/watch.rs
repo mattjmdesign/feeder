@@ -38,6 +38,7 @@ enum Msg {
     Notebook(NotebookOp),
     Timeline(usize),
     CuratorChat(Option<i64>),
+    SetBackends(Vec<Backend>),
 }
 
 #[derive(Clone, Debug)]
@@ -192,7 +193,7 @@ impl Watcher {
                 let mut last_notebook_stamp: Option<(i64, i64, i64, i64)> = None;
                 let mut next_pulse_expiry: Option<i64> = None;
                 let mut dirty = true;
-                let backends = Backend::installed();
+                let mut backends = Backend::installed();
                 loop {
                     let mut renames = Vec::new();
                     let mut briefs = Vec::new();
@@ -220,6 +221,7 @@ impl Watcher {
                                     Msg::Search(q) => search_query = q,
                                     Msg::Timeline(n) => timeline_limit = timeline_limit.max(n),
                                     Msg::CuratorChat(run_id) => curator_chat = run_id,
+                                    Msg::SetBackends(next) => backends = next,
                                     Msg::Rename(id, name) => renames.push((id, name)),
                                     Msg::SetBrief(id, brief) => briefs.push((id, brief)),
                                     Msg::SetArchived(id, archived) => archives.push((id, archived)),
@@ -542,6 +544,10 @@ impl Watcher {
 
     pub fn curator_chat(&self, run_id: Option<i64>) {
         self.tx.send(Msg::CuratorChat(run_id)).ok();
+    }
+
+    pub fn set_backends(&self, backends: Vec<Backend>) {
+        self.tx.send(Msg::SetBackends(backends)).ok();
     }
 
     pub fn notebook(&self, op: NotebookOp) {

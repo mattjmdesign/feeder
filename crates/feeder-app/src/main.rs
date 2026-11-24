@@ -41,6 +41,7 @@ pub use media::{MediaSlide, media_slides};
 use watch::{Want, Watcher};
 
 const PAGE: usize = 25;
+pub const STARTER_PROMPT: &str = "Post a short Feeder update for this project.";
 
 static WINDOW_HANDLE: OnceLock<Mutex<Option<WindowHandle>>> = OnceLock::new();
 
@@ -101,6 +102,7 @@ pub struct ToastItem {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum CopyTarget {
     McpConfig,
+    StarterPrompt,
     ProjectContext,
     LightboxImage,
     Update(i64),
@@ -298,6 +300,20 @@ impl State {
     pub fn close_settings(&mut self) {
         self.settings_open = false;
         self.curator.close_select();
+    }
+
+    pub fn rescan_clis(&mut self) {
+        feeder_core::setup::refresh_search_paths();
+        let wake = self.wake.clone();
+        self.agents.rescan(wake.as_ref());
+        self.curator_sign_in.rescan(wake.as_ref());
+        for b in feeder_core::gardener::Backend::ALL {
+            self.curator.clear_model_failure(b);
+        }
+    }
+
+    pub fn tools_connected(&self) -> bool {
+        !self.projects.is_empty() || self.agents.has_connected()
     }
 
     pub fn dismiss_menus(&mut self) {
@@ -1145,10 +1161,18 @@ fn poll(s: &mut State, clock: f64, tx: &mut Tx) -> bool {
     }
     s.sync_search();
     changed |= s.notebook.chat.drain();
-    s.curator_sign_in.follow_accounts(s.settings_open && s.settings_page == chrome::SettingsPage::Curator, s.wake.as_ref());
+    s.curator_sign_in.follow_accounts(
+        s.settings_open && s.settings_page == chrome::SettingsPage::Curator && s.notebook.preview_backends.is_none(),
+        s.wake.as_ref(),
+    );
     changed |= s.curator_sign_in.poll();
     if let Some(installed) = s.curator_sign_in.take_installed() {
-        s.notebook.gardener.backends = installed;
+        if s.notebook.preview_backends.is_none() {
+            s.notebook.gardener.backends = installed.clone();
+        }
+        if let Some(w) = &s.watcher {
+            w.set_backends(installed);
+        }
         changed = true;
     }
     if let Some(backend) = s.curator_sign_in.take_connected() {
@@ -1199,7 +1223,8 @@ fn poll(s: &mut State, clock: f64, tx: &mut Tx) -> bool {
         let wake = s.wake.clone();
         s.curator.want_models(b, wake.as_ref());
     }
-    s.agents.follow_settings(s.settings_open, s.wake.as_ref());
+    let need_tools = s.settings_open || (s.loaded && s.projects.is_empty());
+    s.agents.follow_scan(need_tools, s.wake.as_ref());
     changed |= s.agents.take();
     if let Some(cache) = &s.images {
         for (name, app) in s.agents.icons.drain(..) {
@@ -1292,6 +1317,9 @@ fn poll(s: &mut State, clock: f64, tx: &mut Tx) -> bool {
             }
             if let Some(changes) = &s.notebook.preview_changes {
                 g.changes.clone_from(changes);
+            }
+            if let Some(backends) = &s.notebook.preview_backends {
+                g.backends.clone_from(backends);
             }
             s.notebook
                 .chat
@@ -1689,20 +1717,46 @@ fn main() {
                 s.notebook_new_page();
             }),
             ("settings", |s| s.settings_open = true),
+            ("settings-tools", |s| {
+                s.settings_page = chrome::SettingsPage::Agents;
+                s.settings_open = true;
+            }),
             ("settings-curator", |s| {
-                s.notebook.gardener.backends = feeder_core::gardener::Backend::ALL.to_vec();
+                let all = feeder_core::gardener::Backend::ALL.to_vec();
+                s.notebook.preview_backends = Some(all.clone());
+                s.notebook.gardener.backends = all;
                 s.curator_sign_in.demo();
                 s.curator.demo();
                 s.settings_page = chrome::SettingsPage::Curator;
                 s.settings_open = true;
             }),
+            ("settings-curator-partial", |s| {
+                use feeder_core::gardener::Backend;
+                let partial = vec![Backend::Codex, Backend::Antigravity];
+                s.notebook.preview_backends = Some(partial.clone());
+                s.notebook.gardener.backends = partial;
+                s.curator_sign_in.demo();
+                s.curator.prefs = feeder_core::gardener::CuratorPrefs::default();
+                s.settings_page = chrome::SettingsPage::Curator;
+                s.settings_open = true;
+            }),
+            ("curator-none", |s| {
+                s.notebook.preview_backends = Some(vec![]);
+                s.notebook.gardener.backends = vec![];
+                s.curator.prefs = feeder_core::gardener::CuratorPrefs::default();
+                s.tab = Tab::Curator;
+            }),
             ("curator-off", |s| {
-                s.notebook.gardener.backends = feeder_core::gardener::Backend::ALL.to_vec();
+                let all = feeder_core::gardener::Backend::ALL.to_vec();
+                s.notebook.preview_backends = Some(all.clone());
+                s.notebook.gardener.backends = all;
                 s.curator.prefs = feeder_core::gardener::CuratorPrefs::default();
                 s.tab = Tab::Curator;
             }),
             ("curator-picker", |s| {
-                s.notebook.gardener.backends = feeder_core::gardener::Backend::ALL.to_vec();
+                let all = feeder_core::gardener::Backend::ALL.to_vec();
+                s.notebook.preview_backends = Some(all.clone());
+                s.notebook.gardener.backends = all;
                 s.curator_sign_in.demo();
                 s.curator.demo();
                 s.tab = Tab::Curator;
@@ -1710,7 +1764,9 @@ fn main() {
             }),
             ("curator-picker-opencode", |s| {
                 use feeder_core::gardener::Backend;
-                s.notebook.gardener.backends = Backend::ALL.to_vec();
+                let all = Backend::ALL.to_vec();
+                s.notebook.preview_backends = Some(all.clone());
+                s.notebook.gardener.backends = all;
                 s.curator_sign_in.demo();
                 s.curator.demo_opencode();
                 s.notebook.curator_backend = Some(Backend::OpenCode);

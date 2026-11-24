@@ -6,6 +6,7 @@ use rune_kit::{Kit, PaletteSeed};
 pub struct Palette {
     pub dark: bool,
     pub bg: Color,
+    pub rail: Color,
     pub card: Color,
     pub hover: Color,
     pub hairline: Color,
@@ -23,6 +24,7 @@ pub fn palette(dark: bool) -> Palette {
         Palette {
             dark,
             bg: oklch(0.135, 0.002, 260.0),
+            rail: oklch(0.105, 0.002, 260.0),
             card: oklch(0.18, 0.003, 260.0),
             hover: oklch(1.0, 0.0, 0.0).alpha(0.06),
             hairline: oklch(1.0, 0.0, 0.0).alpha(0.09),
@@ -38,6 +40,7 @@ pub fn palette(dark: bool) -> Palette {
         Palette {
             dark,
             bg: oklch(0.968, 0.002, 260.0),
+            rail: oklch(0.940, 0.003, 260.0),
             card: oklch(1.0, 0.0, 0.0),
             hover: oklch(0.0, 0.0, 0.0).alpha(0.045),
             hairline: oklch(0.0, 0.0, 0.0).alpha(0.085),
@@ -67,16 +70,18 @@ pub fn kit(p: &Palette) -> Kit {
 
 pub const PANE_INSET: f32 = 8.0;
 
-pub fn pane_kit(k: &Kit) -> Kit {
+pub fn pane_kit(k: &Kit, p: &Palette) -> Kit {
     let mut k = k.clone();
     k.radius.lg = 12.0;
+    k.c.bg_deep = p.rail;
+    k.c.border_muted = p.hairline;
     k
 }
 
-pub fn open_pane_kit(k: &Kit) -> Kit {
-    let mut k = pane_kit(k);
-    k.c.bg_base = k.c.bg_deep;
-    k.c.border_muted = Color::TRANSPARENT;
+pub fn open_pane_kit(k: &Kit, p: &Palette) -> Kit {
+    let mut k = pane_kit(k, p);
+    k.c.bg_base = if p.dark { oklch(0.148, 0.002, 260.0) } else { p.bg };
+    k.c.border_muted = if p.dark { oklch(1.0, 0.0, 0.0).alpha(0.075) } else { oklch(0.0, 0.0, 0.0).alpha(0.075) };
     k
 }
 

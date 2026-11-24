@@ -1274,9 +1274,19 @@ fn agents_section(s: &State, p: &Palette, k: &Kit) -> El {
     match &s.agents.rows {
         None => rows.push(note("Looking for tools on this Mac…")),
         Some(found) if found.is_empty() => {
-            rows.push(note("None of the tools Feeder sets up are installed. Paste the MCP config below into your tool instead."))
+            let supported: Vec<&str> = Tool::ALL.into_iter().map(Tool::name).collect();
+            rows.push(note(&format!(
+                "None of the supported tools ({}) were found. Paste the MCP config below into your tool instead, or click Scan Again after installing one.",
+                supported.join(", ")
+            )));
         }
-        Some(found) => rows.extend(found.iter().map(|(tool, link)| agent_row(s, p, k, *tool, link))),
+        Some(found) => {
+            rows.extend(found.iter().map(|(tool, link)| agent_row(s, p, k, *tool, link)));
+            let missing: Vec<&str> = Tool::ALL.into_iter().filter(|t| !found.iter().any(|(f, _)| f == t)).map(Tool::name).collect();
+            if !missing.is_empty() {
+                rows.push(note(&format!("Not detected on this Mac: {}.", missing.join(", "))));
+            }
+        }
     }
     let copy_label = if s.is_copied(CopyTarget::McpConfig) { "Copied" } else { "Copy Config" };
     rows.push(
@@ -1300,7 +1310,15 @@ fn agents_section(s: &State, p: &Palette, k: &Kit) -> El {
             )),
     );
     rows.push(note("Restart a tool after connecting or disconnecting it. Then ask an agent in any project to post a Feeder update."));
-    section(p, "Tools on this Mac", rows).key(AGENTS_SECTION_KEY)
+    let scanning = s.agents.is_scanning();
+    let rescan = Button::new(if scanning { "Scanning…" } else { "Scan Again" })
+        .variant(ButtonVariant::GhostMuted)
+        .control_size(ControlSize::Small)
+        .disabled(scanning)
+        .on_press(|s: &mut State| s.rescan_clis())
+        .build(k)
+        .key("agents-rescan");
+    section_with_action(p, "Tools on this Mac", rescan, rows).key(AGENTS_SECTION_KEY)
 }
 
 fn agent_row(s: &State, p: &Palette, k: &Kit, tool: Tool, link: &Link) -> El {
@@ -1427,7 +1445,19 @@ fn uninstall_section(s: &State, p: &Palette, k: &Kit) -> El {
 }
 
 fn section(p: &Palette, title: &str, rows: Vec<El>) -> El {
-    let mut c = col().w_full().gap(12.0).child(text(title.to_string()).font(style::NAME).color(p.text_2));
+    section_header(p, title, None, rows)
+}
+
+fn section_with_action(p: &Palette, title: &str, action: El, rows: Vec<El>) -> El {
+    section_header(p, title, Some(action), rows)
+}
+
+fn section_header(p: &Palette, title: &str, action: Option<El>, rows: Vec<El>) -> El {
+    let mut head = row().w_full().center_y().gap(8.0).child(text(title.to_string()).font(style::NAME).color(p.text_2));
+    if let Some(a) = action {
+        head = head.child(rune::spacer()).child(a);
+    }
+    let mut c = col().w_full().gap(12.0).child(head);
     for r in rows {
         c = c.child(r);
     }

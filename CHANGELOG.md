@@ -3,6 +3,15 @@
 What changed in each version of Feeder, newest first. Each section is copied from
 `release-notes/<version>.md` by `scripts/changelog.sh`; edit those files, not this one.
 
+## 0.5.12
+
+- **A welcome screen for new installs.** Home walks you through connecting your coding tools, copying a prompt for your first update, and turning on Curator.
+- **Helpful empty screens.** The Feed, Library, and Curator now say what to do next instead of sitting blank.
+- **Feeder finds more of your tools.** It now looks where your terminal looks, plus common install folders, so Claude Code, OpenCode and others installed through npm, Homebrew, or their own installers show up. Use **Scan Again** in Settings or on Home after installing one.
+- **Curator settings list the tools Feeder couldn't find**, so you can tell what's missing.
+- The sidebar is a shade darker than the page, in both light and dark mode.
+- Library card previews skip headings again, so they start with the note's first sentence.
+
 ## 0.5.11
 
 - Fixed Feeder showing "Application Not Responding" in the Dock on macOS.

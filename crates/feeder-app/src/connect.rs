@@ -62,6 +62,7 @@ enum Job {
 pub struct Agents {
     pub rows: Option<Vec<(Tool, Link)>>,
     fresh: bool,
+    scanning: bool,
     pub uninstalled: bool,
     pub cli: CliStatus,
     pub icons: Vec<(String, PathBuf)>,
@@ -130,31 +131,58 @@ impl Agents {
         })
     }
 
-    pub fn follow_settings(&mut self, open: bool, wake: Option<&Waker>) {
-        if !open {
+    pub fn is_scanning(&self) -> bool {
+        self.scanning
+    }
+
+    pub fn has_connected(&self) -> bool {
+        self.rows.as_ref().is_some_and(|rows| rows.iter().any(|(_, link)| matches!(link, Link::Connected | Link::Outdated)))
+    }
+
+    pub fn follow_scan(&mut self, active: bool, wake: Option<&Waker>) {
+        if !active {
             self.fresh = false;
             return;
         }
-        if self.fresh {
+        if self.fresh || self.scanning {
             return;
         }
         self.fresh = true;
+        self.spawn_scan(wake);
+    }
+
+    pub fn rescan(&mut self, wake: Option<&Waker>) {
+        if self.scanning {
+            return;
+        }
+        self.fresh = true;
+        self.spawn_scan(wake);
+    }
+
+    fn spawn_scan(&mut self, wake: Option<&Waker>) {
+        self.scanning = true;
         let (inbox, wake) = (self.inbox.clone(), wake.cloned());
-        std::thread::spawn(move || {
-            let bin = setup::feeder_binary();
-            let found: Vec<Tool> = Tool::ALL.into_iter().filter(|t| setup::detected(*t)).collect();
-            let icons = found
-                .iter()
-                .filter(|t| !crate::agents::has_logo(t.name()))
-                .filter_map(|t| Some((t.name().to_string(), setup::app_path(*t)?)))
-                .collect();
-            let rows = found.into_iter().map(|t| (t, setup::status(t, &bin).into())).collect();
-            let cli = match setup::cli_on_path(&bin) {
-                Some((path, on_path)) => CliStatus::Installed { path, on_path },
-                None => CliStatus::NotInstalled,
-            };
-            send(&inbox, wake.as_ref(), Msg::Scanned(rows, icons, cli));
-        });
+        if std::thread::Builder::new()
+            .name("feeder-tool-scan".into())
+            .spawn(move || {
+                let bin = setup::feeder_binary();
+                let found: Vec<Tool> = Tool::ALL.into_iter().filter(|t| setup::detected(*t)).collect();
+                let icons = found
+                    .iter()
+                    .filter(|t| !crate::agents::has_logo(t.name()))
+                    .filter_map(|t| Some((t.name().to_string(), setup::app_path(*t)?)))
+                    .collect();
+                let rows = found.into_iter().map(|t| (t, setup::status(t, &bin).into())).collect();
+                let cli = match setup::cli_on_path(&bin) {
+                    Some((path, on_path)) => CliStatus::Installed { path, on_path },
+                    None => CliStatus::NotInstalled,
+                };
+                send(&inbox, wake.as_ref(), Msg::Scanned(rows, icons, cli));
+            })
+            .is_err()
+        {
+            self.scanning = false;
+        }
     }
 
     pub fn connect(&mut self, tool: Tool, wake: Option<&Waker>) {
@@ -190,6 +218,7 @@ impl Agents {
         for msg in msgs {
             match msg {
                 Msg::Scanned(mut rows, icons, cli) => {
+                    self.scanning = false;
                     self.icons.extend(icons);
                     for (tool, link) in &mut rows {
                         if let Some(busy @ (Link::Connecting | Link::Disconnecting)) = self.link(*tool) {
