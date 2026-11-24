@@ -1,7 +1,7 @@
 # Feeder: working rules for agents
 
 Feeder is a macOS app where coding agents post short updates (Done, Why, Next) to a feed per
-project, plus a shared Notebook of lessons. This file is how to change it without breaking the
+project, plus a shared Library of lessons. This file is how to change it without breaking the
 app, the user's data or the development Mac's disk. People contributing start at
 [CONTRIBUTING.md](CONTRIBUTING.md); the rules here apply to them too.
 
@@ -35,10 +35,10 @@ pnpm --dir site dev
 
 | Path | What it is |
 | --- | --- |
-| `crates/feeder-core` | The store (SQLite), Notebook, knowledge flags/changes, git worktree/file preview, and agent setup (`setup` edits each tool's MCP config) |
+| `crates/feeder-core` | The store (SQLite), Library, knowledge flags/changes, git worktree/file preview, and agent setup (`setup` edits each tool's MCP config) |
 | `crates/feeder-core/src/gardener` | Curator backend: runs the person's own `claude`, `codex`, `opencode`, or `antigravity` in isolated profiles wired to `feeder mcp --gardener`, plus auth checks, prefs, and chat history |
 | `crates/feeder-cli` | The `feeder` command, MCP server (`feeder mcp`), Curator CLI (`feeder curator`), and optional local HTTP companion (`feeder serve`) |
-| `crates/feeder-app` | The window, in [Rune](https://github.com/anomalyco/rune). Includes Home, Feed, Project Updates/Files, Notebook, Curator (`gardener.rs`, `curator_settings.rs`, `curator_sign_in.rs`), scoped media loading (`media.rs`), `updater.m` (Sparkle), and `notify.m` (UserNotifications) |
+| `crates/feeder-app` | The window, in [Rune](https://github.com/anomalyco/rune). Includes Home, Feed, Project Updates/Files, Library, Curator (`gardener.rs`, `curator_settings.rs`, `curator_sign_in.rs`), scoped media loading (`media.rs`), `updater.m` (Sparkle), and `notify.m` (UserNotifications) |
 | `crates/feeder-app/src/style.rs` | Colours, type roles and corner radii. Use these; don't write sizes or weights inline |
 | `crates/feeder-app/src/main.rs` | App state, the poll loop and the snapshot scenes |
 | `site/` | The Astro website. Pushing `site/**` to `main` deploys it to GitHub Pages (`.github/workflows/pages.yml`) |
@@ -51,7 +51,7 @@ pnpm --dir site dev
 ### Code comments
 
 - **Never write comments in code.** No `//`, `///`, `//!`, `/* ... */`, `#` comments in scripts or config, or `<!-- ... -->` in templates. Write clear names and small functions instead, put CLI help strings in `clap` `#[command(about = ...)]` / `#[arg(help = ...)]` attributes, and put project docs in Markdown files (`AGENTS.md`, `README.md`).
-- `scripts/no-comments.sh` enforces this across all owned code files (only `#!` shebangs, vendored `site/src/stageshow/`, and generated `assets/ThirdPartyLicenses.html` are exempt).
+- `scripts/no-comments.sh` enforces this across all owned code files (only `#!` shebangs, vendored `site/src/stageshow/`, and generated `assets/ThirdPartyLicenses.html` / `site/public/licenses.html` are exempt).
 
 ### Privacy
 

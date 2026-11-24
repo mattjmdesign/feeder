@@ -23,12 +23,12 @@ mod updater;
 mod watch;
 
 use std::collections::HashMap;
-use std::sync::atomic::AtomicUsize;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::mpsc::{Receiver, TryRecvError};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
-use feeder_core::{FeedUpdate, ProjectSummary, Reply, Settings, Theme, now_ms, parse_attention};
+use feeder_core::{FeedReviewStatus, FeedUpdate, ProjectSummary, Reply, Settings, Theme, now_ms, parse_attention};
 use rune::{
     AppSpec, ClipboardContent, ClipboardImage, Cx, El, Image, ImageCache, Player, PointerPress, Taskbar, TextEdit, Tx, Waker, WindowHandle,
     col, el,
@@ -43,6 +43,8 @@ use watch::{Want, Watcher};
 const PAGE: usize = 25;
 
 static WINDOW_HANDLE: OnceLock<Mutex<Option<WindowHandle>>> = OnceLock::new();
+
+static REDUCED_MOTION: AtomicBool = AtomicBool::new(false);
 
 fn window_slot() -> &'static Mutex<Option<WindowHandle>> {
     WINDOW_HANDLE.get_or_init(|| Mutex::new(None))
@@ -83,6 +85,7 @@ pub enum HomeFilter {
 pub enum ToastKind {
     Info,
     UndoArchive { project_id: i64, was_archived: bool },
+    UndoNoteArchive { page_id: i64, was_archived: bool },
     UndoDismiss { update_id: i64 },
     Flagged { project_id: Option<i64> },
     Error,
@@ -103,6 +106,7 @@ pub enum CopyTarget {
     Update(i64),
     Reply(i64),
     NotebookPage(i64),
+    FilePreview(u64),
 }
 
 pub struct State {
@@ -118,6 +122,7 @@ pub struct State {
     pub timeline: Vec<FeedUpdate>,
     pub timeline_limit: usize,
     pub replies: HashMap<i64, Vec<Reply>>,
+    pub review_statuses: HashMap<i64, FeedReviewStatus>,
     timeline_asked: Arc<AtomicUsize>,
     pub loaded: bool,
     pub open: Option<i64>,
@@ -177,6 +182,7 @@ pub struct State {
     pub(crate) wake: Option<Waker>,
     pub(crate) images: Option<ImageCache>,
     pub shots: HashMap<i64, Image>,
+    pub media_dirty: bool,
     pub feed_visible_rows: Option<std::ops::Range<usize>>,
     pub project_visible_rows: Option<std::ops::Range<usize>>,
     pub videos: HashMap<i64, Player>,
@@ -203,6 +209,7 @@ impl State {
             timeline: vec![],
             timeline_limit: watch::TIMELINE_PAGE,
             replies: HashMap::new(),
+            review_statuses: HashMap::new(),
             timeline_asked: Arc::new(AtomicUsize::new(watch::TIMELINE_PAGE)),
             loaded: false,
             open: None,
@@ -262,6 +269,7 @@ impl State {
             wake: None,
             images: None,
             shots: HashMap::new(),
+            media_dirty: false,
             feed_visible_rows: None,
             project_visible_rows: None,
             videos: HashMap::new(),
@@ -308,7 +316,7 @@ impl State {
         self.open_project_at(id, None);
     }
 
-    fn open_project_at(&mut self, id: i64, update_id: Option<i64>) {
+    pub fn open_project_at(&mut self, id: i64, update_id: Option<i64>) {
         self.open = Some(id);
         self.hovered = None;
         self.dismiss_menus();
@@ -323,12 +331,12 @@ impl State {
         self.brief_editing = None;
         self.editing_update = None;
         self.replying_to = None;
-        self.feed_selected = None;
+        self.feed_selected = update_id;
         self.pending_scroll = update_id;
-        if update_id.is_some() {
-            self.files.view = files::ProjectView::Updates;
-        }
+        self.files.view = files::ProjectView::Updates;
+        self.files.close_preview();
         self.project_visible_rows = None;
+        self.media_dirty = true;
         self.limit = PAGE;
         let seeded: Vec<FeedUpdate> = self.timeline.iter().filter(|u| u.project_id == id).cloned().collect();
         if !seeded.is_empty() || self.summary(id).is_some_and(|sum| sum.updates == 0) {
@@ -361,6 +369,9 @@ impl State {
         self.feed_selected = None;
         self.pending_scroll = None;
         self.project_visible_rows = None;
+        self.files.view = files::ProjectView::Updates;
+        self.files.close_preview();
+        self.media_dirty = true;
         self.close_lightbox();
         self.delete_confirm = None;
         self.ask();
@@ -382,22 +393,57 @@ impl State {
         self.set_card_slide(update_id, next);
     }
 
+    pub fn sync_media(&mut self) {
+        media::sync(self);
+        self.media_dirty = false;
+    }
+
+    pub fn update_is_flagged_or_reviewed(&self, update_id: i64) -> bool {
+        self.open_flag_for_update(update_id)
+            || matches!(self.review_statuses.get(&update_id), Some(FeedReviewStatus::Queued | FeedReviewStatus::Reviewed { .. }))
+    }
+
+    fn pause_active_video(&self, except: Option<i64>) {
+        if let Some(prev) = self.lightbox
+            && except != Some(prev)
+            && let Some(player) = self.videos.get(&prev)
+        {
+            player.pause();
+        }
+    }
+
+    pub fn lightbox_compare_pair(&self, current: i64, compare: i64) -> Option<(i64, i64)> {
+        if current == compare {
+            return None;
+        }
+        let Some((ua, pos_a, _)) = self.find_media(current) else {
+            return Some((compare, current));
+        };
+        let Some((ub, pos_b, _)) = self.find_media(compare) else {
+            return Some((compare, current));
+        };
+        let ord = if ua.id != ub.id { ua.created_at.cmp(&ub.created_at).then(ua.id.cmp(&ub.id)) } else { pos_a.cmp(&pos_b) };
+        if ord == std::cmp::Ordering::Less { Some((current, compare)) } else { Some((compare, current)) }
+    }
+
     pub fn set_card_slide(&mut self, update_id: i64, idx: usize) {
         self.card_slide.insert(update_id, idx);
-        media::sync(self);
+        self.sync_media();
     }
 
     pub fn open_lightbox(&mut self, media_id: i64, tx: &mut Tx) {
+        self.pause_active_video(Some(media_id));
         self.lightbox = Some(media_id);
         self.lightbox_zoom.reset();
         self.lightbox_compare = None;
         self.lightbox_split = 0.5;
         self.clear_copied(CopyTarget::LightboxImage);
-        media::sync(self);
+        self.sync_media();
         tx.focus_when_shown(rune_kit::image_zoom::KEY, false);
     }
 
     pub fn select_lightbox(&mut self, media_id: i64) {
+        self.pause_active_video(Some(media_id));
         self.lightbox = Some(media_id);
         self.lightbox_zoom.reset();
         self.lightbox_compare = None;
@@ -406,21 +452,22 @@ impl State {
             let uid = u.id;
             self.card_slide.insert(uid, slide_idx);
         }
-        media::sync(self);
+        self.sync_media();
     }
 
     pub fn close_lightbox(&mut self) {
+        self.pause_active_video(None);
         self.lightbox = None;
         self.lightbox_zoom.reset();
         self.lightbox_compare = None;
         self.clear_copied(CopyTarget::LightboxImage);
-        media::sync(self);
+        self.sync_media();
     }
 
     pub fn toggle_lightbox_compare(&mut self) {
         if self.lightbox_compare.is_some() {
             self.lightbox_compare = None;
-            media::sync(self);
+            self.sync_media();
             return;
         }
         let Some(id) = self.lightbox else { return };
@@ -434,7 +481,7 @@ impl State {
         if let Some(other) = other {
             self.lightbox_compare = Some(other);
             self.lightbox_split = 0.5;
-            media::sync(self);
+            self.sync_media();
         }
     }
 
@@ -532,6 +579,7 @@ impl State {
         if let Some(w) = &self.watcher {
             w.add_reply(uid, text);
         }
+        self.reconcile_home_filter();
     }
 
     pub fn dismiss_attention(&mut self, uid: i64) {
@@ -549,6 +597,7 @@ impl State {
         if let Some(w) = &self.watcher {
             w.dismiss_attention(uid);
         }
+        self.reconcile_home_filter();
         self.push_toast(
             format!("dismiss-{uid}"),
             ToastItem { title: "Dismissed Needs you".into(), description: None, kind: ToastKind::UndoDismiss { update_id: uid } },
@@ -596,6 +645,7 @@ impl State {
         } else {
             self.branch_filter = Some(branch.to_string());
         }
+        self.media_dirty = true;
     }
 
     pub fn set_archived(&mut self, id: i64, archived: bool) {
@@ -617,6 +667,7 @@ impl State {
         if archived && self.open == Some(id) {
             self.close_project();
         }
+        self.reconcile_home_filter();
         if notify {
             let title = if archived { format!("Archived {name}") } else { format!("Restored {name}") };
             self.push_toast(
@@ -790,6 +841,7 @@ impl State {
             self.close_lightbox();
         }
         self.tab = tab;
+        self.media_dirty = true;
         match tab {
             Tab::Home => {
                 self.home_filter = HomeFilter::All;
@@ -823,6 +875,7 @@ impl State {
             if self.search_query.is_empty() {
                 self.search_snapshot_query.clear();
                 self.search_hits.clear();
+                self.media_dirty = true;
             }
             if let Some(w) = &self.watcher {
                 w.search(self.search_query.clone());
@@ -887,7 +940,6 @@ impl State {
             {
                 let id = sum.project.id;
                 self.open_project_at(id, update_id);
-                self.feed_selected = update_id;
             } else {
                 self.push_toast(
                     "missing-project-url",
@@ -983,6 +1035,12 @@ impl State {
         self.projects.iter().find(|p| p.project.id == id)
     }
 
+    fn reconcile_home_filter(&mut self) {
+        if self.loaded && self.home_filter != HomeFilter::All && home::ordered_active(self).is_empty() {
+            self.home_filter = HomeFilter::All;
+        }
+    }
+
     fn ask(&self) {
         if let Some(w) = &self.watcher {
             let files = self.window_visible && self.open.is_some() && self.files.view == files::ProjectView::Files;
@@ -1016,6 +1074,7 @@ fn view(s: &State, cx: &mut Cx<State>) -> El {
     }
     let inset = cx.titlebar_inset();
     let reduced_motion = cx.is_reduced_motion();
+    REDUCED_MOTION.store(reduced_motion, Ordering::Relaxed);
     let p = style::palette(s.dark(cx.system_dark()));
     cx.foreground(p.text);
     let k = style::kit(&p);
@@ -1065,6 +1124,11 @@ fn view(s: &State, cx: &mut Cx<State>) -> El {
 fn setup(s: &mut State, wake: Waker) {
     #[cfg(feeder_sparkle)]
     updater::bind(wake.clone());
+    if rune::tooling::headless_run().is_none() {
+        let _ = std::thread::Builder::new().name("feeder-skills-sync".into()).spawn(|| {
+            feeder_core::setup::sync_installed_skills();
+        });
+    }
     s.wake = Some(wake.clone());
     s.images = Some(ImageCache::new(wake.clone()));
     s.watcher = Some(Watcher::start(wake));
@@ -1083,6 +1147,14 @@ fn poll(s: &mut State, clock: f64, tx: &mut Tx) -> bool {
     changed |= s.notebook.chat.drain();
     s.curator_sign_in.follow_accounts(s.settings_open && s.settings_page == chrome::SettingsPage::Curator, s.wake.as_ref());
     changed |= s.curator_sign_in.poll();
+    if let Some(installed) = s.curator_sign_in.take_installed() {
+        s.notebook.gardener.backends = installed;
+        changed = true;
+    }
+    if let Some(backend) = s.curator_sign_in.take_connected() {
+        s.curator.clear_model_failure(backend);
+        changed = true;
+    }
     changed |= s.curator.poll();
     if let Some(rx) = &s.clipboard_image_rx {
         match rx.try_recv() {
@@ -1115,11 +1187,14 @@ fn poll(s: &mut State, clock: f64, tx: &mut Tx) -> bool {
     if s.settings_open && s.settings_page == chrome::SettingsPage::Curator {
         let wake = s.wake.clone();
         for b in s.curator.prefs.enabled() {
-            s.curator.want_models(b, wake.as_ref());
+            if s.notebook.gardener.backends.contains(&b) {
+                s.curator.want_models(b, wake.as_ref());
+            }
         }
     } else if s.open.is_none()
         && s.tab == Tab::Curator
         && let Some(b) = curator_settings::selected(s)
+        && s.notebook.gardener.backends.contains(&b)
     {
         let wake = s.wake.clone();
         s.curator.want_models(b, wake.as_ref());
@@ -1174,12 +1249,20 @@ fn poll(s: &mut State, clock: f64, tx: &mut Tx) -> bool {
                 && rune::tooling::headless_run().is_none()
                 && let Some(newest) = snap.timeline.iter().filter(|u| u.id > s.seen_max_update_id).max_by_key(|u| u.id)
             {
-                let project = snap.projects.iter().find(|p| p.project.id == newest.project_id).map(|p| &p.project);
-                let name = project.map_or("Feeder", |p| p.name.as_str());
-                let link =
-                    project.map_or_else(|| "feeder://feed".to_string(), |p| format!("feeder://project/{}/update/{}", p.slug, newest.id));
+                let viewing_project = s.window_visible && s.open == Some(newest.project_id) && s.files.view == files::ProjectView::Updates;
+                let viewing_feed = s.window_visible && s.open.is_none() && s.tab == Tab::Feed;
                 #[cfg(target_os = "macos")]
-                notify::post(&format!("{name} · {}", newest.agent), &newest.body, &link);
+                let active_here = notify::app_is_active() && (viewing_project || viewing_feed);
+                #[cfg(not(target_os = "macos"))]
+                let active_here = false;
+                if !active_here {
+                    let project = snap.projects.iter().find(|p| p.project.id == newest.project_id).map(|p| &p.project);
+                    let name = project.map_or("Feeder", |p| p.name.as_str());
+                    let link = project
+                        .map_or_else(|| "feeder://feed".to_string(), |p| format!("feeder://project/{}/update/{}", p.slug, newest.id));
+                    #[cfg(target_os = "macos")]
+                    notify::post(&format!("{name} · {}", newest.agent), &newest.body, &link);
+                }
             }
             s.seen_max_update_id = max_id;
         } else if !was_loaded {
@@ -1194,6 +1277,15 @@ fn poll(s: &mut State, clock: f64, tx: &mut Tx) -> bool {
                 s.notebook.open = None;
             }
         }
+        if let Some(id) = snap.created_page
+            && s.notebook.pending_open_created
+        {
+            s.notebook.pending_open_created = false;
+            if s.tab == Tab::Notebook && s.notebook.editor.is_none() {
+                s.notebook_open_page(id);
+            }
+        }
+        let mutation_err = snap.mutation_error;
         if let Some(mut g) = snap.gardener {
             if let Some(chats) = &s.notebook.preview_chats {
                 g.chats.clone_from(chats);
@@ -1201,17 +1293,26 @@ fn poll(s: &mut State, clock: f64, tx: &mut Tx) -> bool {
             if let Some(changes) = &s.notebook.preview_changes {
                 g.changes.clone_from(changes);
             }
+            s.notebook
+                .chat
+                .in_flight_proposals
+                .retain(|pid| g.proposals.iter().find(|p| p.id == *pid).is_some_and(|p| p.status == feeder_core::ProposalStatus::Pending));
+            s.notebook.chat.in_flight_changes.retain(|cid| g.changes.iter().find(|c| c.id == *cid).is_some_and(|c| !c.is_reverted()));
             s.notebook.gardener = g;
         }
         s.replies = snap.replies;
+        s.review_statuses = snap.review_statuses;
         s.search_snapshot_query = snap.search_query;
         s.search_hits = snap.search_hits;
         s.error = snap.error;
         s.loaded = true;
-        if let Some(err) = snap.mutation_error {
+        s.reconcile_home_filter();
+        if let Some(err) = &mutation_err {
+            s.notebook.chat.in_flight_proposals.clear();
+            s.notebook.chat.in_flight_changes.clear();
             s.push_toast(
                 "watcher-error",
-                ToastItem { title: "Action failed".into(), description: Some(err), kind: ToastKind::Error },
+                ToastItem { title: "Action failed".into(), description: Some(err.clone()), kind: ToastKind::Error },
                 Some(5.0),
             );
         }
@@ -1242,6 +1343,23 @@ fn poll(s: &mut State, clock: f64, tx: &mut Tx) -> bool {
                         s.brief_draft = edit;
                         s.brief_editing = Some(project_id);
                         tx.focus_when_shown("brief-input", false);
+                    }
+                }
+                watch::FailedWrite::CreatePage(draft) => {
+                    s.notebook.pending_open_created = false;
+                    if s.notebook.editor.is_none() {
+                        s.notebook.editor = Some(notebook::Editor::from_failed_draft(None, draft, mutation_err.clone()));
+                        s.notebook.open = None;
+                        s.tab = Tab::Notebook;
+                        tx.focus_when_shown("nb-editor-title", false);
+                    }
+                }
+                watch::FailedWrite::RevisePage { id, draft } => {
+                    if s.notebook.editor.is_none() {
+                        s.notebook.editor = Some(notebook::Editor::from_failed_draft(Some(id), draft, mutation_err.clone()));
+                        s.notebook.open = None;
+                        s.tab = Tab::Notebook;
+                        tx.focus_when_shown("nb-editor-title", false);
                     }
                 }
             }
@@ -1283,7 +1401,7 @@ fn poll(s: &mut State, clock: f64, tx: &mut Tx) -> bool {
         {
             s.open = None;
         }
-        media::sync(s);
+        s.media_dirty = true;
         if let Some(id) = s.lightbox
             && s.find_media(id).is_none()
         {
@@ -1324,9 +1442,11 @@ fn poll(s: &mut State, clock: f64, tx: &mut Tx) -> bool {
         s.last_badge = Some(unseen);
     }
 
-    media::sync(s);
+    if s.media_dirty {
+        s.sync_media();
+    }
 
-    if rune::tooling::headless_run().is_none() && s.pulse_halo_visible() {
+    if rune::tooling::headless_run().is_none() && !REDUCED_MOTION.load(Ordering::Relaxed) && s.pulse_halo_visible() {
         if clock - s.last_pulse_tick >= 0.065 {
             s.last_pulse_tick = clock;
             changed = true;
@@ -1380,7 +1500,6 @@ fn system_font_faces() -> &'static [&'static [u8]] {
 }
 
 fn main() {
-    rune::prewarm_gpu();
     let mut app = rune::App::new(AppSpec::<State> {
         min_size: Some((640.0, 480.0)),
         scenes: &[
@@ -1933,5 +2052,60 @@ mod tests {
         assert_eq!(home::needs_you_question(&sum).as_deref(), Some("Should EU prices include tax?"));
         sum.last_body = Some("Done: nothing to ask.".into());
         assert_eq!(home::needs_you_question(&sum), None);
+    }
+
+    #[test]
+    fn lightbox_compare_orders_before_and_after_chronologically() {
+        let mut s = State::new();
+        let mut older = sample_update(10, 1, "Older");
+        older.created_at = 1_000;
+        older.screenshot = Some("/tmp/older.png".into());
+        let mut newer = sample_update(11, 1, "Newer");
+        newer.created_at = 2_000;
+        newer.media = vec![
+            feeder_core::MediaAttachment {
+                id: 201,
+                update_id: 11,
+                position: 0,
+                path: "/tmp/a.png".into(),
+                width: None,
+                height: None,
+                caption: None,
+            },
+            feeder_core::MediaAttachment {
+                id: 202,
+                update_id: 11,
+                position: 1,
+                path: "/tmp/b.png".into(),
+                width: None,
+                height: None,
+                caption: None,
+            },
+        ];
+        s.feed = vec![newer, older];
+
+        assert_eq!(s.lightbox_compare_pair(-10, 201), Some((-10, 201)));
+        assert_eq!(s.lightbox_compare_pair(201, -10), Some((-10, 201)));
+        assert_eq!(s.lightbox_compare_pair(202, 201), Some((201, 202)));
+    }
+
+    #[test]
+    fn review_status_hides_flag_action_and_home_filter_resets_when_empty() {
+        let mut s = State::new();
+        s.loaded = true;
+        let mut sum = sample_summary(1, "alpha", "Alpha");
+        sum.needs_you = false;
+        s.projects.push(sum);
+        s.home_filter = HomeFilter::NeedsYou;
+        s.reconcile_home_filter();
+        assert_eq!(s.home_filter, HomeFilter::All);
+
+        assert!(!s.update_is_flagged_or_reviewed(10));
+        s.review_statuses.insert(10, FeedReviewStatus::Dismissed);
+        assert!(!s.update_is_flagged_or_reviewed(10));
+        s.review_statuses.insert(10, FeedReviewStatus::Queued);
+        assert!(s.update_is_flagged_or_reviewed(10));
+        s.review_statuses.insert(10, FeedReviewStatus::Reviewed { note_id: Some(7) });
+        assert!(s.update_is_flagged_or_reviewed(10));
     }
 }

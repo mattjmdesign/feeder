@@ -39,6 +39,10 @@ void feeder_notify_start(void) {
     UNUserNotificationCenter.currentNotificationCenter.delegate = notifier;
 }
 
+bool feeder_app_is_active(void) {
+    return NSThread.isMainThread && NSApp != nil && NSApp.active;
+}
+
 bool feeder_notify(const char *title, const char *body, const char *url) {
     if (!bundled()) {
         return false;

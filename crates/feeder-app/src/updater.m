@@ -21,6 +21,7 @@ typedef struct {
     const char *notes;
     const char *message;
     bool reveal;
+    bool can_advance;
 } UpdateSnapshot;
 
 @interface FeederUpdateDriver : NSObject <SPUUserDriver, NSMenuItemValidation>
@@ -212,11 +213,11 @@ void feeder_start_updater(void (*wake)(void)) {
 
 UpdateSnapshot feeder_update_snapshot(void) {
     if (!NSThread.isMainThread || driver == nil) {
-        UpdateSnapshot empty = { Idle, -1.0, NULL, NULL, NULL, false };
+        UpdateSnapshot empty = { Idle, -1.0, NULL, NULL, NULL, false, false };
         return empty;
     }
     UpdateSnapshot snapshot = { driver.phase, driver.progress, driver.version.UTF8String, driver.notes.UTF8String,
-                                driver.message.UTF8String, driver.reveal };
+                                driver.message.UTF8String, driver.reveal, driver.action != nil };
     driver.reveal = NO;
     return snapshot;
 }

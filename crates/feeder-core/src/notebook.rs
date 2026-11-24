@@ -357,7 +357,7 @@ impl PageDraft {
         for text in [&topic, &title, &body] {
             if let Some(what) = secret_in(text) {
                 return Err(Error::Invalid(format!(
-                    "this note looks like it contains {what}; the notebook is shared across projects, so leave secrets out"
+                    "this note looks like it contains {what}; the Library is shared across projects, so leave secrets out"
                 )));
             }
         }
@@ -403,10 +403,20 @@ const PAGE_COLS: &str = "id, kind, topic, title, tags, body, context, cause, rul
 
 impl Store {
     pub fn pages(&self, filter: &PageFilter) -> Result<Vec<Page>> {
-        let mut stmt = self.conn.prepare(&format!("SELECT {PAGE_COLS} FROM notebook_pages ORDER BY updated_at DESC, id DESC"))?;
-        let rows = stmt.query_map([], page_row)?;
+        let standing = (!filter.include_archived).then_some(Standing::Current.as_str());
+        let kind = filter.kind.map(Kind::as_str);
+        let topic = filter.topic.as_deref().map(|t| normalize_topic(t).unwrap_or_else(|| t.to_ascii_lowercase()));
+        let mut stmt = self.conn.prepare(&format!(
+            "SELECT {PAGE_COLS} FROM notebook_pages
+             WHERE (?1 IS NULL OR standing = ?1)
+               AND (?2 IS NULL OR kind = ?2)
+               AND (?3 IS NULL OR topic = ?3)
+               AND (?4 IS NULL OR project_id = ?4)
+             ORDER BY updated_at DESC, id DESC"
+        ))?;
+        let rows = stmt.query_map(params![standing, kind, topic, filter.project_id], page_row)?;
         let all: Vec<Page> = rows.collect::<rusqlite::Result<_>>()?;
-        Ok(all.into_iter().filter(|p| passes(p, filter)).collect())
+        if filter.tag.is_some() { Ok(all.into_iter().filter(|p| passes(p, filter)).collect()) } else { Ok(all) }
     }
 
     pub fn page(&self, id: i64) -> Result<Option<Page>> {
@@ -455,14 +465,24 @@ impl Store {
 
     pub fn similar_pages(&self, draft: &PageDraft) -> Result<Vec<Page>> {
         let want = title_words(&draft.title);
-        let mut scored: Vec<(f32, Page)> = self
-            .pages(&PageFilter::default())?
+        let mut stmt = self.conn.prepare("SELECT id, title FROM notebook_pages WHERE standing = 'current'")?;
+        let mut scored: Vec<(f32, i64)> = stmt
+            .query_map([], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?)))?
+            .collect::<rusqlite::Result<Vec<_>>>()?
             .into_iter()
-            .map(|p| (jaccard(&want, &title_words(&p.title)), p))
-            .filter(|(score, p)| *score >= SIMILAR_TITLE || p.title.eq_ignore_ascii_case(&draft.title))
+            .filter_map(|(id, title)| {
+                let score = jaccard(&want, &title_words(&title));
+                (score >= SIMILAR_TITLE || title.eq_ignore_ascii_case(&draft.title)).then_some((score, id))
+            })
             .collect();
-        scored.sort_by(|a, b| b.0.total_cmp(&a.0));
-        Ok(scored.into_iter().map(|(_, p)| p).collect())
+        scored.sort_by(|a, b| b.0.total_cmp(&a.0).then_with(|| b.1.cmp(&a.1)));
+        let mut out = Vec::with_capacity(scored.len());
+        for (_, id) in scored {
+            if let Some(page) = self.page(id)? {
+                out.push(page);
+            }
+        }
+        Ok(out)
     }
 
     pub fn create_page(&self, draft: PageDraft, author: &str, project_id: Option<i64>, on_similar: OnSimilar) -> Result<Page> {
@@ -473,7 +493,7 @@ impl Store {
                 self.similar_pages(&draft)?.into_iter().find(|p| on_similar == OnSimilar::Refuse || p.project_id == project_id)
         {
             return Err(Error::Invalid(format!(
-                "the notebook already has a page on this: #{} \"{}\". Revise it (pass id {}) rather than adding another, or file this as new only if it's a genuinely different note",
+                "the Library already has a note on this: #{} \"{}\". Revise it (pass id {}) rather than adding another, or file this as new only if it's a genuinely different note",
                 existing.id, existing.title, existing.id
             )));
         }
@@ -494,7 +514,7 @@ impl Store {
             ],
         )?;
         let id = self.conn.last_insert_rowid();
-        self.page(id)?.ok_or_else(|| Error::NotFound(format!("page {id} vanished")))
+        self.page(id)?.ok_or_else(|| Error::NotFound(format!("note {id} vanished")))
     }
 
     pub fn revise_page(&self, id: i64, draft: PageDraft, author: &str) -> Result<Page> {
@@ -518,24 +538,26 @@ impl Store {
             ],
         )?;
         if changed == 0 {
-            return Err(Error::NotFound(format!("no notebook page {id}")));
+            return Err(Error::NotFound(format!("no Library note {id}")));
         }
-        self.page(id)?.ok_or_else(|| Error::NotFound(format!("no notebook page {id}")))
+        self.page(id)?.ok_or_else(|| Error::NotFound(format!("no Library note {id}")))
     }
 
     pub fn toggle_page_task(&self, id: i64, task_index: usize, checked: bool) -> Result<Page> {
-        let page = self.page(id)?.ok_or_else(|| Error::NotFound(format!("no notebook page {id}")))?;
+        let page = self.page(id)?.ok_or_else(|| Error::NotFound(format!("no Library note {id}")))?;
         let Some(updated) = toggle_markdown_task(&page.body, task_index, checked) else {
             return Ok(page);
         };
         self.conn.execute("UPDATE notebook_pages SET body = ?1, updated_at = ?2 WHERE id = ?3", params![updated, now_ms(), id])?;
-        self.page(id)?.ok_or_else(|| Error::NotFound(format!("no notebook page {id}")))
+        self.page(id)?.ok_or_else(|| Error::NotFound(format!("no Library note {id}")))
     }
 
     pub fn set_page_standing(&self, id: i64, standing: Standing) -> Result<()> {
-        let changed = self.conn.execute("UPDATE notebook_pages SET standing = ?1 WHERE id = ?2", params![standing.as_str(), id])?;
+        let changed = self
+            .conn
+            .execute("UPDATE notebook_pages SET standing = ?1, updated_at = ?2 WHERE id = ?3", params![standing.as_str(), now_ms(), id])?;
         if changed == 0 {
-            return Err(Error::NotFound(format!("no notebook page {id}")));
+            return Err(Error::NotFound(format!("no Library note {id}")));
         }
         Ok(())
     }
@@ -543,9 +565,9 @@ impl Store {
     pub fn mark_page_helped(&self, id: i64) -> Result<Page> {
         let changed = self.conn.execute("UPDATE notebook_pages SET helped = helped + 1 WHERE id = ?1", params![id])?;
         if changed == 0 {
-            return Err(Error::NotFound(format!("no notebook page {id}")));
+            return Err(Error::NotFound(format!("no Library note {id}")));
         }
-        self.page(id)?.ok_or_else(|| Error::NotFound(format!("no notebook page {id}")))
+        self.page(id)?.ok_or_else(|| Error::NotFound(format!("no Library note {id}")))
     }
 
     pub fn delete_page(&self, id: i64) -> Result<()> {
@@ -554,11 +576,41 @@ impl Store {
     }
 
     pub fn page_tags(&self) -> Result<Vec<TagCount>> {
-        Ok(tag_counts(&self.pages(&PageFilter::default())?))
+        let mut stmt = self.conn.prepare("SELECT tags FROM notebook_pages WHERE standing = 'current'")?;
+        let mut counts: HashMap<String, usize> = HashMap::new();
+        for row in stmt.query_map([], |r| r.get::<_, String>(0))? {
+            let raw = row?;
+            for tag in raw.split_whitespace() {
+                *counts.entry(tag.to_string()).or_default() += 1;
+            }
+        }
+        let mut out: Vec<TagCount> = counts.into_iter().map(|(tag, pages)| TagCount { tag, pages }).collect();
+        out.sort_by(|a, b| b.pages.cmp(&a.pages).then_with(|| a.tag.cmp(&b.tag)));
+        Ok(out)
     }
 
     pub fn page_topics(&self) -> Result<Vec<TopicSummary>> {
-        Ok(topic_counts(&self.pages(&PageFilter::default())?))
+        let mut stmt = self.conn.prepare("SELECT topic, tags FROM notebook_pages WHERE standing = 'current'")?;
+        let mut grouped: HashMap<String, (usize, HashMap<String, usize>)> = HashMap::new();
+        for row in stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))? {
+            let (raw_topic, raw_tags) = row?;
+            let slug = normalize_topic(&raw_topic).unwrap_or_else(|| "general".into());
+            let entry = grouped.entry(slug).or_insert_with(|| (0, HashMap::new()));
+            entry.0 += 1;
+            for tag in raw_tags.split_whitespace() {
+                *entry.1.entry(tag.to_string()).or_default() += 1;
+            }
+        }
+        let mut out: Vec<TopicSummary> = grouped
+            .into_iter()
+            .map(|(topic, (pages, tag_map))| {
+                let mut tags: Vec<TagCount> = tag_map.into_iter().map(|(tag, pages)| TagCount { tag, pages }).collect();
+                tags.sort_by(|a, b| b.pages.cmp(&a.pages).then_with(|| a.tag.cmp(&b.tag)));
+                TopicSummary { label: topic_label(&topic), pages, topic, tags }
+            })
+            .collect();
+        out.sort_by(|a, b| b.pages.cmp(&a.pages).then_with(|| a.label.cmp(&b.label)));
+        Ok(out)
     }
 }
 
@@ -732,6 +784,22 @@ fn push_stripped_inline(chars: &[char], out: &mut String) {
     }
 }
 
+pub fn count_markdown_tasks(md: &str) -> usize {
+    let mut in_fence = false;
+    let mut count = 0;
+    for chunk in md.split_inclusive('\n') {
+        let trimmed = chunk.trim_start();
+        if trimmed.starts_with("```") || trimmed.starts_with("~~~") {
+            in_fence = !in_fence;
+            continue;
+        }
+        if !in_fence && find_task_box_offset(chunk).is_some() {
+            count += 1;
+        }
+    }
+    count
+}
+
 pub fn toggle_markdown_task(md: &str, task_index: usize, checked: bool) -> Option<String> {
     let mut in_fence = false;
     let mut seen = 0usize;
@@ -861,14 +929,26 @@ pub fn secret_in(text: &str) -> Option<&'static str> {
     if text.contains("-----BEGIN") && text.contains("PRIVATE KEY") {
         return Some("a private key");
     }
-    for word in text.split(|c: char| c.is_whitespace() || "\"'`(),;=".contains(c)) {
-        let long_tail = |prefix: &str| {
-            word.strip_prefix(prefix)
-                .is_some_and(|rest| rest.len() >= 16 && rest.chars().all(|c| c.is_ascii_alphanumeric() || "-_".contains(c)))
-        };
-        if ["sk-", "sk_live_", "sk_test_", "rk_live_", "ghp_", "gho_", "github_pat_", "xoxb-", "xoxp-", "glpat-", "AIza"]
-            .iter()
-            .any(|p| long_tail(p))
+    for word in text.split(|c: char| !c.is_ascii_alphanumeric() && c != '-' && c != '_') {
+        let long_tail = |prefix: &str| word.strip_prefix(prefix).is_some_and(|rest| rest.len() >= 16);
+        if [
+            "sk-",
+            "sk_live_",
+            "sk_test_",
+            "rk_live_",
+            "ghp_",
+            "gho_",
+            "ghs_",
+            "ghu_",
+            "ghr_",
+            "github_pat_",
+            "xoxb-",
+            "xoxp-",
+            "glpat-",
+            "AIza",
+        ]
+        .iter()
+        .any(|p| long_tail(p))
         {
             return Some("an API key or token");
         }
@@ -959,6 +1039,7 @@ pub(crate) fn migrate(conn: &Connection) -> Result<()> {
         conn.execute("ALTER TABLE notebook_pages ADD COLUMN human_edited INTEGER NOT NULL DEFAULT 0", [])?;
         conn.execute("UPDATE notebook_pages SET human_edited = 1 WHERE agent = ?1", params![HUMAN_AUTHOR])?;
     }
+    conn.execute("CREATE INDEX IF NOT EXISTS notebook_by_standing_topic ON notebook_pages(standing, topic, updated_at DESC, id DESC)", [])?;
 
     let needs_body: Vec<(i64, String, Option<String>, String)> = {
         let mut stmt = conn.prepare("SELECT id, context, cause, rule FROM notebook_pages WHERE trim(body) = ''")?;
@@ -1243,5 +1324,15 @@ mod tests {
         assert!(md.contains("Agents & MCP · Decision"));
         assert!(md.contains("Ship **stdio** only."));
         assert!(page.excerpt(80).contains("Considered an HTTP transport"));
+    }
+
+    #[test]
+    fn secret_in_catches_punctuation_wrapped_and_github_tokens() {
+        assert!(secret_in("Leaked key sk-abcdefghijklmnopqrstuvwxyz123456.").is_some());
+        assert!(secret_in("token:ghp_0123456789abcdef0123").is_some());
+        assert!(secret_in("[ghs_0123456789abcdef0123]").is_some());
+        assert!(secret_in("ghu_0123456789abcdef0123").is_some());
+        assert!(secret_in("ghr_0123456789abcdef0123").is_some());
+        assert_eq!(count_markdown_tasks("~~~\n- [ ] fenced\n~~~\n1. [ ] ordered\n> - [x] quoted\n"), 2);
     }
 }

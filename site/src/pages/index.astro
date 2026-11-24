@@ -9,7 +9,7 @@ import ReplyDemo from '../demo/ReplyDemo';
 import { ToolLogo } from '../demo/ToolLogo';
 import Layout from '../layouts/Layout.astro';
 import { ORBS, orbBackground } from '../lib/orb';
-import { DOWNLOAD_URL, RELEASES_URL, REPO_URL } from '../lib/site';
+import { asset, DOWNLOAD_URL, RELEASES_URL, REPO_URL } from '../lib/site';
 
 const hero = ORBS.hero!;
 const ballStyle = `background:${orbBackground(hero)}`;
@@ -92,18 +92,19 @@ const ballStyle = `background:${orbBackground(hero)}`;
           <li><code>get_feed</code><span>Recent updates and your replies</span></li>
           <li><code>post_update</code><span>What was done, why, what’s next, and media carousels</span></li>
           <li><code>pulse</code><span>Shows the agent as working on Home</span></li>
-          <li><code>search_notebook</code><span>Lessons from your other projects, before the work starts</span></li>
+          <li><code>search_notebook</code><span>Lessons from the Library across your projects</span></li>
+          <li><code>read_page</code><span>Full Library notes, checklists, and project context</span></li>
           <li><code>flag_knowledge</code><span>A note that’s missing, wrong or out of date, for Curator</span></li>
         </ul>
       </section>
 
       <section class="section feature" id="curator">
         <div class="feature__text">
-          <h2 class="section__title">Curator keeps the notebook right</h2>
+          <h2 class="section__title">Curator keeps the library right</h2>
           <p>
-            Flag an update when an agent got something wrong. Curator reads it, checks the notebook, and writes or
-            fixes the note, citing the update it came from. Every edit can be reverted, and notes you wrote by hand
-            are never overwritten.
+            Flag an update when an agent got something wrong. Curator reads it, checks the library, and proposes a
+            new note or edit, citing the update it came from. Apply the proposals you want, dismiss the rest, and
+            revert any edit. Notes you wrote by hand are never overwritten.
           </p>
           <p>
             It runs on a subscription you already have (Claude Code, Codex, OpenCode or Antigravity) and only after
@@ -186,7 +187,7 @@ const ballStyle = `background:${orbBackground(hero)}`;
           <div id="privacy">
             <dt>Storage &amp; privacy</dt>
             <dd>
-              Projects, updates, and notebook pages live in a SQLite database. Attachments are stored alongside it in{' '}
+              Projects, updates, and library pages live in a SQLite database. Attachments are stored alongside it in{' '}
               <code>~/Library/Application Support/feeder</code>. Agents run <code>feeder mcp</code> over local
               stdin/stdout with no open ports. No data is collected; the only network request checks GitHub Releases
               for app updates.
@@ -196,8 +197,9 @@ const ballStyle = `background:${orbBackground(hero)}`;
             <dt>Curator</dt>
             <dd>
               Off until you turn on a subscription in <strong>Settings → Curator</strong>. Ask answers from your notes
-              without editing them; a review makes at most five cited edits per run, each with Revert. Feeder starts
-              the tool’s own CLI with its saved sign-in; it never stores a password or API key.
+              without editing them; a review proposes up to five cited edits per run for you to apply or dismiss, each
+              with Revert. Feeder starts the tool’s own CLI with its saved sign-in; it never stores a password or API
+              key.
             </dd>
           </div>
           <div>
@@ -238,7 +240,7 @@ const ballStyle = `background:${orbBackground(hero)}`;
       <div class="foot__links">
         <a href={REPO_URL}>Source</a>
         <a href={RELEASES_URL}>Releases</a>
-        <a href={`${REPO_URL}/blob/main/assets/ThirdPartyLicenses.html`}>Third-party licenses</a>
+        <a href={asset('licenses.html')}>Third-party licenses</a>
       </div>
     </footer>
   </div>
@@ -330,8 +332,13 @@ const ballStyle = `background:${orbBackground(hero)}`;
 <style>
   .page {
     display: grid;
+    grid-template-columns: minmax(0, 1fr);
     grid-template-rows: auto 1fr auto;
     min-height: 100dvh;
+  }
+
+  main {
+    min-width: 0;
   }
 
   .top {
@@ -524,8 +531,7 @@ const ballStyle = `background:${orbBackground(hero)}`;
     margin-top: 28px;
   }
 
-  .cta__main,
-  .cta__alt {
+  .cta__main {
     display: inline-flex;
     align-items: center;
     gap: 8px;
@@ -535,33 +541,18 @@ const ballStyle = `background:${orbBackground(hero)}`;
     font-size: var(--fs-body);
     font-weight: 500;
     letter-spacing: -0.01em;
-    transition:
-      background 0.16s ease,
-      border-color 0.16s ease,
-      transform 0.14s var(--ease);
-  }
-
-  .cta__main {
     background: var(--btn-bg);
     color: var(--btn-ink);
+    transition:
+      background 0.16s ease,
+      transform 0.14s var(--ease);
   }
 
   .cta__main:hover {
     background: var(--btn-bg-hover);
   }
 
-  .cta__alt {
-    border: 1px solid var(--line-strong);
-    background: var(--surface);
-    color: var(--text);
-  }
-
-  .cta__alt:hover {
-    background: var(--hover-tint);
-  }
-
-  .cta__main:active,
-  .cta__alt:active {
+  .cta__main:active {
     transform: scale(0.97);
   }
 
@@ -658,6 +649,7 @@ const ballStyle = `background:${orbBackground(hero)}`;
     border-radius: 5px;
     background: var(--surface-subtle);
     color: var(--text);
+    overflow-wrap: anywhere;
   }
 
   .feature__text {
@@ -690,7 +682,7 @@ const ballStyle = `background:${orbBackground(hero)}`;
 
   .calls {
     display: grid;
-    grid-template-columns: repeat(4, minmax(0, 1fr));
+    grid-template-columns: repeat(3, minmax(0, 1fr));
     gap: 20px;
     margin: 24px 0 0;
     padding: 20px 0 0;
@@ -717,6 +709,12 @@ const ballStyle = `background:${orbBackground(hero)}`;
   @media (max-width: 760px) {
     .calls {
       grid-template-columns: repeat(2, minmax(0, 1fr));
+    }
+  }
+
+  @media (max-width: 420px) {
+    .calls {
+      grid-template-columns: 1fr;
     }
   }
 

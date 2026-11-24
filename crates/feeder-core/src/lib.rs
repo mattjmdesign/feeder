@@ -27,8 +27,8 @@ pub use knowledge::{
 };
 pub use notebook::{
     BODY_CHARS, CANONICAL_TOPICS, HUMAN_AUTHOR, Kind, OnSimilar, Page, PageDraft, PageFilter, Standing, TAG_COUNT, TITLE_CHARS,
-    TOPIC_MAX_CHARS, TagCount, TopicSpec, TopicSummary, compose_legacy_body, infer_topic, markdown_excerpt, normalize_tags,
-    normalize_topic, secret_in, tag_counts, toggle_markdown_task, topic_counts, topic_label,
+    TOPIC_MAX_CHARS, TagCount, TopicSpec, TopicSummary, compose_legacy_body, count_markdown_tasks, infer_topic, markdown_excerpt,
+    normalize_tags, normalize_topic, secret_in, tag_counts, toggle_markdown_task, topic_counts, topic_label,
 };
 pub use orb::{Orb, Pattern};
 pub use settings::{OrbSize, Order, Settings, Theme};

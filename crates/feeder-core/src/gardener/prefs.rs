@@ -1,14 +1,13 @@
 use std::collections::BTreeMap;
-use std::io::{self, BufRead, BufReader, Read, Write};
+use std::io::{self, Read, Write};
 use std::os::unix::fs::OpenOptionsExt;
 use std::os::unix::process::CommandExt;
 use std::path::Path;
 use std::process::{Command, Stdio};
-use std::sync::mpsc::{self, RecvTimeoutError};
 use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
-use serde_json::{Value, json};
+use serde_json::Value;
 
 use super::{Backend, profile, session};
 use crate::{Error, Result};
@@ -155,7 +154,7 @@ impl Prefs {
         let p = self.get(backend);
         RunConfig {
             model: p.model.map(|s| s.trim().to_string()).filter(|s| !s.is_empty()),
-            effort: p.effort.map(|s| s.trim().to_string()).filter(|s| !s.is_empty()),
+            effort: p.effort.map(|s| s.trim().to_ascii_lowercase()).filter(|s| !s.is_empty()),
         }
     }
 }
@@ -193,6 +192,9 @@ impl Backend {
         let bin = self.binary().ok_or_else(|| Error::NotFound(format!("{} isn't installed", self.label())))?;
         let mut cmd = profile::command(self, &bin, data)?;
         cmd.args(args);
+        if self == Self::Antigravity {
+            profile::add_antigravity_gemini_dir(&mut cmd, data)?;
+        }
         let (status, text) = read_command_stdout(&mut cmd, LIST_TIMEOUT).map_err(|e| {
             if e.kind() == io::ErrorKind::TimedOut {
                 Error::Invalid(format!("{} took too long to list its models", self.label()))
@@ -249,80 +251,16 @@ fn codex_models(data: &Path) -> Result<Vec<ModelInfo>> {
 
 fn codex_models_rpc(data: &Path) -> Result<Vec<ModelInfo>> {
     let bin = Backend::Codex.binary().ok_or_else(|| Error::NotFound("Codex isn't installed".into()))?;
-    let mut cmd = profile::command(Backend::Codex, &bin, data)?;
-    cmd.args(["app-server", "--listen", "stdio://"]);
-    let mut child = cmd.process_group(0).stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::null()).spawn()?;
-    let mut input = child.stdin.take().ok_or_else(|| Error::Invalid("Missing Codex input".into()))?;
-    let output = child.stdout.take().ok_or_else(|| Error::Invalid("Missing Codex output".into()))?;
-    let (tx, rx) = mpsc::sync_channel(16);
-    std::thread::Builder::new().name("feeder-codex-models".into()).spawn(move || {
-        let mut reader = BufReader::new(output);
-        let mut line = Vec::new();
-        loop {
-            line.clear();
-            const MAX_LINE: u64 = 1024 * 1024;
-            let Ok(bytes) = (&mut reader).take(MAX_LINE).read_until(b'\n', &mut line) else { break };
-            if bytes == 0 || (!line.ends_with(b"\n") && bytes as u64 == MAX_LINE) {
-                break;
+    let result =
+        profile::codex_rpc(&bin, data, "model/list", CODEX_RPC_TIMEOUT, 1024 * 1024, "feeder-codex-models").map_err(|e| match e {
+            Error::Io(io_err) if io_err.kind() == io::ErrorKind::TimedOut => {
+                Error::Invalid("Codex took too long to list its models".into())
             }
-            if let Ok(message) = serde_json::from_slice::<Value>(&line)
-                && tx.send(message).is_err()
-            {
-                break;
-            }
-        }
-    })?;
-
-    let result = (|| -> Result<Vec<ModelInfo>> {
-        let deadline = Instant::now() + CODEX_RPC_TIMEOUT;
-        writeln!(
-            input,
-            "{}",
-            json!({
-                "id": 1,
-                "method": "initialize",
-                "params": { "clientInfo": { "name": "feeder", "title": "Feeder", "version": env!("CARGO_PKG_VERSION") } }
-            })
-        )?;
-        input.flush()?;
-
-        let mut initialized = false;
-        loop {
-            let remaining = deadline.saturating_duration_since(Instant::now());
-            if remaining.is_zero() {
-                return Err(Error::Invalid("Codex took too long to list its models".into()));
-            }
-            let message = match rx.recv_timeout(remaining.min(Duration::from_millis(100))) {
-                Ok(message) => message,
-                Err(RecvTimeoutError::Timeout) => continue,
-                Err(RecvTimeoutError::Disconnected) => {
-                    return Err(Error::Invalid("Codex couldn't list its models. Is it signed in?".into()));
-                }
-            };
-            match message["id"].as_u64() {
-                Some(1) if !initialized && message.get("result").is_some() => {
-                    initialized = true;
-                    writeln!(input, "{}", json!({ "method": "initialized" }))?;
-                    writeln!(input, "{}", json!({ "id": 2, "method": "model/list", "params": {} }))?;
-                    input.flush()?;
-                }
-                Some(2) if message.get("result").is_some() => {
-                    let models = parse_codex_rpc(&message["result"]);
-                    return if models.is_empty() {
-                        Err(Error::NotFound("Codex hasn't listed its models yet. Run Codex once.".into()))
-                    } else {
-                        Ok(models)
-                    };
-                }
-                Some(1 | 2) => return Err(Error::Invalid("Codex couldn't list its models. Is it signed in?".into())),
-                _ => {}
-            }
-        }
-    })();
-
-    drop(input);
-    let _ = session::terminate_child(&mut child);
-    result
+            Error::Invalid(_) => Error::Invalid("Codex couldn't list its models. Is it signed in?".into()),
+            other => other,
+        })?;
+    let models = parse_codex_rpc(&result);
+    if models.is_empty() { Err(Error::NotFound("Codex hasn't listed its models yet. Run Codex once.".into())) } else { Ok(models) }
 }
 
 fn parse_codex(text: &str) -> Vec<ModelInfo> {
@@ -460,6 +398,8 @@ pub(super) fn antigravity_model(run: &RunConfig) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
+    use serde_json::json;
+
     use super::*;
 
     #[test]

@@ -12,7 +12,7 @@ render() {
     echo
     echo "## $version"
     echo
-    sed '/^## /d' "$notes" | sed '/./,$!d'
+    awk 'NR==1 && /^## / { next } { print }' "$notes" | sed '/./,$!d'
   done
 }
 

@@ -16,12 +16,12 @@ These are the parts worth checking when you review it:
 
 - **Data.** Everything lives in `~/Library/Application Support/feeder` (`0700` permissions): a
   SQLite database, copied media (symlinks are refused and image/video headers are validated), and
-  `settings.json`. Updates, replies, project briefs, and notebook pages reject common API keys and
+  `settings.json`. Updates, replies, project briefs, and library pages reject common API keys and
   tokens before saving.
 - **Curator.** When you start a session, the selected CLI sends your messages and the sources
   it reads to the model provider it uses. Ask sessions can
-  read only Notebook pages in scope. Review sessions can also read flags and Feed threads in
-  scope and make cited Notebook edits. Each CLI manages its own credentials and reuses your
+  read only Library pages in scope. Review sessions can also read flags and Feed threads in
+  scope and propose cited Library edits for you to apply or revert. Each CLI manages its own credentials and reuses your
   existing sign-in; Feeder stores none. Curator uses a subscription only after you turn it on in
   Settings → Curator. Antigravity's Curator settings live in Feeder's data directory
   (`--gemini-dir`), so Feeder never edits `~/.gemini`. Curator strips shell API keys and

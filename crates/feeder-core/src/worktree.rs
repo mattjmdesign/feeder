@@ -222,9 +222,10 @@ fn numstat(bytes: &[u8]) -> Result<HashMap<&str, (u32, u32)>, String> {
 }
 
 fn count_lines(path: &Path) -> io::Result<u32> {
+    const MAX_COUNT_BYTES: u64 = 2 * 1024 * 1024;
     let file = OpenOptions::new().read(true).custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK).open(path)?;
     let metadata = file.metadata()?;
-    if !metadata.is_file() {
+    if !metadata.is_file() || metadata.len() > MAX_COUNT_BYTES {
         return Ok(0);
     }
     let mut file = file.take(metadata.len());

@@ -1,13 +1,13 @@
 use std::collections::HashMap;
 use std::fs::File;
-use std::io::{BufRead, BufReader, Read, Write};
+use std::io::{BufRead, BufReader, Read, Seek, SeekFrom, Write};
 use std::net::{TcpListener, TcpStream};
 use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
-use feeder_core::{FeedUpdate, Project, ProjectSummary, Reply, Store, ago, now_ms, parse_attention};
+use feeder_core::{FeedUpdate, Project, ProjectSummary, Reply, Store, ago, data_dir, now_ms, parse_attention};
 use serde_json::{Value, json};
 
 use crate::todo_json;
@@ -147,9 +147,9 @@ fn handle_connection(mut stream: TcpStream, token: Option<&str>, loopback: bool)
         req.query.get("token").filter(|t| ct_eq(t, expected)).map(|t| format!("feeder_token={t}; HttpOnly; SameSite=Strict; Path=/"))
     });
 
-    let store = match Store::open_default() {
-        Ok(s) => s,
-        Err(e) => return write_json(&mut stream, "500 Internal Server Error", &json!({ "error": e.to_string() })),
+    let open_store = || match Store::open_default() {
+        Ok(s) => Ok(s),
+        Err(e) => Err(e.to_string()),
     };
 
     match (req.method.as_str(), req.path.as_str()) {
@@ -160,12 +160,23 @@ fn handle_connection(mut stream: TcpStream, token: Option<&str>, loopback: bool)
             }
             write_response(&mut stream, "200 OK", "text/html; charset=utf-8", INDEX_HTML.as_bytes(), &extra)
         }
-        ("GET", "/api/state") => match build_state_json(&store, req.query.get("project").map(String::as_str)) {
+        ("GET", p) if p.starts_with("/media/") => {
+            let name = p.trim_start_matches("/media/");
+            serve_media(&mut stream, &data_dir(), req.headers.get("range").map(String::as_str), name)
+        }
+        ("GET", "/api/state") => match open_store().and_then(|s| build_state_json(&s, req.query.get("project").map(String::as_str))) {
             Ok(v) => write_json(&mut stream, "200 OK", &v),
             Err(e) => write_json(&mut stream, "500 Internal Server Error", &json!({ "error": e })),
         },
-        ("GET", "/api/events") => serve_events(&mut stream, &store, set_cookie.as_deref()),
+        ("GET", "/api/events") => match open_store() {
+            Ok(store) => serve_events(&mut stream, &store, set_cookie.as_deref()),
+            Err(e) => write_json(&mut stream, "500 Internal Server Error", &json!({ "error": e })),
+        },
         ("POST", "/api/reply") => {
+            let store = match open_store() {
+                Ok(s) => s,
+                Err(e) => return write_json(&mut stream, "500 Internal Server Error", &json!({ "error": e })),
+            };
             let Ok(v) = serde_json::from_slice::<Value>(&req.body) else {
                 return write_json(&mut stream, "400 Bad Request", &json!({ "error": "invalid JSON" }));
             };
@@ -180,6 +191,10 @@ fn handle_connection(mut stream: TcpStream, token: Option<&str>, loopback: bool)
             }
         }
         ("POST", "/api/dismiss") => {
+            let store = match open_store() {
+                Ok(s) => s,
+                Err(e) => return write_json(&mut stream, "500 Internal Server Error", &json!({ "error": e })),
+            };
             let Ok(v) = serde_json::from_slice::<Value>(&req.body) else {
                 return write_json(&mut stream, "400 Bad Request", &json!({ "error": "invalid JSON" }));
             };
@@ -196,6 +211,10 @@ fn handle_connection(mut stream: TcpStream, token: Option<&str>, loopback: bool)
             }
         }
         ("POST", "/api/brief") => {
+            let store = match open_store() {
+                Ok(s) => s,
+                Err(e) => return write_json(&mut stream, "500 Internal Server Error", &json!({ "error": e })),
+            };
             let Ok(v) = serde_json::from_slice::<Value>(&req.body) else {
                 return write_json(&mut stream, "400 Bad Request", &json!({ "error": "invalid JSON" }));
             };
@@ -209,6 +228,10 @@ fn handle_connection(mut stream: TcpStream, token: Option<&str>, loopback: bool)
             }
         }
         ("POST", "/api/todo") => {
+            let store = match open_store() {
+                Ok(s) => s,
+                Err(e) => return write_json(&mut stream, "500 Internal Server Error", &json!({ "error": e })),
+            };
             let Ok(v) = serde_json::from_slice::<Value>(&req.body) else {
                 return write_json(&mut stream, "400 Bad Request", &json!({ "error": "invalid JSON" }));
             };
@@ -218,6 +241,10 @@ fn handle_connection(mut stream: TcpStream, token: Option<&str>, loopback: bool)
             }
         }
         ("POST", "/api/seen") => {
+            let store = match open_store() {
+                Ok(s) => s,
+                Err(e) => return write_json(&mut stream, "500 Internal Server Error", &json!({ "error": e })),
+            };
             let v = serde_json::from_slice::<Value>(&req.body).unwrap_or(json!({}));
             let res = if v.get("all").and_then(Value::as_bool) == Some(true) {
                 store.mark_all_seen()
@@ -230,10 +257,6 @@ fn handle_connection(mut stream: TcpStream, token: Option<&str>, loopback: bool)
                 Ok(()) => write_json(&mut stream, "200 OK", &json!({ "ok": true })),
                 Err(e) => write_json(&mut stream, "500 Internal Server Error", &json!({ "error": e.to_string() })),
             }
-        }
-        ("GET", p) if p.starts_with("/media/") => {
-            let name = p.trim_start_matches("/media/");
-            serve_media(&mut stream, &store, name)
         }
         _ => write_response(&mut stream, "404 Not Found", "text/plain; charset=utf-8", b"Not Found", &[]),
     }
@@ -490,12 +513,15 @@ fn reply_json(r: &Reply, now: i64) -> Value {
     })
 }
 
-fn serve_media(stream: &mut TcpStream, store: &Store, name: &str) -> std::io::Result<()> {
+fn serve_media(stream: &mut TcpStream, data_dir: &Path, range: Option<&str>, raw_name: &str) -> std::io::Result<()> {
+    let Some(name) = percent_decode_path(raw_name) else {
+        return write_response(stream, "400 Bad Request", "text/plain; charset=utf-8", b"Invalid media name", &[]);
+    };
     if name.is_empty() || name.starts_with('.') || name.contains(['/', '\\', '\0']) {
         return write_response(stream, "400 Bad Request", "text/plain; charset=utf-8", b"Invalid media name", &[]);
     }
-    let media_dir = store.dir().join("media");
-    let path = media_dir.join(name);
+    let media_dir = data_dir.join("media");
+    let path = media_dir.join(&name);
     let Ok(sym_meta) = std::fs::symlink_metadata(&path) else {
         return write_response(stream, "404 Not Found", "text/plain; charset=utf-8", b"Media not found", &[]);
     };
@@ -513,12 +539,70 @@ fn serve_media(stream: &mut TcpStream, store: &Store, name: &str) -> std::io::Re
     };
     let len = sym_meta.len();
     let mime = mime_for(&canon_file);
+    if let Some(raw_range) = range {
+        match parse_byte_range(raw_range, len) {
+            Ok((start, end)) => {
+                if file.seek(SeekFrom::Start(start)).is_err() {
+                    return write_response(stream, "500 Internal Server Error", "text/plain; charset=utf-8", b"Seek failed", &[]);
+                }
+                let count = end - start + 1;
+                let head = format!(
+                    "HTTP/1.1 206 Partial Content\r\nContent-Type: {mime}\r\nContent-Length: {count}\r\nContent-Range: bytes {start}-{end}/{len}\r\nAccept-Ranges: bytes\r\nCache-Control: private, max-age=31536000, immutable\r\nX-Content-Type-Options: nosniff\r\nReferrer-Policy: no-referrer\r\nX-Frame-Options: DENY\r\nConnection: close\r\n\r\n"
+                );
+                stream.write_all(head.as_bytes())?;
+                let _ = std::io::copy(&mut file.take(count), stream)?;
+                return stream.flush();
+            }
+            Err(()) => {
+                let head = format!(
+                    "HTTP/1.1 416 Range Not Satisfiable\r\nContent-Range: bytes */{len}\r\nAccept-Ranges: bytes\r\nContent-Length: 0\r\nX-Content-Type-Options: nosniff\r\nReferrer-Policy: no-referrer\r\nX-Frame-Options: DENY\r\nConnection: close\r\n\r\n"
+                );
+                stream.write_all(head.as_bytes())?;
+                return stream.flush();
+            }
+        }
+    }
     let head = format!(
-        "HTTP/1.1 200 OK\r\nContent-Type: {mime}\r\nContent-Length: {len}\r\nCache-Control: no-store\r\nX-Content-Type-Options: nosniff\r\nReferrer-Policy: no-referrer\r\nX-Frame-Options: DENY\r\nConnection: close\r\n\r\n"
+        "HTTP/1.1 200 OK\r\nContent-Type: {mime}\r\nContent-Length: {len}\r\nAccept-Ranges: bytes\r\nCache-Control: private, max-age=31536000, immutable\r\nX-Content-Type-Options: nosniff\r\nReferrer-Policy: no-referrer\r\nX-Frame-Options: DENY\r\nConnection: close\r\n\r\n"
     );
     stream.write_all(head.as_bytes())?;
     let _ = std::io::copy(&mut file, stream)?;
     stream.flush()
+}
+
+fn parse_byte_range(header: &str, len: u64) -> Result<(u64, u64), ()> {
+    if len == 0 {
+        return Err(());
+    }
+    let spec = header.trim().strip_prefix("bytes=").ok_or(())?;
+    if spec.contains(',') {
+        return Err(());
+    }
+    let (raw_start, raw_end) = spec.split_once('-').ok_or(())?;
+    let raw_start = raw_start.trim();
+    let raw_end = raw_end.trim();
+    if raw_start.is_empty() {
+        let suffix: u64 = raw_end.parse().map_err(|_| ())?;
+        if suffix == 0 {
+            return Err(());
+        }
+        let start = len.saturating_sub(suffix);
+        return Ok((start, len - 1));
+    }
+    let start: u64 = raw_start.parse().map_err(|_| ())?;
+    if start >= len {
+        return Err(());
+    }
+    let end = if raw_end.is_empty() {
+        len - 1
+    } else {
+        let parsed: u64 = raw_end.parse().map_err(|_| ())?;
+        if parsed < start {
+            return Err(());
+        }
+        parsed.min(len - 1)
+    };
+    Ok((start, end))
 }
 
 fn mime_for(path: &Path) -> &'static str {
@@ -613,7 +697,18 @@ fn read_request(stream: &mut TcpStream) -> Result<Option<HttpRequest>, ReadError
             return Err(ReadError::HeadersTooLarge);
         }
         if let Some((k, v)) = trimmed.split_once(':') {
-            headers.insert(k.trim().to_ascii_lowercase(), v.trim().to_string());
+            let key = k.trim().to_ascii_lowercase();
+            let val = v.trim();
+            let sep = if key == "cookie" { "; " } else { ", " };
+            headers
+                .entry(key)
+                .and_modify(|cur: &mut String| {
+                    if cur.len() + sep.len() + val.len() <= MAX_LINE_BYTES {
+                        cur.push_str(sep);
+                        cur.push_str(val);
+                    }
+                })
+                .or_insert_with(|| val.to_string());
         }
     }
     let len = match headers.get("content-length") {
@@ -646,6 +741,14 @@ fn parse_query(raw: &str) -> HashMap<String, String> {
 }
 
 fn percent_decode(s: &str) -> String {
+    percent_decode_bytes(s, true).unwrap_or_else(|| s.to_string())
+}
+
+fn percent_decode_path(s: &str) -> Option<String> {
+    percent_decode_bytes(s, false)
+}
+
+fn percent_decode_bytes(s: &str, plus_as_space: bool) -> Option<String> {
     let mut out = Vec::with_capacity(s.len());
     let bytes = s.as_bytes();
     let mut i = 0;
@@ -658,14 +761,14 @@ fn percent_decode(s: &str) -> String {
             i += 3;
             continue;
         }
-        if bytes[i] == b'+' {
+        if plus_as_space && bytes[i] == b'+' {
             out.push(b' ');
         } else {
             out.push(bytes[i]);
         }
         i += 1;
     }
-    String::from_utf8_lossy(&out).into_owned()
+    if plus_as_space { Some(String::from_utf8_lossy(&out).into_owned()) } else { String::from_utf8(out).ok() }
 }
 
 fn hex(b: u8) -> Option<u8> {
@@ -769,6 +872,9 @@ main{max-width:740px;margin:0 auto;padding:16px;}
 <script>
 let state = null, selected = null, mode = 'feed', pendingRender = false, todoOpen = false, todoClearConfirm = false, slideIdx = {};
 const replyDrafts = new Map();
+const briefDrafts = new Map();
+const todoErrors = new Map();
+let globalError = '';
 if (new URLSearchParams(location.search).has('token')) {
   const clean = new URL(location.href);
   clean.searchParams.delete('token');
@@ -778,18 +884,27 @@ function isTyping(){
   const a = document.activeElement;
   return a && (a.tagName === 'INPUT' || a.tagName === 'TEXTAREA');
 }
+function isPlayingVideo(){
+  return Array.from(document.querySelectorAll('video')).some(v => !v.paused && !v.ended);
+}
+function shouldDeferRender(){
+  return isTyping() || isPlayingVideo();
+}
+function flushPendingRender(){
+  setTimeout(() => { if(pendingRender && !shouldDeferRender()){ pendingRender = false; render(); } }, 80);
+}
 async function load(background) {
   const q = selected ? '?project=' + encodeURIComponent(selected) : '';
   const r = await fetch('/api/state' + q, { credentials: 'same-origin' });
   if(!r.ok) throw Error('Couldn’t refresh the feed.');
   state = await r.json();
-  if(background && isTyping()){ pendingRender = true; return; }
+  if(background && shouldDeferRender()){ pendingRender = true; return; }
   pendingRender = false;
   render();
 }
-document.addEventListener('focusout', () => {
-  setTimeout(() => { if(pendingRender && !isTyping()){ pendingRender = false; render(); } }, 80);
-});
+document.addEventListener('focusout', flushPendingRender);
+document.addEventListener('pause', flushPendingRender, true);
+document.addEventListener('ended', flushPendingRender, true);
 document.getElementById('projects').addEventListener('click', (e) => {
   const btn = e.target.closest('button[data-slug]');
   if(btn) pickProject(btn.dataset.slug);
@@ -800,7 +915,17 @@ function openTodos(){ todoOpen = true; todoClearConfirm = false; render(); const
 function closeEmptyTodos(){ todoOpen = false; todoClearConfirm = false; render(); }
 function stepSlide(uid, delta, total){ slideIdx[uid] = (((slideIdx[uid] || 0) + delta) % total + total) % total; render(); }
 function setSlide(uid, idx){ slideIdx[uid] = idx; render(); }
-async function markAllRead(){ await fetch('/api/seen', {method:'POST',credentials:'same-origin',headers:{'Content-Type':'application/json'},body:JSON.stringify({all:true})}); load(false); }
+async function markAllRead(){
+  try {
+    const r = await fetch('/api/seen', {method:'POST',credentials:'same-origin',headers:{'Content-Type':'application/json'},body:JSON.stringify({all:true})});
+    if(!r.ok) throw Error('Couldn’t mark updates read.');
+    globalError = '';
+    await load(false);
+  } catch (e) {
+    globalError = e?.message || 'Couldn’t mark updates read.';
+    render();
+  }
+}
 function replyDraft(uid){
   if(!replyDrafts.has(uid)) replyDrafts.set(uid, {text:'', error:'', sending:false});
   return replyDrafts.get(uid);
@@ -855,23 +980,74 @@ async function sendReply(uid, input){
     });
   }
 }
+function editBrief(pid, serverVal, el){
+  briefDrafts.set(pid, { text: el.value, dirty: el.value !== (serverVal || ''), error: '' });
+}
 async function dismissAttention(uid){
-  await fetch('/api/dismiss',{method:'POST',credentials:'same-origin',headers:{'Content-Type':'application/json'},body:JSON.stringify({update_id:uid})});
-  load(false);
+  try {
+    const r = await fetch('/api/dismiss',{method:'POST',credentials:'same-origin',headers:{'Content-Type':'application/json'},body:JSON.stringify({update_id:uid})});
+    if(!r.ok){
+      const detail = await r.json().catch(()=>null);
+      throw Error(typeof detail?.error === 'string' ? detail.error : 'Couldn’t dismiss update.');
+    }
+    globalError = '';
+    await load(false);
+  } catch (e) {
+    globalError = e?.message || 'Couldn’t dismiss update.';
+    render();
+  }
 }
 async function saveBrief(pid){
   const el = document.getElementById('brief-input');
-  await fetch('/api/brief',{method:'POST',credentials:'same-origin',headers:{'Content-Type':'application/json'},body:JSON.stringify({project_id:pid,brief:el.value})});
-  load(false);
+  if(!el) return;
+  const text = el.value;
+  try {
+    const r = await fetch('/api/brief',{method:'POST',credentials:'same-origin',headers:{'Content-Type':'application/json'},body:JSON.stringify({project_id:pid,brief:text})});
+    if(!r.ok){
+      const detail = await r.json().catch(()=>null);
+      const msg = typeof detail?.error === 'string' ? detail.error : 'Couldn’t save the brief.';
+      briefDrafts.set(pid, { text, dirty: true, error: msg });
+      render();
+      return;
+    }
+    briefDrafts.delete(pid);
+    globalError = '';
+    await load(false);
+  } catch {
+    briefDrafts.set(pid, { text, dirty: true, error: 'Couldn’t save the brief. Try again.' });
+    render();
+  }
 }
 async function postTodo(payload){
-  await fetch('/api/todo',{method:'POST',credentials:'same-origin',headers:{'Content-Type':'application/json'},body:JSON.stringify(payload)});
-  load(false);
+  const pid = payload.project_id ?? state?.projects?.find(p => p.slug === selected)?.id;
+  try {
+    const r = await fetch('/api/todo',{method:'POST',credentials:'same-origin',headers:{'Content-Type':'application/json'},body:JSON.stringify(payload)});
+    if(!r.ok){
+      const detail = await r.json().catch(()=>null);
+      const msg = typeof detail?.error === 'string' ? detail.error : 'Couldn’t update to-do.';
+      if(pid != null) todoErrors.set(pid, msg); else globalError = msg;
+      render();
+      return false;
+    }
+    if(pid != null) todoErrors.delete(pid);
+    globalError = '';
+    await load(false);
+    return true;
+  } catch {
+    const msg = 'Couldn’t update to-do. Try again.';
+    if(pid != null) todoErrors.set(pid, msg); else globalError = msg;
+    render();
+    return false;
+  }
 }
 async function addTodo(pid, el){
   const title = el.value.trim(); if(!title) return;
-  el.value = ''; todoOpen = true; todoClearConfirm = false;
-  await postTodo({action:'add', project_id:pid, title});
+  todoOpen = true; todoClearConfirm = false;
+  if(await postTodo({action:'add', project_id:pid, title})){
+    const fresh = document.getElementById('todo-input');
+    if(fresh) fresh.value = '';
+    else el.value = '';
+  }
 }
 async function toggleTodo(id, done){ todoClearConfirm = false; await postTodo({action:'toggle', id, done}); }
 async function deleteTodo(id){ todoClearConfirm = false; await postTodo({action:'delete', id}); }
@@ -906,14 +1082,18 @@ function render(){
     return `<button class="btn ${active}" data-slug="${esc(p.slug)}">${dot} ${esc(p.name)}</button>`;
   }).join('');
   const cEl = document.getElementById('content');
-  let html = '';
+  let html = globalError ? `<div class="card reply-error" role="status">${esc(globalError)}</div>` : '';
   if(selected){
     const proj = state.projects.find(p => p.slug === selected);
     if(proj){
       const todos = state.todos || [];
       const showTodoCard = todoOpen || todos.length > 0;
+      const bDraft = briefDrafts.get(proj.id);
+      const briefVal = bDraft?.dirty ? bDraft.text : (proj.brief || '');
+      const briefErr = bDraft?.error || '';
+      const todoErr = todoErrors.get(proj.id) || '';
       html += `<div class="card"><div class="meta"><strong>${esc(proj.name)}</strong>${proj.pulse?`<span class="pill">${esc(proj.pulse.agent)}: ${esc(proj.pulse.status)}</span>`:''}</div>`;
-      html += `<div style="margin-top:8px"><textarea id="brief-input" rows="2" style="width:100%;padding:8px;border-radius:8px;border:1px solid var(--line);background:transparent" placeholder="Pinned project brief (Goal / Focus / Commands)…">${esc(proj.brief||'')}</textarea><div style="margin-top:6px;display:flex;gap:8px"><button class="btn" onclick="saveBrief(${proj.id})">Save brief</button>${showTodoCard?'':`<button class="btn" onclick="openTodos()">+ To-do</button>`}</div></div></div>`;
+      html += `<div style="margin-top:8px"><textarea id="brief-input" rows="2" style="width:100%;padding:8px;border-radius:8px;border:1px solid var(--line);background:transparent" placeholder="Pinned project brief (Goal / Focus / Commands)…" oninput="editBrief(${proj.id},${JSON.stringify(proj.brief||'')},this)">${esc(briefVal)}</textarea><div style="margin-top:6px;display:flex;gap:8px;align-items:center"><button class="btn" onclick="saveBrief(${proj.id})">Save brief</button>${showTodoCard?'':`<button class="btn" onclick="openTodos()">+ To-do</button>`}<p class="reply-error" role="status">${esc(briefErr)}</p></div></div></div>`;
       if(showTodoCard){
         const openCount = todos.filter(t => !t.done).length;
         const doneCount = todos.length - openCount;
@@ -934,7 +1114,7 @@ function render(){
           }
           html += `</div>`;
         }
-        html += `<form class="reply-form" onsubmit="event.preventDefault();addTodo(${proj.id},this.querySelector('input'))"><input id="todo-input" placeholder="Add a to-do…"><button class="btn" type="submit">Add</button></form></div>`;
+        html += `<form class="reply-form" onsubmit="event.preventDefault();addTodo(${proj.id},this.querySelector('input'))"><input id="todo-input" placeholder="Add a to-do…"><button class="btn" type="submit">Add</button></form><p class="reply-error" role="status">${esc(todoErr)}</p></div>`;
       }
     }
   }
@@ -1134,6 +1314,67 @@ mod tests {
 
         drop(client);
         let _ = server.join();
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn media_percent_decode_ranges_and_cookie_headers_work() {
+        assert_eq!(percent_decode_path("hello%20world+1.png").as_deref(), Some("hello world+1.png"));
+        assert!(parse_byte_range("bytes=0-3", 10) == Ok((0, 3)));
+        assert!(parse_byte_range("bytes=4-", 10) == Ok((4, 9)));
+        assert!(parse_byte_range("bytes=-3", 10) == Ok((7, 9)));
+        assert!(parse_byte_range("bytes=20-", 10).is_err());
+
+        let dir = std::env::temp_dir().join(format!("feeder-web-media-{}-{}", std::process::id(), now_ms()));
+        let media = dir.join("media");
+        std::fs::create_dir_all(&media).unwrap();
+        std::fs::write(media.join("clip test.mp4"), b"0123456789").unwrap();
+
+        let run_media = |raw_name: &str, range: Option<&str>| -> Vec<u8> {
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            let addr = listener.local_addr().unwrap();
+            let dir_c = dir.clone();
+            let raw_owned = raw_name.to_string();
+            let range_owned = range.map(str::to_string);
+            let t = std::thread::spawn(move || {
+                let (mut s, _) = listener.accept().unwrap();
+                serve_media(&mut s, &dir_c, range_owned.as_deref(), &raw_owned).unwrap();
+            });
+            let mut client = TcpStream::connect(addr).unwrap();
+            let mut buf = Vec::new();
+            client.read_to_end(&mut buf).unwrap();
+            t.join().unwrap();
+            buf
+        };
+
+        let full = run_media("clip%20test.mp4", None);
+        let full_text = String::from_utf8_lossy(&full);
+        assert!(full_text.starts_with("HTTP/1.1 200 OK"), "{full_text}");
+        assert!(full_text.contains("Accept-Ranges: bytes"), "{full_text}");
+        assert!(full_text.ends_with("0123456789"), "{full_text}");
+
+        let partial = run_media("clip%20test.mp4", Some("bytes=2-5"));
+        let partial_text = String::from_utf8_lossy(&partial);
+        assert!(partial_text.starts_with("HTTP/1.1 206 Partial Content"), "{partial_text}");
+        assert!(partial_text.contains("Content-Range: bytes 2-5/10"), "{partial_text}");
+        assert!(partial_text.ends_with("2345"), "{partial_text}");
+
+        let bad_range = run_media("clip%20test.mp4", Some("bytes=99-"));
+        let bad_text = String::from_utf8_lossy(&bad_range);
+        assert!(bad_text.starts_with("HTTP/1.1 416 Range Not Satisfiable"), "{bad_text}");
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let t = std::thread::spawn(move || {
+            let (mut s, _) = listener.accept().unwrap();
+            read_request(&mut s).unwrap().unwrap()
+        });
+        let mut client = TcpStream::connect(addr).unwrap();
+        client.write_all(b"GET / HTTP/1.1\r\nHost: localhost\r\nCookie: a=1\r\nCookie: feeder_token=xyz\r\n\r\n").unwrap();
+        drop(client);
+        let req = t.join().unwrap();
+        assert_eq!(req.headers.get("cookie").map(String::as_str), Some("a=1; feeder_token=xyz"));
+
         std::fs::remove_dir_all(dir).ok();
     }
 }

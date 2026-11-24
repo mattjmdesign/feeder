@@ -125,7 +125,7 @@ enum Command {
         #[arg(help = "What's missing or wrong.")]
         note: Vec<String>,
         #[arg(help = "Flag a Feed thread and its replies for Curator to review.")]
-        #[arg(long, conflicts_with_all = ["note", "kind", "page", "suggest", "project"])]
+        #[arg(long, conflicts_with_all = ["note", "kind", "page", "suggest", "suggest_file", "project", "shared"])]
         update: Option<i64>,
         #[arg(help = "`missing` (default), `wrong` or `outdated`.")]
         #[arg(long)]
@@ -134,11 +134,17 @@ enum Command {
         #[arg(long)]
         page: Option<i64>,
         #[arg(help = "The correct information, if you know it.")]
-        #[arg(long)]
+        #[arg(long, conflicts_with = "suggest_file")]
         suggest: Option<String>,
+        #[arg(help = "Read a Markdown suggestion draft from a file.")]
+        #[arg(long, conflicts_with = "suggest")]
+        suggest_file: Option<PathBuf>,
         #[arg(help = "The project you're working in. Defaults to the current folder's project.")]
         #[arg(short, long)]
         project: Option<String>,
+        #[arg(help = "Flag a cross-project shared gap instead of tying it to the current folder's project.")]
+        #[arg(long, conflicts_with_all = ["project", "update"])]
+        shared: bool,
         #[arg(short, long)]
         agent: Option<String>,
         #[arg(long)]
@@ -409,10 +415,12 @@ fn run(command: Command) -> Result<(), String> {
     match command {
         Command::Post { message, project, agent, screenshot, branch, diff_stat, dir, json } => {
             let body = read_body(message)?;
+            let dir_explicit = dir.is_some();
             let dir = match dir {
                 Some(d) => d,
                 None => std::env::current_dir().map_err(|e| e.to_string())?,
             };
+            let explicit_project = project.is_some();
             let project = match project {
                 Some(name) => store.project_named(&name, None),
                 None => store.project_at(&detect_project(&dir)),
@@ -420,7 +428,12 @@ fn run(command: Command) -> Result<(), String> {
             .map_err(|e| e.to_string())?;
             let agent = agent_display_name(&agent.unwrap_or_else(default_agent));
             let screenshots: Vec<PathBuf> = screenshot.into_iter().map(|p| absolute(&p)).collect();
-            let meta = detect_git_meta(&dir);
+            let git_dir = if dir_explicit || !explicit_project {
+                Some(dir)
+            } else {
+                project.path.as_deref().map(PathBuf::from).filter(|p| p.exists())
+            };
+            let meta = git_dir.as_deref().map(detect_git_meta).unwrap_or_default();
             let branch = branch
                 .and_then(|b| {
                     let t = b.trim().to_string();
@@ -552,7 +565,7 @@ fn run(command: Command) -> Result<(), String> {
                 None if !unread => resolve_existing(&store, None).ok(),
                 None => None,
             };
-            let replies = if unread {
+            let mut replies = if unread {
                 store.unread_human_replies(target_project.as_ref().map(|p| p.id)).map_err(|e| e.to_string())?
             } else if let Some(p) = &target_project {
                 let feed = store.feed(p.id, 30, None).map_err(|e| e.to_string())?;
@@ -561,11 +574,18 @@ fn run(command: Command) -> Result<(), String> {
             } else {
                 store.unread_human_replies(None).map_err(|e| e.to_string())?
             };
-            let names: std::collections::HashMap<i64, String> =
-                store.projects().map_err(|e| e.to_string())?.into_iter().map(|s| (s.project.id, s.project.name)).collect();
+            let names = store.project_names().map_err(|e| e.to_string())?;
             if mark_read && !replies.is_empty() {
                 let ids: Vec<i64> = replies.iter().filter(|r| r.from_human && r.read_at.is_none()).map(|r| r.id).collect();
-                store.mark_replies_read(&ids).map_err(|e| e.to_string())?;
+                if !ids.is_empty() {
+                    store.mark_replies_read(&ids).map_err(|e| e.to_string())?;
+                    let read_at = now_ms();
+                    for r in &mut replies {
+                        if r.from_human && r.read_at.is_none() {
+                            r.read_at = Some(read_at);
+                        }
+                    }
+                }
             }
             if json {
                 let list: Vec<_> = replies
@@ -613,11 +633,6 @@ fn run(command: Command) -> Result<(), String> {
             } else if !text.is_empty() {
                 let body = read_body(text)?;
                 store.set_project_brief(p.id, Some(&body)).map_err(|e| e.to_string())?;
-            } else if !std::io::stdin().is_terminal() {
-                let body = read_body(text)?;
-                if !body.trim().is_empty() {
-                    store.set_project_brief(p.id, Some(&body)).map_err(|e| e.to_string())?;
-                }
             }
             let updated = store.project(p.id).map_err(|e| e.to_string())?.ok_or("project vanished")?;
             if json {
@@ -630,29 +645,46 @@ fn run(command: Command) -> Result<(), String> {
             Ok(())
         }
         Command::Todo { action, project, open, json } => run_todo(&store, action, project, open, json),
-        Command::Notebook { action } => notebook::run(&store, action, &default_agent()),
+        Command::Notebook { action } => {
+            let author = agent_from_env().unwrap_or_else(|| feeder_core::HUMAN_AUTHOR.to_string());
+            notebook::run(&store, action, &author)
+        }
         Command::Flag { update: Some(id), agent, json, .. } => {
             let author = agent.as_deref().map_or_else(|| feeder_core::HUMAN_AUTHOR.to_string(), agent_display_name);
             let flag = store.flag_update_for_notebook(id, &author).map_err(|e| e.to_string())?;
             gardener::print_flag(&flag, json);
             Ok(())
         }
-        Command::Flag { note, kind, page, suggest, project, agent, json, .. } => {
+        Command::Flag { note, kind, page, suggest, suggest_file, project, shared, agent, json, .. } => {
             let kind = kind.as_deref().unwrap_or("missing").parse().map_err(|e: feeder_core::Error| e.to_string())?;
-            let project_id = match project {
-                Some(name) => Some(store.find_project(&name).map_err(|e| e.to_string())?.ok_or(format!("no project called {name}"))?.id),
-                None => {
-                    std::env::current_dir().ok().and_then(|here| store.find_detected(&detect_project(&here)).ok().flatten()).map(|p| p.id)
+            let project_id = if shared {
+                None
+            } else {
+                match project {
+                    Some(name) => {
+                        Some(store.find_project(&name).map_err(|e| e.to_string())?.ok_or(format!("no project called {name}"))?.id)
+                    }
+                    None => std::env::current_dir()
+                        .ok()
+                        .and_then(|here| store.find_detected(&detect_project(&here)).ok().flatten())
+                        .map(|p| p.id),
                 }
             };
-            let author = agent_display_name(&agent.unwrap_or_else(default_agent));
-            let flag = feeder_core::NewFlag { kind, page_id: page, project_id, note: note.join(" "), suggestion: suggest };
+            let suggestion = match suggest_file {
+                Some(path) => Some(std::fs::read_to_string(&path).map_err(|e| format!("can't read {}: {e}", path.display()))?),
+                None => suggest,
+            };
+            let author = agent
+                .as_deref()
+                .map_or_else(|| agent_from_env().unwrap_or_else(|| feeder_core::HUMAN_AUTHOR.to_string()), agent_display_name);
+            let flag = feeder_core::NewFlag { kind, page_id: page, project_id, note: note.join(" "), suggestion };
             gardener::flag(&store, flag, &author, json)
         }
         Command::Flags { all, dismiss, reason, json } => gardener::flags(&store, all, dismiss, reason, json),
         Command::Gardener { action } => gardener::run(&store, action),
         Command::Pulse { status, project, agent, branch, ttl, clear, json } => {
             let dir = std::env::current_dir().map_err(|e| e.to_string())?;
+            let explicit_project = project.is_some();
             let project = match project {
                 Some(name) => store.project_named(&name, None),
                 None => store.project_at(&detect_project(&dir)),
@@ -669,7 +701,8 @@ fn run(command: Command) -> Result<(), String> {
                 return Ok(());
             }
             let status_text = if status.is_empty() { "Working".to_string() } else { status.join(" ") };
-            let branch = branch.or_else(|| detect_git_meta(&dir).branch);
+            let git_dir = if !explicit_project { Some(dir) } else { project.path.as_deref().map(PathBuf::from).filter(|p| p.exists()) };
+            let branch = branch.or_else(|| git_dir.as_deref().and_then(|d| detect_git_meta(d).branch));
             let ttl_ms = i64::try_from(ttl.saturating_mul(1000)).unwrap_or(120_000);
             let pulse = store.set_pulse(project.id, &agent, branch.as_deref(), &status_text, ttl_ms).map_err(|e| e.to_string())?;
             if json {

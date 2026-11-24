@@ -17,6 +17,27 @@ fi
 if ! scripts/changelog.sh --check; then
   exit 1
 fi
+case "$(rustc -vV | sed -n 's/^host: //p')" in
+  aarch64-apple-darwin) ARCH="arm64" ;;
+  *)
+    echo "Release builds run on Apple silicon (aarch64-apple-darwin) only." >&2
+    exit 1
+    ;;
+esac
+BRANCH="$(git rev-parse --abbrev-ref HEAD)"
+if [[ "$BRANCH" != "main" ]]; then
+  echo "Switch to main before releasing (currently on $BRANCH)." >&2
+  exit 1
+fi
+git fetch -q origin main
+if [[ "$(git rev-parse HEAD)" != "$(git rev-parse origin/main)" ]]; then
+  echo "Local main does not match origin/main. Push first." >&2
+  exit 1
+fi
+if ! gh auth status >/dev/null 2>&1; then
+  echo "GitHub CLI is not signed in. Run 'gh auth login' first." >&2
+  exit 1
+fi
 if [[ -n "$(git status --porcelain)" ]]; then
   echo "Commit your changes first; a release builds what's committed." >&2
   exit 1
@@ -41,10 +62,6 @@ fi
 FEEDER_SIGN_IDENTITY="$IDENTITY" FEEDER_NOTARY_PROFILE=feeder FEEDER_UPDATE_FEED_URL="$FEED_URL" \
   FEEDER_UPDATE_PUBLIC_KEY="$PUBLIC_KEY" scripts/mac-app.sh --package
 
-case "$(rustc -vV | sed -n 's/^host: //p')" in
-  aarch64-apple-darwin) ARCH="arm64" ;;
-  *) ARCH="x86_64" ;;
-esac
 BUILT="dist/Feeder-$VERSION-macos-$ARCH.dmg"
 NAME="Feeder"
 STAGE="dist/release-$VERSION"

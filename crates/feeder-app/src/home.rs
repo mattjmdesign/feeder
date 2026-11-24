@@ -154,7 +154,7 @@ fn shelf(s: &State, p: &Palette, k: &Kit, reduced_motion: bool, layer: &mut Vec<
                 .center_y()
                 .gap(12.0)
                 .child(rune::rule(1.0, p.hairline).grow(1.0))
-                .child(text(format!("ARCHIVED · {}", archived.len())).font(style::LABEL).color(p.text_3))
+                .child(text("ARCHIVED").font(style::LABEL).color(p.text_3))
                 .child(
                     chrome::bar_button("hide-archived", "Hide", p)
                         .border(1.0, p.hairline)

@@ -229,7 +229,7 @@ impl Store {
     }
 
     pub fn active_gardener_run(&self, id: i64) -> Result<Run> {
-        self.running_gardener()?.filter(|run| run.id == id).ok_or_else(|| Error::Invalid("this gardener session has ended".into()))
+        self.running_gardener()?.filter(|run| run.id == id).ok_or_else(|| Error::Invalid("this Curator session has ended".into()))
     }
 
     pub fn start_gardener_run(&self, backend: Backend) -> Result<i64> {
@@ -248,7 +248,7 @@ impl Store {
         let tx = Transaction::new_unchecked(&self.conn, TransactionBehavior::Immediate)?;
         if let Some(running) = self.running_gardener()? {
             return Err(Error::Invalid(format!(
-                "a gardener session is already running (started {})",
+                "a Curator session is already running (started {})",
                 crate::ago(running.started_at, now_ms())
             )));
         }
@@ -324,8 +324,7 @@ fn run_row(r: &Row<'_>) -> rusqlite::Result<Run> {
 }
 
 pub(crate) fn migrate(conn: &Connection) -> Result<()> {
-    let tx = Transaction::new_unchecked(conn, TransactionBehavior::Immediate)?;
-    tx.execute_batch(
+    conn.execute_batch(
         "CREATE TABLE IF NOT EXISTS gardener_runs (
             id INTEGER PRIMARY KEY,
             backend TEXT NOT NULL,
@@ -350,12 +349,12 @@ pub(crate) fn migrate(conn: &Connection) -> Result<()> {
         ("knowledge_flags", "source_update_id", "INTEGER REFERENCES updates(id) ON DELETE SET NULL"),
     ] {
         let has_column: bool =
-            tx.query_row("SELECT EXISTS(SELECT 1 FROM pragma_table_info(?1) WHERE name = ?2)", params![table, column], |r| r.get(0))?;
+            conn.query_row("SELECT EXISTS(SELECT 1 FROM pragma_table_info(?1) WHERE name = ?2)", params![table, column], |r| r.get(0))?;
         if !has_column {
-            tx.execute(&format!("ALTER TABLE {table} ADD COLUMN {column} {definition}"), [])?;
+            conn.execute(&format!("ALTER TABLE {table} ADD COLUMN {column} {definition}"), [])?;
         }
     }
-    tx.execute_batch(
+    conn.execute_batch(
         "CREATE INDEX IF NOT EXISTS notebook_changes_by_run ON notebook_changes(gardener_run_id) WHERE gardener_run_id IS NOT NULL;
          CREATE INDEX IF NOT EXISTS knowledge_flags_by_update
              ON knowledge_flags(source_update_id, (status = 'open') DESC, id DESC) WHERE source_update_id IS NOT NULL;
@@ -367,8 +366,7 @@ pub(crate) fn migrate(conn: &Connection) -> Result<()> {
             PRIMARY KEY (run_id, flag_id)
          );",
     )?;
-    chat::migrate(&tx)?;
-    tx.commit()?;
+    chat::migrate(conn)?;
     Ok(())
 }
 
@@ -530,14 +528,31 @@ mod tests {
                 StoredEvent::Event(Event::Started),
                 StoredEvent::Event(Event::ToolStarted(call)),
                 StoredEvent::Event(read),
-                StoredEvent::Event(Event::Text("Use the ".into())),
-                StoredEvent::Event(Event::Text("checklist.".into())),
+                StoredEvent::Event(Event::Text("Use the checklist.".into())),
                 StoredEvent::Event(Event::TurnFinished),
                 StoredEvent::You("Where is it?".into()),
                 StoredEvent::Event(Event::Text("In the Notebook.".into())),
                 StoredEvent::Event(Event::Ended),
             ]
         );
+    }
+
+    #[test]
+    fn long_streamed_replies_coalesce_thousands_of_deltas_without_truncating() {
+        let t = temp_store("chat-coalesce");
+        let s = &t.store;
+        let id = s
+            .claim_curator_run(Backend::ClaudeCode, Scope::Notebook, SessionMode::Ask, Some(ChatOpening::Message("Explain")))
+            .expect("start chat");
+        let mut recorder = chat::Recorder::new(Store::open(&t.dir).expect("writer connection"), id);
+        for _ in 0..2_500 {
+            recorder.record(StoredEvent::Event(Event::Text("ab ".into()))).expect("buffer delta");
+        }
+        recorder.record(StoredEvent::Event(Event::TurnFinished)).expect("flush");
+        recorder.finish(None, None).expect("finish");
+        let events = s.curator_chat_events(id).expect("replay");
+        assert_eq!(events.len(), 4);
+        assert_eq!(events[1], StoredEvent::Event(Event::Text("ab ".repeat(2_500))));
     }
 
     #[test]

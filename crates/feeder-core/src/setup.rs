@@ -216,15 +216,114 @@ pub fn status(tool: Tool, bin: &Path) -> Status {
     }
 }
 
+pub fn cli_on_path(bin: &Path) -> Option<(PathBuf, bool)> {
+    let found = which("feeder")?;
+    Some((found.clone(), same_file(&found, bin)))
+}
+
+pub fn install_cli_link(bin: &Path) -> std::io::Result<(PathBuf, bool)> {
+    let path_dirs: Vec<PathBuf> = std::env::var_os("PATH").map(|p| std::env::split_paths(&p).collect()).unwrap_or_default();
+    let preferred =
+        [home().join(".local/bin"), home().join(".cargo/bin"), PathBuf::from("/opt/homebrew/bin"), PathBuf::from("/usr/local/bin")];
+    let target_dir =
+        preferred.iter().find(|dir| path_dirs.contains(dir) && dir_writable(dir)).cloned().unwrap_or_else(|| home().join(".local/bin"));
+    std::fs::create_dir_all(&target_dir)?;
+    let link = target_dir.join("feeder");
+    let tmp = target_dir.join(format!(".feeder-link-{}-{:08x}", std::process::id(), fastrand::u32(..)));
+    std::os::unix::fs::symlink(bin, &tmp)?;
+    if let Err(e) = std::fs::rename(&tmp, &link) {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(e);
+    }
+    let on_path = path_dirs.contains(&target_dir);
+    Ok((link, on_path))
+}
+
+fn dir_writable(dir: &Path) -> bool {
+    let Ok(meta) = dir.metadata() else { return false };
+    if !meta.is_dir() {
+        return false;
+    }
+    let probe = dir.join(format!(".feeder-probe-{}-{:08x}", std::process::id(), fastrand::u32(..)));
+    match std::fs::OpenOptions::new().write(true).create_new(true).open(&probe) {
+        Ok(_) => {
+            let _ = std::fs::remove_file(&probe);
+            true
+        }
+        Err(_) => false,
+    }
+}
+
+pub(crate) fn strip_jsonc_comments(input: &str) -> String {
+    let bytes = input.as_bytes();
+    let mut out = String::with_capacity(input.len());
+    let mut i = 0;
+    let mut in_string = false;
+    while i < bytes.len() {
+        let b = bytes[i];
+        if in_string {
+            if b == b'\\' && i + 1 < bytes.len() {
+                let end = next_char_end(input, i + 1);
+                out.push_str(&input[i..end]);
+                i = end;
+                continue;
+            }
+            if b == b'"' {
+                in_string = false;
+            }
+            let end = next_char_end(input, i);
+            out.push_str(&input[i..end]);
+            i = end;
+            continue;
+        }
+        if b == b'"' {
+            in_string = true;
+            out.push('"');
+            i += 1;
+            continue;
+        }
+        if b == b'/' && bytes.get(i + 1) == Some(&b'/') {
+            i += 2;
+            while i < bytes.len() && bytes[i] != b'\n' {
+                i += 1;
+            }
+            continue;
+        }
+        if b == b'/' && bytes.get(i + 1) == Some(&b'*') {
+            i += 2;
+            while i + 1 < bytes.len() && !(bytes[i] == b'*' && bytes[i + 1] == b'/') {
+                if bytes[i] == b'\n' {
+                    out.push('\n');
+                }
+                i += 1;
+            }
+            i = (i + 2).min(bytes.len());
+            continue;
+        }
+        let end = next_char_end(input, i);
+        out.push_str(&input[i..end]);
+        i = end;
+    }
+    out
+}
+
+fn next_char_end(s: &str, start: usize) -> usize {
+    s[start..].chars().next().map_or(s.len(), |c| start + c.len_utf8())
+}
+
 fn configured_command(config: Config) -> Option<PathBuf> {
     let read_json = |path: &Path| serde_json::from_str::<Value>(&std::fs::read_to_string(path).ok()?).ok();
+    let read_jsonc = |path: &Path| {
+        let raw = std::fs::read_to_string(path).ok()?;
+        serde_json::from_str::<Value>(&strip_jsonc_comments(&raw)).ok()
+    };
     match config {
         Config::ClaudeCli { config_dir } => {
             let doc = read_json(&config_dir.unwrap_or_else(home).join(".claude.json"))?;
             doc.get("mcpServers")?.get("feeder")?.get("command")?.as_str().map(PathBuf::from)
         }
         Config::Json { path, key, opencode } => {
-            let doc = read_json(&path)?;
+            let doc = if opencode { read_jsonc(&path).or_else(|| read_jsonc(&path.with_extension("jsonc"))) } else { read_json(&path) }?;
             let server = doc.get(key)?.get("feeder")?;
             if opencode && server.get("enabled").and_then(Value::as_bool) == Some(false) {
                 return None;
@@ -234,12 +333,69 @@ fn configured_command(config: Config) -> Option<PathBuf> {
         }
         Config::CodexToml { path } => {
             let text = std::fs::read_to_string(path).ok()?;
-            let table = text.split_inclusive('\n').skip_while(|l| l.trim() != "[mcp_servers.feeder]").skip(1);
-            let line = table.take_while(|l| !l.trim_start().starts_with('[')).find(|l| l.trim_start().starts_with("command"))?;
-            let value = line.split_once('=')?.1.trim();
-            Some(PathBuf::from(value.trim_matches('"').replace("\\\\", "\\")))
+            parse_codex_command(&text)
         }
     }
+}
+
+fn strip_toml_comment(line: &str) -> &str {
+    let mut in_dq = false;
+    let mut in_sq = false;
+    let mut escaped = false;
+    for (idx, ch) in line.char_indices() {
+        if in_dq {
+            if escaped {
+                escaped = false;
+            } else if ch == '\\' {
+                escaped = true;
+            } else if ch == '"' {
+                in_dq = false;
+            }
+        } else if in_sq {
+            if ch == '\'' {
+                in_sq = false;
+            }
+        } else {
+            match ch {
+                '"' => in_dq = true,
+                '\'' => in_sq = true,
+                '#' => return &line[..idx],
+                _ => {}
+            }
+        }
+    }
+    line
+}
+
+fn parse_codex_command(text: &str) -> Option<PathBuf> {
+    let mut in_table = false;
+    for raw in text.lines() {
+        let line = strip_toml_comment(raw).trim();
+        if line.is_empty() {
+            continue;
+        }
+        if line.starts_with('[') {
+            in_table = line == "[mcp_servers.feeder]";
+            continue;
+        }
+        if !in_table {
+            continue;
+        }
+        let Some((key, val)) = line.split_once('=') else { continue };
+        if key.trim() != "command" {
+            continue;
+        }
+        let val = val.trim();
+        let parsed = if let Some(inner) = val.strip_prefix('"').and_then(|s| s.strip_suffix('"')) {
+            inner.replace("\\\"", "\"").replace("\\\\", "\\")
+        } else if let Some(inner) = val.strip_prefix('\'').and_then(|s| s.strip_suffix('\'')) {
+            inner.to_string()
+        } else {
+            continue;
+        };
+        return Some(PathBuf::from(parsed));
+    }
+    None
 }
 
 fn same_file(a: &Path, b: &Path) -> bool {
@@ -262,6 +418,9 @@ fn apply(config: Config, bin: &Path) -> (String, Outcome) {
     match config {
         Config::ClaudeCli { config_dir } => {
             let place = config_dir.as_ref().map(|d| d.display().to_string()).unwrap_or_else(|| "Claude Code (user scope)".into());
+            if configured_command(Config::ClaudeCli { config_dir: config_dir.clone() }).is_some_and(|cmd| same_file(&cmd, bin)) {
+                return (place, Outcome::Already);
+            }
             let Some(claude) = which("claude") else { return (place, Outcome::Skipped("the claude CLI isn't installed".into())) };
             let run = |args: &[&str]| {
                 let mut cmd = Command::new(&claude);
@@ -339,13 +498,14 @@ fn apply(config: Config, bin: &Path) -> (String, Outcome) {
 }
 
 fn remove_toml_table(text: &str, name: &str) -> Option<String> {
-    let header = format!("[{name}]");
+    let exact = format!("[{name}]");
+    let subprefix = format!("[{name}.");
     let mut out = String::new();
     let mut found = false;
     let mut skipping = false;
     for line in text.split_inclusive('\n') {
-        let t = line.trim();
-        if t == header {
+        let t = strip_toml_comment(line).trim();
+        if t == exact || (t.starts_with(&subprefix) && t.ends_with(']')) {
             found = true;
             skipping = true;
             continue;
@@ -411,11 +571,29 @@ pub fn install_skills() -> Vec<PathBuf> {
     let skills = [("feeder-update", crate::skill_markdown()), ("feeder-notebook", crate::notebook_skill_markdown())];
     skill_roots()
         .into_iter()
-        .filter(|r| r.is_dir())
+        .filter(|r| r.is_dir() || r.parent().is_some_and(Path::is_dir))
         .flat_map(|r| skills.iter().map(move |(name, body)| (r.join(name), body)))
         .filter_map(|(dir, body)| {
             std::fs::create_dir_all(&dir).ok()?;
             std::fs::write(dir.join("SKILL.md"), body).ok()?;
+            Some(dir)
+        })
+        .collect()
+}
+
+pub fn sync_installed_skills() -> Vec<PathBuf> {
+    let skills = [("feeder-update", crate::skill_markdown()), ("feeder-notebook", crate::notebook_skill_markdown())];
+    skill_roots()
+        .into_iter()
+        .filter(|r| r.is_dir())
+        .flat_map(|r| skills.iter().map(move |(name, body)| (r.join(name), body)))
+        .filter_map(|(dir, body)| {
+            let file = dir.join("SKILL.md");
+            let existing = std::fs::read_to_string(&file).ok()?;
+            if existing == *body {
+                return None;
+            }
+            std::fs::write(&file, body).ok()?;
             Some(dir)
         })
         .collect()
@@ -430,7 +608,11 @@ pub fn remove_skills() -> Vec<PathBuf> {
 }
 
 pub fn disconnect(tool: Tool) -> Vec<(String, Outcome)> {
-    configs(tool).into_iter().map(unapply).collect()
+    configs(tool)
+        .into_iter()
+        .filter(|c| !(tool == Tool::T3Code && matches!(c, Config::CodexToml { .. }) && detected(Tool::Codex)))
+        .map(unapply)
+        .collect()
 }
 
 fn unapply(config: Config) -> (String, Outcome) {

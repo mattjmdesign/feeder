@@ -8,7 +8,7 @@ use feeder_core::gardener::{
     Backend, ChatOpening, ChatSummary, CuratorPrefs, Event, OPENING, Run, RunStatus, Scope, Session, SessionEnv, SessionMode, StoredEvent,
     effort_label,
 };
-use feeder_core::{Change, Flag, FlagOutcome, FlagStatus, HUMAN_AUTHOR, NewFlag, Store, ago, now_ms};
+use feeder_core::{Change, Flag, FlagOutcome, FlagStatus, HUMAN_AUTHOR, NewFlag, Proposal, Store, ago, now_ms};
 use serde_json::{Value, json};
 
 #[derive(Subcommand)]
@@ -72,6 +72,23 @@ pub enum GardenerCmd {
     },
     #[command(about = "Undo one change (see `feeder curator changes`).")]
     Revert { id: i64 },
+    #[command(about = "List pending Library proposals from Curator chats.")]
+    Proposals {
+        #[arg(long)]
+        json: bool,
+    },
+    #[command(about = "Apply a pending Curator proposal by its ID.")]
+    Apply {
+        id: i64,
+        #[arg(long)]
+        json: bool,
+    },
+    #[command(about = "Dismiss a pending Curator proposal by its ID.")]
+    Dismiss {
+        id: i64,
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 pub fn flag(store: &Store, flag: NewFlag, author: &str, json: bool) -> Result<(), String> {
@@ -155,6 +172,7 @@ pub fn run(store: &Store, cmd: GardenerCmd) -> Result<(), String> {
             let prefs = CuratorPrefs::load(store.dir());
             let runs = store.gardener_runs(5).map_err(|e| e.to_string())?;
             let open = store.open_flag_count().map_err(|e| e.to_string())?;
+            let pending_proposals = store.pending_curator_proposals(100).map_err(|e| e.to_string())?.len();
             if json {
                 let runs = runs
                     .iter()
@@ -187,6 +205,7 @@ pub fn run(store: &Store, cmd: GardenerCmd) -> Result<(), String> {
                         "default": prefs.default_backend().map(Backend::as_str),
                         "subscriptions": subscriptions,
                         "open_flags": open,
+                        "pending_proposals": pending_proposals,
                         "runs": runs,
                     })
                 );
@@ -214,6 +233,9 @@ pub fn run(store: &Store, cmd: GardenerCmd) -> Result<(), String> {
                     if enabled.is_empty() { "none (turn one on in Settings → Curator)".into() } else { enabled.join(", ") }
                 );
                 println!("Open flags: {open}");
+                if pending_proposals > 0 {
+                    println!("Pending proposals: {pending_proposals}");
+                }
                 match runs.first() {
                     Some(r) => print_run(r),
                     None => println!("No runs yet. Start one with `feeder curator run`."),
@@ -273,13 +295,78 @@ pub fn run(store: &Store, cmd: GardenerCmd) -> Result<(), String> {
             let done = store.revert_change(id, HUMAN_AUTHOR).map_err(|e| e.to_string())?;
             let state = match done.change.action {
                 feeder_core::ChangeAction::Archived => "archived",
-                feeder_core::ChangeAction::Restored => "back in the notebook",
+                feeder_core::ChangeAction::Restored => "back in the Library",
                 feeder_core::ChangeAction::Created | feeder_core::ChangeAction::Revised => "back to its earlier text",
             };
-            println!("Reverted change #{id}: page #{} \"{}\" is {state}.", done.page.id, done.page.title);
+            println!("Reverted change #{id}: note #{} \"{}\" is {state}.", done.page.id, done.page.title);
+        }
+        GardenerCmd::Proposals { json } => {
+            let proposals = store.pending_curator_proposals(50).map_err(|e| e.to_string())?;
+            if json {
+                println!("{}", Value::Array(proposals.iter().map(proposal_json).collect()));
+            } else if proposals.is_empty() {
+                println!("No pending Curator proposals.");
+            } else {
+                let now = now_ms();
+                for p in &proposals {
+                    let target = p.page_id.map(|id| format!("note #{id}")).unwrap_or_else(|| "new note".into());
+                    println!(
+                        "#{:<4} {} \"{}\" ({target}) · chat #{} · {} — {}",
+                        p.id,
+                        p.action.label(),
+                        terminal_text(&p.title),
+                        p.run_id,
+                        ago(p.created_at, now),
+                        terminal_text(&p.reason)
+                    );
+                }
+            }
+        }
+        GardenerCmd::Apply { id, json } => {
+            let done = store.apply_curator_proposal(id).map_err(|e| e.to_string())?;
+            if json {
+                println!(
+                    "{}",
+                    json!({
+                        "proposal_id": id,
+                        "change": change_json(&done.change),
+                        "page": { "id": done.page.id, "title": done.page.title },
+                    })
+                );
+            } else {
+                println!("Applied proposal #{id}: note #{} \"{}\" (change #{}).", done.page.id, done.page.title, done.change.id);
+            }
+        }
+        GardenerCmd::Dismiss { id, json } => {
+            let proposal = store.dismiss_curator_proposal(id).map_err(|e| e.to_string())?;
+            if json {
+                println!("{}", proposal_json(&proposal));
+            } else {
+                println!("Dismissed proposal #{}: \"{}\".", proposal.id, proposal.title);
+            }
         }
     }
     Ok(())
+}
+
+fn proposal_json(p: &Proposal) -> Value {
+    json!({
+        "id": p.id,
+        "run_id": p.run_id,
+        "action": p.action.as_str(),
+        "page_id": p.page_id,
+        "project_id": p.project_id,
+        "kind": p.kind.as_str(),
+        "topic": p.topic,
+        "title": p.title,
+        "tags": p.tags,
+        "reason": p.reason,
+        "source_flags": p.source_flags,
+        "source_updates": p.source_updates,
+        "status": p.status.as_str(),
+        "change_id": p.change_id,
+        "created_at": p.created_at,
+    })
 }
 
 fn chat_json(chat: &ChatSummary) -> Value {
@@ -357,12 +444,15 @@ fn chat(backend: Backend, env: SessionEnv, label: &str, scope: Scope, mode: Sess
     while let Some(event) = receive(&rx)? {
         match event {
             Event::Started => {}
-            Event::Thinking(t) => write!(out, "\x1b[2m{t}\x1b[0m").map_err(|e| e.to_string())?,
-            Event::Text(t) => write!(out, "{t}").map_err(|e| e.to_string())?,
-            Event::ToolStarted(call) => writeln!(out, "\n  → {} {}", call.name, call.input).map_err(|e| e.to_string())?,
+            Event::Thinking(t) => write!(out, "\x1b[2m{}\x1b[0m", terminal_text(&t)).map_err(|e| e.to_string())?,
+            Event::Text(t) => write!(out, "{}", terminal_text(&t)).map_err(|e| e.to_string())?,
+            Event::ToolStarted(call) => {
+                let input = call.input.to_string();
+                writeln!(out, "\n  → {} {}", terminal_text(&call.name), terminal_text(&input)).map_err(|e| e.to_string())?;
+            }
             Event::ToolFinished { output, failed, .. } => {
                 let first = output.lines().next().unwrap_or("");
-                writeln!(out, "  {} {first}", if failed { "✗" } else { "✓" }).map_err(|e| e.to_string())?;
+                writeln!(out, "  {} {}", if failed { "✗" } else { "✓" }, terminal_text(first)).map_err(|e| e.to_string())?;
             }
             Event::TurnFinished => {
                 writeln!(out).map_err(|e| e.to_string())?;
@@ -381,7 +471,7 @@ fn chat(backend: Backend, env: SessionEnv, label: &str, scope: Scope, mode: Sess
                     backend.sign_in_command()
                 ));
             }
-            Event::Failed(why) => return Err(why),
+            Event::Failed(why) => return Err(terminal_text(&why)),
             Event::Ended => break,
         }
         out.flush().map_err(|e| e.to_string())?;

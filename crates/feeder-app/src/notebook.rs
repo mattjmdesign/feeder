@@ -1,11 +1,12 @@
 use std::collections::HashMap;
 
 use feeder_core::{
-    CANONICAL_TOPICS, Kind, Page, PageDraft, Standing, ago, infer_topic, normalize_topic, toggle_markdown_task, topic_counts, topic_label,
+    CANONICAL_TOPICS, Kind, Page, PageDraft, Standing, ago, count_markdown_tasks, infer_topic, normalize_topic, toggle_markdown_task,
+    topic_counts, topic_label,
 };
 use rune::{
-    Color, Cursor, El, Icon, Key, KeyEvent, Link, LinkPaint, ScrollSpec, Span, TextEdit, Transition, Tx, col, el, icon, memo, oklch, row,
-    text, text_input,
+    Color, Cursor, El, Icon, Key, KeyEvent, LineCap, Link, LinkPaint, ScrollSpec, Shape, Span, TextEdit, Transition, Tx, canvas, col, el,
+    icon, memo, oklch, row, text, text_input,
 };
 use rune_kit::shell::{SidebarPeek, SidebarToggle};
 use rune_kit::syntax::{self, SyntaxTheme};
@@ -27,6 +28,7 @@ const CARD_PAD: f32 = 8.0;
 pub(crate) const INDEX_PAD: f32 = 32.0;
 const CARD_GAP: f32 = 12.0;
 const DOC_MAX_W: f32 = 720.0;
+const BANNER_H: f32 = 132.0;
 
 pub(crate) static PLUS_ICON: Icon = Icon {
     name: "nb-plus",
@@ -83,6 +85,7 @@ pub struct Notebook {
     pub delete_confirm: Option<i64>,
     pub action_menu_open: bool,
     pub auto_open_first: bool,
+    pub pending_open_created: bool,
     pub gardener: crate::watch::GardenerView,
     pub chat: crate::gardener::Chat,
     pub preview_chats: Option<Vec<feeder_core::gardener::ChatSummary>>,
@@ -105,6 +108,7 @@ impl Default for Notebook {
             delete_confirm: None,
             action_menu_open: false,
             auto_open_first: false,
+            pending_open_created: false,
             gardener: crate::watch::GardenerView::default(),
             chat: crate::gardener::Chat::default(),
             preview_chats: None,
@@ -132,45 +136,89 @@ pub struct Editor {
     pub title: TextEdit,
     pub body: TextEdit,
     pub preview: bool,
+    pub discard_confirm: bool,
     pub error: Option<String>,
+    initial: (Kind, TopicChoice, String, String, String, Vec<String>),
 }
 
 impl Editor {
     fn blank(default_topic: Option<&str>) -> Editor {
         let mut title = TextEdit::new("");
         title.focused = true;
+        let topic_choice = match default_topic {
+            Some(t) if !t.is_empty() => TopicChoice::Selected(t.to_string()),
+            _ => TopicChoice::Auto,
+        };
+        let initial = (Kind::Note, topic_choice.clone(), String::new(), String::new(), String::new(), Vec::new());
         Editor {
             id: None,
             kind: Kind::Note,
             tags: Vec::new(),
-            topic_choice: match default_topic {
-                Some(t) if !t.is_empty() => TopicChoice::Selected(t.to_string()),
-                _ => TopicChoice::Auto,
-            },
+            topic_choice,
             topic_open: false,
             topic_custom: TextEdit::new(""),
             title,
             body: TextEdit::new(""),
             preview: false,
+            discard_confirm: false,
             error: None,
+            initial,
         }
     }
 
     fn from_page(p: &Page) -> Editor {
         let mut body = TextEdit::new(&p.body);
         body.focused = true;
+        let topic_choice = TopicChoice::Selected(p.topic.clone());
+        let initial = (p.kind, topic_choice.clone(), String::new(), p.title.clone(), p.body.clone(), p.tags.clone());
         Editor {
             id: Some(p.id),
             kind: p.kind,
             tags: p.tags.clone(),
-            topic_choice: TopicChoice::Selected(p.topic.clone()),
+            topic_choice,
             topic_open: false,
             topic_custom: TextEdit::new(""),
             title: TextEdit::new(&p.title),
             body,
             preview: false,
+            discard_confirm: false,
             error: None,
+            initial,
         }
+    }
+
+    pub fn from_failed_draft(id: Option<i64>, draft: PageDraft, err: Option<String>) -> Editor {
+        let mut body = TextEdit::new(&draft.body);
+        body.focused = true;
+        let topic_choice = match draft.topic {
+            Some(t) if !t.is_empty() => TopicChoice::Selected(t),
+            _ => TopicChoice::Auto,
+        };
+        Editor {
+            id,
+            kind: draft.kind,
+            tags: draft.tags.clone(),
+            topic_choice: topic_choice.clone(),
+            topic_open: false,
+            topic_custom: TextEdit::new(""),
+            title: TextEdit::new(&draft.title),
+            body,
+            preview: false,
+            discard_confirm: false,
+            error: err,
+            initial: (draft.kind, topic_choice, String::new(), String::new(), String::new(), Vec::new()),
+        }
+    }
+
+    pub fn is_dirty(&self) -> bool {
+        (
+            self.kind,
+            self.topic_choice.clone(),
+            self.topic_custom.text.clone(),
+            self.title.text.clone(),
+            self.body.text.clone(),
+            self.tags.clone(),
+        ) != self.initial
     }
 
     fn resolved_topic_arg(&self) -> Option<String> {
@@ -277,14 +325,18 @@ impl Notebook {
     }
 
     pub fn visible(&self) -> Vec<&Page> {
+        let words: Vec<String> = self.query.text.split_whitespace().map(str::to_lowercase).collect();
+        let search_all_active = !words.is_empty() && !matches!(self.shelf, Shelf::Archived);
         let on_shelf = |p: &&Page| -> bool {
+            if search_all_active {
+                return !p.is_archived();
+            }
             match &self.shelf {
                 Shelf::All => !p.is_archived(),
                 Shelf::Topic(t) => !p.is_archived() && p.topic == *t,
                 Shelf::Archived => p.is_archived(),
             }
         };
-        let words: Vec<String> = self.query.text.split_whitespace().map(str::to_lowercase).collect();
         let mut scored: Vec<(usize, &Page)> =
             self.pages.iter().filter(on_shelf).filter_map(|p| score(p, &words).map(|sc| (sc, p))).collect();
         if !words.is_empty() {
@@ -322,7 +374,24 @@ impl State {
         }
     }
 
+    pub fn try_leave_editor(&mut self) -> bool {
+        let Some(ed) = self.notebook.editor.as_mut() else {
+            return true;
+        };
+        if !ed.is_dirty() || ed.discard_confirm {
+            self.notebook.editor = None;
+            true
+        } else {
+            ed.discard_confirm = true;
+            ed.preview = false;
+            false
+        }
+    }
+
     pub fn notebook_new_page(&mut self) {
+        if !self.try_leave_editor() {
+            return;
+        }
         let default_topic = match &self.notebook.shelf {
             Shelf::Topic(t) => Some(t.as_str()),
             _ => None,
@@ -334,6 +403,12 @@ impl State {
     }
 
     pub fn notebook_edit(&mut self, id: i64) {
+        if self.notebook.editor.as_ref().is_some_and(|e| e.id == Some(id)) {
+            return;
+        }
+        if !self.try_leave_editor() {
+            return;
+        }
         if let Some(page) = self.notebook.page(id).cloned() {
             self.notebook.editor = Some(Editor::from_page(&page));
             self.notebook.delete_confirm = None;
@@ -342,6 +417,9 @@ impl State {
     }
 
     pub fn notebook_open_page(&mut self, id: i64) {
+        if !self.try_leave_editor() {
+            return;
+        }
         self.notebook.open = Some(id);
         self.notebook.editor = None;
         self.notebook.delete_confirm = None;
@@ -361,6 +439,7 @@ impl State {
     }
 
     pub fn flag_update_for_notebook(&mut self, update_id: i64) {
+        self.review_statuses.insert(update_id, feeder_core::FeedReviewStatus::Queued);
         self.notebook_send(NotebookOp::FlagUpdate(update_id));
         let project_id = self.feed.iter().chain(&self.timeline).chain(&self.search_hits).find(|u| u.id == update_id).map(|u| u.project_id);
         self.push_toast(
@@ -396,6 +475,9 @@ impl State {
 
     fn notebook_select_tree_node(&mut self, id: &str) {
         if let Some(slug) = id.strip_prefix("topic:") {
+            if !self.try_leave_editor() {
+                return;
+            }
             self.notebook.shelf = Shelf::Topic(slug.to_string());
             self.notebook.open = None;
             self.notebook.editor = None;
@@ -437,6 +519,7 @@ impl State {
                 if self.notebook.shelf == Shelf::Archived {
                     self.notebook.shelf = Shelf::All;
                 }
+                self.notebook.pending_open_created = true;
                 self.notebook_send(NotebookOp::Create(draft));
                 self.notebook.sync_tree_selection();
             }
@@ -451,18 +534,23 @@ impl State {
     }
 
     pub fn notebook_escape(&mut self) -> bool {
-        let nb = &mut self.notebook;
-        if nb.action_menu_open {
-            nb.action_menu_open = false;
+        if self.notebook.action_menu_open {
+            self.notebook.action_menu_open = false;
             return true;
         }
-        if let Some(ed) = nb.editor.as_mut()
+        if let Some(ed) = self.notebook.editor.as_mut()
             && ed.topic_open
         {
             ed.topic_open = false;
             return true;
         }
-        if nb.editor.take().is_some() || nb.delete_confirm.take().is_some() || nb.open.take().is_some() {
+        if self.notebook.editor.is_some() {
+            let _ = self.try_leave_editor();
+            self.notebook.sync_tree_selection();
+            return true;
+        }
+        let nb = &mut self.notebook;
+        if nb.delete_confirm.take().is_some() || nb.open.take().is_some() {
             nb.sync_tree_selection();
             return true;
         }
@@ -475,6 +563,9 @@ impl State {
     }
 
     pub(crate) fn notebook_shelf(&mut self, shelf: Shelf) {
+        if !self.try_leave_editor() {
+            return;
+        }
         self.notebook.shelf = shelf;
         self.notebook.open = None;
         self.notebook.editor = None;
@@ -571,10 +662,7 @@ fn toolbar_breadcrumb(nb: &Notebook, p: &Palette, k: &Kit) -> El {
             ed.title.text.trim().to_string()
         };
         row_el = row_el
-            .child(crumb_btn("nb-bc-root", "Library", false).on_press(|s: &mut State| {
-                s.notebook.editor = None;
-                s.notebook_shelf(Shelf::All);
-            }))
+            .child(crumb_btn("nb-bc-root", "Library", false).on_press(|s: &mut State| s.notebook_shelf(Shelf::All)))
             .child(sep())
             .child(text(title_crumb).font(k.ty.ui_compact).color(p.text).truncate().max_w(260.0).pl(CRUMB_PAD));
         return row_el;
@@ -633,7 +721,7 @@ fn sidebar_view(s: &State, p: &Palette, k: &Kit) -> El {
     let new_row = SidebarRow::new("New Note").icon(&PLUS_ICON).on_select(|s: &mut State, _| s.notebook_new_page()).build(k).key("nb-new");
 
     let all_selected = nb.editor.is_none() && nb.open.is_none() && nb.shelf == Shelf::All;
-    let all_row = SidebarRow::new("All notes")
+    let all_row = SidebarRow::new("All Notes")
         .icon(&NOTES_ICON)
         .badge(current_count.to_string())
         .selected(all_selected)
@@ -728,17 +816,18 @@ fn index_view(s: &State, p: &Palette, k: &Kit) -> El {
         return col().w_full().max_w(INDEX_MAX_W).child(empty_notebook(p, k));
     }
 
-    let heading = match &nb.shelf {
-        Shelf::All => "Library".to_string(),
-        Shelf::Topic(slug) => topic_label(slug).to_string(),
-        Shelf::Archived => "Archived".to_string(),
+    let searching = !nb.query.text.trim().is_empty() && !matches!(nb.shelf, Shelf::Archived);
+    let heading = if searching {
+        "Search results".to_string()
+    } else {
+        match &nb.shelf {
+            Shelf::All => "Library".to_string(),
+            Shelf::Topic(slug) => topic_label(slug).to_string(),
+            Shelf::Archived => "Archived".to_string(),
+        }
     };
 
     let pages = nb.visible();
-    let mut topics: Vec<&str> = nb.pages.iter().map(|page| page.topic.as_str()).collect();
-    topics.sort_unstable();
-    topics.dedup();
-    let topic_rank = |topic: &str| topics.binary_search(&topic).unwrap_or_default();
 
     let header = col().key("nb-header").w_full().pb(24.0).child(text(heading).font(style::DISPLAY).color(p.text));
 
@@ -751,8 +840,8 @@ fn index_view(s: &State, p: &Palette, k: &Kit) -> El {
             empty = empty.child(ask_curator_card(s, &question, agent, p, k));
         }
         list = list.child(empty);
-    } else if let Shelf::Topic(topic) = &nb.shelf {
-        list = list.child(card_grid(s, &pages, topic_rank(topic), p));
+    } else if !searching && let Shelf::Topic(topic) = &nb.shelf {
+        list = list.child(card_grid(s, &pages, topic_slot(topic), p));
     } else {
         let mut groups: Vec<(&str, Vec<&Page>)> = Vec::new();
         for page in pages {
@@ -779,7 +868,7 @@ fn index_view(s: &State, p: &Palette, k: &Kit) -> El {
                 col().key(format!("nb-group-{topic}")).w_full().pt(if i == 0 { 0.0 } else { 32.0 }).child(heading).child(card_grid(
                     s,
                     &members,
-                    topic_rank(topic),
+                    topic_slot(topic),
                     p,
                 )),
             );
@@ -813,10 +902,8 @@ fn index_card(s: &State, page: &Page, rank: usize, p: &Palette) -> El {
         .gap(4.0)
         .pt(1.0)
         .pr(8.0)
-        .child(
-            text(page.title.clone()).font(style::NAME).color(p.text).w_full().h(style::NAME.line_height * 2.0).wrap_anywhere().max_lines(2),
-        )
-        .child(text(card_excerpt(&page.body)).font(style::META).color(p.text_2).w_full().h(style::META.line_height * 2.0).max_lines(2))
+        .child(text(page.title.clone()).font(style::NAME).color(p.text).w_full().h(style::NAME.line_height * 2.0).wrap().max_lines(2))
+        .child(text(page.excerpt(240)).font(style::META).color(p.text_2).w_full().h(style::META.line_height * 2.0).max_lines(2))
         .child(text(ago(page.updated_at, s.now)).font(style::META).color(p.text_3));
     row()
         .key(format!("nb-page-{id}"))
@@ -859,82 +946,107 @@ fn category_duotone(seed: u64, rank: usize, dark: bool) -> CategoryDuotone {
     CategoryDuotone { hue, ground, bright, dim, border }
 }
 
-fn pattern_tile(topic: &str, rank: usize, dark: bool) -> El {
-    let seed = topic.bytes().fold(0xcbf2_9ce4_8422_2325_u64, |h, b| (h ^ u64::from(b)).wrapping_mul(0x0100_0000_01b3));
-    memo(format!("nb-pattern-{topic}"), (seed, rank, dark), || {
-        const PITCH: f32 = 6.0;
-        const DOT: f32 = 2.0;
-        let mut rng = seed | 1;
-        let mut next = move || {
-            rng ^= rng << 13;
-            rng ^= rng >> 7;
-            rng ^= rng << 17;
-            (rng >> 11) as f32 / (1u64 << 53) as f32
-        };
-        let kind = rank % 6;
-        let (freq, phase, angle, cx, cy) =
-            (2.0 + next() * 4.0, next() * std::f32::consts::TAU, next() * std::f32::consts::PI, next(), next());
-        let flip = next() < 0.5;
-        let palette = category_duotone(seed, rank, dark);
-        let bright = palette.bright;
-        let dim = palette.dim;
-        let n = (TILE / PITCH).floor() as usize;
-        let inset = (TILE - (n as f32 - 1.0) * PITCH - DOT) / 2.0;
-        let mut tile = el().size(TILE, TILE).radius(8.0).clip_rounded(8.0).fill(palette.ground).border(1.0, palette.border);
-        let dir = (seed >> 3) % 4;
-        for row_i in 0..n {
-            for col_i in 0..n {
-                let u = col_i as f32 / (n - 1) as f32;
-                let mut v = row_i as f32 / (n - 1) as f32;
-                if flip {
-                    v = 1.0 - v;
-                }
-                let r = next();
-                let on = match kind {
-                    0 => {
-                        let t = match dir {
-                            0 => v,
-                            1 => 1.0 - v,
-                            2 => u,
-                            _ => (u + v) / 2.0,
-                        };
-                        r < t.powf(1.3)
-                    }
-                    1 => ((u * angle.cos() + v * angle.sin()) * freq + phase).rem_euclid(1.0) < 0.45,
-                    2 => (((u - cx).hypot(v - cy)) * freq * 1.5).rem_euclid(1.0) < 0.5,
-                    3 => v > 0.5 + 0.28 * (u * freq * 1.2 + phase).sin() - r * 0.08,
-                    4 => (((u * freq * 1.5) as i32 + (v * freq * 1.5) as i32) % 2 == 0) && r < 0.9,
-                    _ => r < 0.36,
-                };
-                if !on {
-                    continue;
-                }
-                let tone = if next() < 0.55 { bright } else { dim };
-                let x = inset + col_i as f32 * PITCH;
-                let y = inset + row_i as f32 * PITCH;
-                tile = tile.child(el().size(DOT, DOT).radius(DOT / 2.0).fill(tone).absolute(x, y));
+fn topic_seed(topic: &str) -> u64 {
+    topic.bytes().fold(0xcbf2_9ce4_8422_2325_u64, |h, b| (h ^ u64::from(b)).wrapping_mul(0x0100_0000_01b3))
+}
+
+fn topic_slot(topic: &str) -> usize {
+    CANONICAL_TOPICS.iter().position(|t| t.slug == topic).unwrap_or_else(|| CANONICAL_TOPICS.len() + (topic_seed(topic) % 12) as usize)
+}
+
+fn pattern_dots(seed: u64, rank: usize, palette: CategoryDuotone, w: f32, h: f32) -> Shape {
+    const PITCH: f32 = 6.0;
+    const DOT: f32 = 2.0;
+    const PAD: f32 = 7.0;
+    let inner_w = (w - PAD * 2.0).max(DOT);
+    let inner_h = (h - PAD * 2.0).max(DOT);
+    let mut rng = seed | 1;
+    let mut next = move || {
+        rng ^= rng << 13;
+        rng ^= rng >> 7;
+        rng ^= rng << 17;
+        (rng >> 11) as f32 / (1u64 << 53) as f32
+    };
+    let kind = rank % 6;
+    let (freq, phase, angle, cx, cy) = (2.0 + next() * 4.0, next() * std::f32::consts::TAU, next() * std::f32::consts::PI, next(), next());
+    let flip = next() < 0.5;
+    let nx = (inner_w / PITCH).floor().max(2.0) as usize;
+    let ny = (inner_h / PITCH).floor().max(2.0) as usize;
+    let inset_x = PAD + (inner_w - (nx as f32 - 1.0) * PITCH - DOT) / 2.0;
+    let inset_y = PAD + (inner_h - (ny as f32 - 1.0) * PITCH - DOT) / 2.0;
+    let aspect = (nx - 1) as f32 / (ny - 1) as f32;
+    let cx = cx * aspect;
+    let dir = (seed >> 3) % 4;
+    let mut shape = Shape::new();
+    for row_i in 0..ny {
+        for col_i in 0..nx {
+            let u = col_i as f32 / (ny - 1) as f32;
+            let across = col_i as f32 / (nx - 1) as f32;
+            let mut v = row_i as f32 / (ny - 1) as f32;
+            if flip {
+                v = 1.0 - v;
             }
+            let r = next();
+            let on = match kind {
+                0 => {
+                    let t = match dir {
+                        0 => v,
+                        1 => 1.0 - v,
+                        2 => across,
+                        _ => (across + v) / 2.0,
+                    };
+                    r < t.powf(1.3)
+                }
+                1 => ((u * angle.cos() + v * angle.sin()) * freq + phase).rem_euclid(1.0) < 0.45,
+                2 => (((u - cx).hypot(v - cy)) * freq * 1.5).rem_euclid(1.0) < 0.5,
+                3 => v > 0.5 + 0.28 * (u * freq * 1.2 + phase).sin() - r * 0.08,
+                4 => (((u * freq * 1.5) as i32 + (v * freq * 1.5) as i32) % 2 == 0) && r < 0.9,
+                _ => r < 0.36,
+            };
+            if !on {
+                continue;
+            }
+            let tone = if next() < 0.55 { palette.bright } else { palette.dim };
+            let centre = [inset_x + col_i as f32 * PITCH + DOT / 2.0, inset_y + row_i as f32 * PITCH + DOT / 2.0];
+            shape = shape.line(centre, centre, DOT, LineCap::Round, tone);
         }
-        tile.a11y_hidden()
+    }
+    shape
+}
+
+fn pattern_field(topic: &str, rank: usize, dark: bool, w: f32, h: f32) -> El {
+    let seed = topic_seed(topic);
+    memo(format!("nb-pattern-{topic}-{w}x{h}"), (seed, rank, dark), || {
+        let palette = category_duotone(seed, rank, dark);
+        el().size(w, h)
+            .fill(palette.ground)
+            .child(canvas(pattern_dots(seed, rank, palette, w, h)).size(w, h).absolute(0.0, 0.0))
+            .a11y_hidden()
     })
 }
 
-fn card_excerpt(body: &str) -> String {
-    let mut out = String::new();
-    for line in body.lines().map(str::trim) {
-        if line.is_empty() || line.starts_with('#') || line.starts_with("```") || line.starts_with('>') {
-            continue;
-        }
-        let clean = line.trim_start_matches(['-', '*', ' ']).replace("**", "").replace('`', "");
-        if !out.is_empty() {
-            out.push(' ');
-        }
-        out.push_str(&clean);
-        if out.chars().count() > 240 {
-            break;
-        }
-    }
-    out
+fn pattern_tile(topic: &str, rank: usize, dark: bool) -> El {
+    let palette = category_duotone(topic_seed(topic), rank, dark);
+    el().size(TILE, TILE)
+        .radius(8.0)
+        .clip_rounded(8.0)
+        .fill(palette.ground)
+        .border(1.0, palette.border)
+        .child(pattern_field(topic, rank, dark, TILE, TILE))
+        .a11y_hidden()
+}
+
+fn pattern_banner(topic: &str, rank: usize, dark: bool) -> El {
+    let palette = category_duotone(topic_seed(topic), rank, dark);
+    el().key("nb-banner")
+        .w_full()
+        .h(BANNER_H)
+        .radius(12.0)
+        .clip_rounded(12.0)
+        .fill(palette.ground)
+        .border(1.0, palette.border)
+        .child(pattern_field(topic, rank, dark, DOC_MAX_W, BANNER_H))
+        .a11y_hidden()
 }
 
 fn page_view(s: &State, page: &Page, p: &Palette, k: &Kit, layer: &mut Vec<El>) -> El {
@@ -964,6 +1076,7 @@ fn page_view(s: &State, page: &Page, p: &Palette, k: &Kit, layer: &mut Vec<El>) 
         .build(k)
         .key("nb-edit");
 
+    let page_title = page.title.clone();
     let (archive_label, standing) =
         if page.is_archived() { ("Restore Note", Standing::Current) } else { ("Archive Note", Standing::Archived) };
     let more_trigger = row()
@@ -988,9 +1101,23 @@ fn page_view(s: &State, page: &Page, p: &Palette, k: &Kit, layer: &mut Vec<El>) 
         .on_close(|s: &mut State| s.notebook.action_menu_open = false)
         .item(MenuItem::new(archive_label).on_select(move |s: &mut State| {
             s.notebook.action_menu_open = false;
-            s.notebook_send(NotebookOp::SetStanding(id, standing));
+            if let Some(pg) = s.notebook.pages.iter_mut().find(|p| p.id == id) {
+                pg.standing = standing;
+            }
             s.notebook.open = None;
-            s.notebook.sync_tree_selection();
+            s.notebook.sync_tree();
+            s.notebook_send(NotebookOp::SetStanding(id, standing));
+            if standing == Standing::Archived {
+                s.push_toast(
+                    "notebook-archived",
+                    ToastItem {
+                        title: format!("Archived \"{page_title}\""),
+                        description: None,
+                        kind: ToastKind::UndoNoteArchive { page_id: id, was_archived: false },
+                    },
+                    Some(5.0),
+                );
+            }
         }))
         .separator()
         .item(MenuItem::new("Delete Note…").danger(true).on_select(move |s: &mut State| {
@@ -1016,7 +1143,8 @@ fn page_view(s: &State, page: &Page, p: &Palette, k: &Kit, layer: &mut Vec<El>) 
         .child(rune::spacer())
         .child(actions);
 
-    let mut doc = col().key(format!("nb-sheet-{id}")).w_full().max_w(DOC_MAX_W).transition(Transition::none()).child(top_bar);
+    let banner = pattern_banner(&page.topic, topic_slot(&page.topic), p.dark).mb(28.0);
+    let mut doc = col().key(format!("nb-sheet-{id}")).w_full().max_w(DOC_MAX_W).transition(Transition::none()).child(top_bar).child(banner);
 
     if s.notebook.delete_confirm == Some(id) {
         let confirm = row()
@@ -1045,9 +1173,10 @@ fn page_view(s: &State, page: &Page, p: &Palette, k: &Kit, layer: &mut Vec<El>) 
                     .control_size(ControlSize::Regular)
                     .on_press(move |s: &mut State| {
                         s.notebook_send(NotebookOp::Delete(id));
+                        s.notebook.pages.retain(|p| p.id != id);
                         s.notebook.delete_confirm = None;
                         s.notebook.open = None;
-                        s.notebook.sync_tree_selection();
+                        s.notebook.sync_tree();
                     })
                     .build(k),
             );
@@ -1293,29 +1422,6 @@ enum ArticleChunk {
     Callout { kind: CalloutKind, title: String, body: String, task_offset: usize },
 }
 
-fn is_task_list_line(line: &str) -> bool {
-    let trimmed = line.trim_start();
-    let Some(rest) = trimmed.strip_prefix("- ").or_else(|| trimmed.strip_prefix("* ")).or_else(|| trimmed.strip_prefix("+ ")) else {
-        return false;
-    };
-    rest.starts_with("[ ] ") || rest.starts_with("[x] ") || rest.starts_with("[X] ")
-}
-
-fn count_tasks(md: &str) -> usize {
-    let mut in_fence = false;
-    let mut count = 0;
-    for line in md.lines() {
-        if line.trim_start().starts_with("```") {
-            in_fence = !in_fence;
-            continue;
-        }
-        if !in_fence && is_task_list_line(line) {
-            count += 1;
-        }
-    }
-    count
-}
-
 fn parse_callout_header(line: &str) -> Option<(CalloutKind, String)> {
     let rest = line.trim_start().strip_prefix('>')?.trim_start();
     let after_open = rest.strip_prefix("[!")?;
@@ -1327,11 +1433,21 @@ fn parse_callout_header(line: &str) -> Option<(CalloutKind, String)> {
     Some((kind, title))
 }
 
+fn parse_fence_line(line: &str) -> Option<(char, usize)> {
+    let trimmed = line.trim_start();
+    let ch = trimmed.bytes().next()?;
+    if ch != b'`' && ch != b'~' {
+        return None;
+    }
+    let count = trimmed.bytes().take_while(|&b| b == ch).count();
+    (count >= 3).then_some((ch as char, count))
+}
+
 fn split_article_chunks(src: &str) -> Vec<ArticleChunk> {
     let lines: Vec<&str> = src.lines().collect();
     let mut chunks = Vec::new();
     let mut buf: Vec<&str> = Vec::new();
-    let mut in_fence = false;
+    let mut fence: Option<(char, usize)> = None;
     let mut task_offset = 0usize;
     let mut i = 0;
 
@@ -1347,20 +1463,26 @@ fn split_article_chunks(src: &str) -> Vec<ArticleChunk> {
         }
         let text = buf.join("\n");
         buf.clear();
-        let n = count_tasks(&text);
+        let n = count_markdown_tasks(&text);
         chunks.push(ArticleChunk::Markdown { text, task_offset: *task_offset });
         *task_offset += n;
     };
 
     while i < lines.len() {
         let line = lines[i];
-        if line.trim_start().starts_with("```") {
-            in_fence = !in_fence;
+        if let Some((ch, count)) = parse_fence_line(line) {
+            match fence {
+                None => fence = Some((ch, count)),
+                Some((open_ch, open_count)) if open_ch == ch && count >= open_count => fence = None,
+                _ => {}
+            }
             buf.push(line);
             i += 1;
             continue;
         }
-        if !in_fence && let Some((kind, title)) = parse_callout_header(line) {
+        if fence.is_none()
+            && let Some((kind, title)) = parse_callout_header(line)
+        {
             flush_md(&mut buf, &mut chunks, &mut task_offset);
             let mut body_lines = Vec::new();
             i += 1;
@@ -1373,7 +1495,7 @@ fn split_article_chunks(src: &str) -> Vec<ArticleChunk> {
                 }
             }
             let body = body_lines.join("\n").trim().to_string();
-            let n = count_tasks(&body);
+            let n = count_markdown_tasks(&body);
             chunks.push(ArticleChunk::Callout { kind, title, body, task_offset });
             task_offset += n;
             continue;
@@ -1387,6 +1509,12 @@ fn split_article_chunks(src: &str) -> Vec<ArticleChunk> {
 
 const LIVE_WORD_FADE: f32 = 0.22;
 
+fn handle_markdown_link(s: &mut State, url: &str, tx: &mut Tx) {
+    if !s.open_feeder_url(url) {
+        let _ = tx.open_url(url);
+    }
+}
+
 pub(crate) fn render_live_markdown(src: &str, reduced_motion: bool, p: &Palette, k: &Kit) -> El {
     let md_style = feed::markdown_style(p, k).body_font(style::PROSE);
     Markdown::new(src.to_string())
@@ -1394,31 +1522,13 @@ pub(crate) fn render_live_markdown(src: &str, reduced_motion: bool, p: &Palette,
         .streaming(true)
         .reveal(if reduced_motion { 0.0 } else { LIVE_WORD_FADE })
         .tasks_read_only()
-        .on_link(|s: &mut State, url: &str| {
-            if let Some(id) = url
-                .strip_prefix("feeder://notebook/")
-                .or_else(|| url.strip_prefix("feeder://library/"))
-                .and_then(|id| id.parse::<i64>().ok())
-            {
-                s.open_notebook_page_from_anywhere(id);
-            }
-        })
+        .on_link_tx(handle_markdown_link)
         .render(&md_style)
 }
 
 pub(crate) fn render_article_markdown(src: &str, page_id: Option<i64>, p: &Palette, k: &Kit) -> El {
     let md_style = feed::markdown_style(p, k).body_font(style::PROSE);
-    let article_markdown = |text: String| {
-        Markdown::new(text).selectable(true).on_link(|s: &mut State, url: &str| {
-            if let Some(id) = url
-                .strip_prefix("feeder://notebook/")
-                .or_else(|| url.strip_prefix("feeder://library/"))
-                .and_then(|id| id.parse::<i64>().ok())
-            {
-                s.open_notebook_page_from_anywhere(id);
-            }
-        })
-    };
+    let article_markdown = |text: String| Markdown::new(text).selectable(true).on_link_tx(handle_markdown_link);
     let chunks = split_article_chunks(src);
     if chunks.is_empty() {
         return el().w_full();
@@ -1497,7 +1607,9 @@ fn editor_view(nb: &Notebook, ed: &Editor, p: &Palette, k: &Kit, layer: &mut Vec
     let cancel = Button::new("Cancel")
         .variant(ButtonVariant::Ghost)
         .control_size(ControlSize::Regular)
-        .on_press(|s: &mut State| s.notebook.editor = None)
+        .on_press(|s: &mut State| {
+            let _ = s.try_leave_editor();
+        })
         .build(k);
 
     let save = Button::new(if ed.id.is_some() { "Save" } else { "Save Note" })
@@ -1524,14 +1636,14 @@ fn editor_view(nb: &Notebook, ed: &Editor, p: &Palette, k: &Kit, layer: &mut Vec
     {
         topic_options.push((topic_label(slug).to_string(), TopicChoice::Selected(slug.clone())));
     }
-    topic_options.push(("New category…".to_string(), TopicChoice::Custom));
+    topic_options.push(("New Category…".to_string(), TopicChoice::Custom));
 
     let option_labels: Vec<String> = topic_options.iter().map(|(l, _)| l.clone()).collect();
     let current_topic_label = topic_options
         .iter()
         .find(|(_, choice)| *choice == ed.topic_choice)
         .map(|(l, _)| l.clone())
-        .unwrap_or_else(|| "New category…".to_string());
+        .unwrap_or_else(|| "New Category…".to_string());
 
     let map_opts = topic_options.clone();
     let topic_select = Select::new("nb-ed-topic", &option_labels)
@@ -1619,7 +1731,45 @@ fn editor_view(nb: &Notebook, ed: &Editor, p: &Palette, k: &Kit, layer: &mut Vec
             .on_input_key(|s: &mut State, e: &KeyEvent, _| editor_common_key(s, e))
     };
 
-    let mut page = col().key("nb-editor").w_full().max_w(DOC_MAX_W).transition(Transition::none()).child(top_bar).child(title_el);
+    let mut page = col().key("nb-editor").w_full().max_w(DOC_MAX_W).transition(Transition::none()).child(top_bar);
+
+    if ed.discard_confirm {
+        page = page.child(
+            row()
+                .key("nb-discard-confirm")
+                .w_full()
+                .mb(16.0)
+                .px(14.0)
+                .py(10.0)
+                .gap(10.0)
+                .center_y()
+                .radius(8.0)
+                .fill(k.c.layer_01)
+                .border(1.0, k.c.border_muted)
+                .child(text("Discard unsaved changes?").font(style::BODY).color(p.text))
+                .child(rune::spacer())
+                .child(
+                    Button::new("Keep Editing")
+                        .variant(ButtonVariant::Ghost)
+                        .control_size(ControlSize::Regular)
+                        .on_press(|s: &mut State| {
+                            if let Some(ed) = s.notebook.editor.as_mut() {
+                                ed.discard_confirm = false;
+                            }
+                        })
+                        .build(k),
+                )
+                .child(
+                    Button::new("Discard")
+                        .variant(ButtonVariant::Danger)
+                        .control_size(ControlSize::Regular)
+                        .on_press(|s: &mut State| s.notebook.editor = None)
+                        .build(k),
+                ),
+        );
+    }
+
+    page = page.child(title_el);
 
     if !ed.preview {
         page = page.child(format_toolbar(p, k).mt(14.0));
@@ -1726,7 +1876,7 @@ fn editor_common_key(s: &mut State, e: &KeyEvent) -> bool {
         {
             ed.topic_open = false;
         } else {
-            s.notebook.editor = None;
+            let _ = s.try_leave_editor();
         }
         return true;
     }
@@ -1862,12 +2012,9 @@ fn apply_md_action(edit: &mut TextEdit, action: MdAction) {
     match action {
         MdAction::Wrap(before, after, placeholder) => {
             let (start, end) = edit.range();
-            let text_len = edit.text.len();
             if start < end {
-                let wrapped_around = start >= before.len()
-                    && end + after.len() <= text_len
-                    && &edit.text[start - before.len()..start] == before
-                    && &edit.text[end..end + after.len()] == after;
+                let wrapped_around = edit.text.get(..start).is_some_and(|s| s.ends_with(before))
+                    && edit.text.get(end..).is_some_and(|s| s.starts_with(after));
                 if wrapped_around {
                     let inner = edit.text[start..end].to_string();
                     let mut updated = edit.text.clone();
@@ -2003,7 +2150,7 @@ fn markdown_decorations(src: &str, p: &Palette, k: &Kit) -> Vec<Span> {
             } else {
                 if fence_body_start < line_start {
                     let code_slice = &src[fence_body_start..line_start];
-                    spans.push(Span::new(fence_body_start, line_start).mono().size(13.0));
+                    spans.push(Span::new(fence_body_start, line_start).mono().size(style::CONTROL.size));
                     let hl = syntax::highlight(fence_lang.as_deref(), code_slice);
                     spans.extend(syntax_theme.spans(&hl, fence_body_start));
                 }
@@ -2029,10 +2176,9 @@ fn markdown_decorations(src: &str, p: &Palette, k: &Kit) -> Vec<Span> {
         let hashes = line.bytes().take_while(|&b| b == b'#').count();
         if (1..=4).contains(&hashes) && line[hashes..].starts_with(' ') {
             let size = match hashes {
-                1 => 23.0,
-                2 => 19.0,
-                3 => 16.5,
-                _ => 15.0,
+                1 => style::DISPLAY.size,
+                2 => style::TITLE.size,
+                _ => style::BODY.size,
             };
             spans.push(Span::new(line_start, line_start + hashes + 1).size(size).color(syntax_dim));
             if line_start + hashes + 1 < line_end {
@@ -2087,7 +2233,7 @@ fn markdown_decorations(src: &str, p: &Palette, k: &Kit) -> Vec<Span> {
 
     if in_fence && fence_body_start < src.len() {
         let code_slice = &src[fence_body_start..];
-        spans.push(Span::new(fence_body_start, src.len()).mono().size(13.0));
+        spans.push(Span::new(fence_body_start, src.len()).mono().size(style::CONTROL.size));
         let hl = syntax::highlight(fence_lang.as_deref(), code_slice);
         spans.extend(syntax_theme.spans(&hl, fence_body_start));
     }
@@ -2107,7 +2253,7 @@ fn decorate_inline(text: &str, base: usize, p: &Palette, dim: Color, code_bg: Co
         {
             let close = i + 1 + rel;
             out.push(Span::new(base + i, base + i + 1).mono().color(dim));
-            out.push(Span::new(base + i + 1, base + close).mono().size(13.5).bg(code_bg, 2.5));
+            out.push(Span::new(base + i + 1, base + close).mono().size(style::CONTROL.size).bg(code_bg, 2.5));
             out.push(Span::new(base + close, base + close + 1).mono().color(dim));
             i = close + 1;
             continue;
@@ -2392,5 +2538,36 @@ mod tests {
         s.notebook_save();
         assert!(s.notebook.editor.is_none());
         assert_eq!(s.notebook.shelf, Shelf::All);
+        assert!(s.notebook.pending_open_created);
+    }
+
+    #[test]
+    fn wrap_next_to_multibyte_utf8_and_dirty_discard_and_tilde_task_offsets() {
+        let mut edit = TextEdit::new("café — word");
+        let word_start = edit.text.find("word").unwrap();
+        edit.set_selection(word_start, edit.text.len());
+        apply_md_action(&mut edit, MdAction::Wrap("**", "**", "bold"));
+        assert_eq!(edit.text, "café — **word**");
+
+        let mut s = State::new();
+        s.notebook = notebook();
+        s.notebook_new_page();
+        s.notebook.editor.as_mut().unwrap().title = TextEdit::new("Unsaved");
+        assert!(s.notebook_escape());
+        assert!(s.notebook.editor.as_ref().unwrap().discard_confirm);
+        assert!(s.notebook_escape());
+        assert!(s.notebook.editor.is_none());
+
+        let md = "~~~\n- [ ] Not a task\n~~~\n\n- [ ] First real task\n\n> [!note]\n> - [x] Second task";
+        let chunks = split_article_chunks(md);
+        assert_eq!(chunks.len(), 2);
+        assert_eq!(
+            chunks[0],
+            ArticleChunk::Markdown { text: "~~~\n- [ ] Not a task\n~~~\n\n- [ ] First real task".into(), task_offset: 0 }
+        );
+        assert_eq!(
+            chunks[1],
+            ArticleChunk::Callout { kind: CalloutKind::Note, title: "Note".into(), body: "- [x] Second task".into(), task_offset: 1 }
+        );
     }
 }

@@ -16,9 +16,6 @@ pub fn step_selection(ids: &[i64], current: Option<i64>, delta: isize) -> Option
 }
 
 pub fn on_key(s: &mut State, e: &KeyEvent, tx: &mut Tx) -> bool {
-    if s.open.is_some() && crate::files::on_key(s, e) {
-        return true;
-    }
     let nb_editing = s.tab == Tab::Notebook && s.open.is_none() && s.notebook.editor.is_some();
     if nb_editing && !s.palette_open && !s.settings_open {
         if e.is_command('s') {
@@ -93,14 +90,18 @@ pub fn on_key(s: &mut State, e: &KeyEvent, tx: &mut Tx) -> bool {
         tx.focus_when_shown("feed-search", false);
         return true;
     }
-    if s.open.is_none()
-        && s.editing.is_none()
+    if s.editing.is_none()
         && !nb_editing
         && !s.palette_open
         && !s.settings_open
+        && s.lightbox.is_none()
+        && s.delete_confirm.is_none()
         && let Some(tab) = ['1', '2', '3', '4'].iter().position(|c| e.is_command(*c)).map(|i| Tab::ALL[i])
     {
         if tab == Tab::Curator {
+            if s.open.is_some() {
+                s.close_project();
+            }
             s.open_curator(tx);
         } else {
             s.select_tab(tab, tx);
@@ -120,8 +121,8 @@ pub fn on_key(s: &mut State, e: &KeyEvent, tx: &mut Tx) -> bool {
         s.sync_search();
         return true;
     }
-    if s.lightbox.is_some() {
-        match e.key {
+    if let Some(id) = s.lightbox {
+        match &e.key {
             Key::Escape => {
                 if s.lightbox_compare.is_some() {
                     s.lightbox_compare = None;
@@ -140,6 +141,10 @@ pub fn on_key(s: &mut State, e: &KeyEvent, tx: &mut Tx) -> bool {
                 s.step_lightbox(1);
                 return true;
             }
+            Key::Text(t) if t == " " && !e.mods.cmd && !e.mods.ctrl && !e.mods.alt && s.videos.contains_key(&id) => {
+                s.toggle_video(id);
+                return true;
+            }
             _ => {}
         }
     }
@@ -150,11 +155,11 @@ pub fn on_key(s: &mut State, e: &KeyEvent, tx: &mut Tx) -> bool {
                 return true;
             }
             Key::Up => {
-                chrome::move_palette(s, -1);
+                chrome::move_palette(s, -1, tx);
                 return true;
             }
             Key::Down => {
-                chrome::move_palette(s, 1);
+                chrome::move_palette(s, 1, tx);
                 return true;
             }
             Key::Enter => {
@@ -213,6 +218,19 @@ pub fn on_key(s: &mut State, e: &KeyEvent, tx: &mut Tx) -> bool {
             return true;
         }
     }
+    if s.open.is_some()
+        && !s.palette_open
+        && !s.settings_open
+        && s.lightbox.is_none()
+        && s.delete_confirm.is_none()
+        && !s.menu_open
+        && s.post_menu.is_none()
+        && s.orb_menu.is_none()
+        && !s.curator.picker_open
+        && crate::files::on_key(s, e)
+    {
+        return true;
+    }
     if matches!(e.key, Key::Escape) && s.tab == Tab::Notebook && s.open.is_none() && s.notebook_escape() {
         return true;
     }
@@ -232,9 +250,13 @@ pub fn on_key(s: &mut State, e: &KeyEvent, tx: &mut Tx) -> bool {
         s.cancel_rename();
         return true;
     }
-    if matches!(e.key, Key::Escape) && s.open.is_none() && s.tab == Tab::Feed && !s.feed_search.text.is_empty() {
-        s.feed_search.text.clear();
-        s.sync_search();
+    if matches!(e.key, Key::Escape) && s.open.is_none() && s.tab == Tab::Feed && (!s.feed_search.text.is_empty() || s.feed_search.focused) {
+        if !s.feed_search.text.is_empty() {
+            s.feed_search.text.clear();
+            s.sync_search();
+        } else {
+            s.feed_search.focused = false;
+        }
         return true;
     }
     if matches!(e.key, Key::Escape) && s.open.is_some() && (s.project_search_open || !s.project_search.text.is_empty()) {
@@ -361,7 +383,7 @@ pub fn on_key(s: &mut State, e: &KeyEvent, tx: &mut Tx) -> bool {
                     if let Some(uid) = current
                         && let Some((_, sum)) = visible.iter().find(|(u, _)| u.id == uid)
                     {
-                        s.open_project(sum.project.id);
+                        s.open_project_at(sum.project.id, Some(uid));
                         return true;
                     }
                 }

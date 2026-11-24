@@ -14,6 +14,7 @@ MODE_STRIP = "--strip" in sys.argv[1:]
 
 EXCLUDED_FILES = {
     "assets/ThirdPartyLicenses.html",
+    "site/public/licenses.html",
     "site/pnpm-lock.yaml",
 }
 
@@ -29,7 +30,7 @@ def tracked_files() -> list[pathlib.Path]:
             continue
         if "stageshow" in p.parts:
             continue
-        if p.suffix in {".rs", ".m", ".swift", ".ts", ".tsx", ".mjs", ".js", ".jsx", ".css", ".astro", ".html", ".sh", ".py", ".toml", ".yml"}:
+        if p.suffix in {".rs", ".m", ".ts", ".tsx", ".mjs", ".js", ".jsx", ".css", ".astro", ".html", ".sh", ".py", ".toml", ".yml"}:
             files.append(p)
     return files
 

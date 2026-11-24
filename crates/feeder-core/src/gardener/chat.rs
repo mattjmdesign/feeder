@@ -47,6 +47,16 @@ pub(super) fn continuation_prompt(earlier: &[StoredEvent], message: &str) -> Str
                 flush(&mut reply, &mut turns);
                 turns.push(format!("Person: {}", text.trim()));
             }
+            StoredEvent::Event(Event::ToolStarted(call)) => {
+                flush(&mut reply, &mut turns);
+                let detail = call
+                    .text_arg("title")
+                    .or_else(|| call.text_arg("query"))
+                    .map(|s| format!(" ({})", clip(s, 60)))
+                    .or_else(|| call.int_arg("id").map(|id| format!(" (#{id})")))
+                    .unwrap_or_default();
+                turns.push(format!("Curator used {}{detail}", call.name));
+            }
             StoredEvent::Event(Event::Text(piece)) => reply.push_str(piece),
             StoredEvent::Event(Event::TurnFinished) => flush(&mut reply, &mut turns),
             StoredEvent::Event(_) => {}
@@ -95,7 +105,12 @@ impl Store {
     pub fn curator_chats(&self, limit: usize) -> Result<Vec<ChatSummary>> {
         let limit = i64::try_from(limit).unwrap_or(i64::MAX);
         let mut stmt = self.conn.prepare(
-            "SELECT r.id, r.started_at, r.read_only, r.project_id, c.title, r.edits,
+            "SELECT r.id, r.started_at, r.read_only, r.project_id, c.title,
+                    r.edits + COALESCE((
+                        SELECT SUM(pr.edits) FROM curator_chats past
+                        JOIN gardener_runs pr ON pr.id = past.run_id
+                        WHERE past.archived_under = c.run_id
+                    ), 0),
                     c.truncated OR EXISTS (
                         SELECT 1 FROM curator_chats past WHERE past.archived_under = c.run_id AND past.truncated
                     )
@@ -147,7 +162,12 @@ impl Store {
         if self.running_gardener()?.is_some_and(|run| run.id == run_id) {
             return Err(Error::Invalid("end the active Curator session before deleting its chat".into()));
         }
-        if tx.execute("UPDATE gardener_runs SET summary = NULL, error = NULL WHERE id = ?1", [run_id])? == 0 {
+        let cleared = tx.execute(
+            "UPDATE gardener_runs SET summary = NULL, error = NULL
+             WHERE id = ?1 OR id IN (SELECT run_id FROM curator_chats WHERE archived_under = ?1)",
+            [run_id],
+        )?;
+        if cleared == 0 {
             return Err(Error::NotFound(format!("no Curator run {run_id}")));
         }
         tx.execute("DELETE FROM curator_chats WHERE run_id = ?1 AND archived_under IS NULL", [run_id])?;
@@ -334,7 +354,7 @@ impl Deltas {
         if self.omitted {
             return;
         }
-        if self.bytes + delta.len() > TEXT_BYTES || i64::try_from(self.parts.len()).unwrap_or(i64::MAX) >= CHAT_EVENTS {
+        if self.bytes + delta.len() > TEXT_BYTES {
             self.omitted = true;
             self.parts.clear();
             return;
@@ -347,16 +367,16 @@ impl Deltas {
         if self.omitted {
             return vec![StoredEvent::Event(event(OMITTED.into()))];
         }
-        if sensitive(&self.parts.concat()) {
+        let joined = self.parts.concat();
+        if sensitive(&joined) {
             return vec![StoredEvent::Event(event(REDACTED.into()))];
         }
-        self.parts.into_iter().map(|part| StoredEvent::Event(event(part))).collect()
+        vec![StoredEvent::Event(event(joined))]
     }
 }
 
 fn sensitive(text: &str) -> bool {
     secret_in(text).is_some()
-        || text.split(|c: char| !c.is_ascii_alphanumeric() && c != '-' && c != '_').any(|word| secret_in(word).is_some())
 }
 
 pub(super) fn private_text(text: &str, chars: usize) -> String {

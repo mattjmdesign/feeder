@@ -55,6 +55,7 @@ pub fn bar_chrome(s: &State, id: i64, p: &Palette, k: &Kit) -> (El, Option<El>) 
             .fit()
             .on_pick(move |s: &mut State, i: usize, _: &mut Tx| {
                 s.files.view = views.get(i).copied().unwrap_or_default();
+                s.media_dirty = true;
                 s.ask();
             })
             .build(k)
@@ -256,8 +257,10 @@ pub fn view(s: &State, id: i64, p: &Palette, k: &Kit, reduced_motion: bool) -> E
                         },
                     )
                     .on_visible_rows(|s: &mut State, range| {
-                        s.project_visible_rows = Some(range);
-                        crate::media::sync(s);
+                        if s.project_visible_rows.as_ref() != Some(&range) {
+                            s.project_visible_rows = Some(range);
+                            s.sync_media();
+                        }
                         false
                     });
                 timeline = timeline.child(rows);
@@ -399,7 +402,7 @@ fn brief_card(s: &State, p: &Palette, k: &Kit, summary: &ProjectSummary) -> El {
                     .hover(p.hover)
                     .cursor(Cursor::Pointer)
                     .on_press_tx(move |s: &mut State, tx: &mut Tx| s.start_brief_edit(id, tx))
-                    .child(text("Edit brief").font(style::META).color(p.text_3)),
+                    .child(text("Edit Brief").font(style::META).color(p.text_3)),
             )
     } else {
         chrome::bar_button("add-brief", "+ Add Project Brief", p)
@@ -667,16 +670,20 @@ pub fn card_actions(s: &State, p: &Palette, u: &FeedUpdate) -> El {
         .on_press_tx(move |s: &mut State, tx: &mut Tx| s.start_edit_update(uid, tx));
     let reply_btn = small_btn(format!("reply-u-{uid}"), "Reply", "Reply to update")
         .on_press_tx(move |s: &mut State, tx: &mut Tx| s.start_reply(uid, tx));
-    let flag_btn =
-        small_btn(format!("flag-u-{uid}"), "Flag", "Flag for Library").on_press(move |s: &mut State| s.flag_update_for_notebook(uid));
     let delete_btn =
         small_btn(format!("del-u-{uid}"), "Delete", "Delete update").on_press(move |s: &mut State| s.delete_confirm = Some(uid));
 
-    row().gap(2.0).center_y().child(copy_btn).child(edit_btn).child(reply_btn).child(flag_btn).child(delete_btn)
+    let mut actions = row().gap(2.0).center_y().child(copy_btn).child(edit_btn).child(reply_btn);
+    if !s.update_is_flagged_or_reviewed(uid) {
+        let flag_btn =
+            small_btn(format!("flag-u-{uid}"), "Flag", "Flag for Library").on_press(move |s: &mut State| s.flag_update_for_notebook(uid));
+        actions = actions.child(flag_btn);
+    }
+    actions.child(delete_btn)
 }
 
 pub fn flag_pill(s: &State, p: &Palette, u: &FeedUpdate) -> Option<El> {
-    if !s.open_flag_for_update(u.id) {
+    if !s.open_flag_for_update(u.id) && !matches!(s.review_statuses.get(&u.id), Some(feeder_core::FeedReviewStatus::Queued)) {
         return None;
     }
     let (uid, project_id) = (u.id, u.project_id);
@@ -700,9 +707,16 @@ pub fn flag_pill(s: &State, p: &Palette, u: &FeedUpdate) -> Option<El> {
 }
 
 pub fn notebook_link(s: &State, p: &Palette, update_id: i64) -> Option<El> {
-    let change = s.notebook.gardener.changes.iter().find(|c| !c.is_reverted() && c.source_updates.contains(&update_id))?;
-    let page_id = change.page_id;
-    let title = change.page_title.clone();
+    let (page_id, title) =
+        if let Some(change) = s.notebook.gardener.changes.iter().find(|c| !c.is_reverted() && c.source_updates.contains(&update_id)) {
+            (change.page_id, change.page_title.clone())
+        } else if let Some(feeder_core::FeedReviewStatus::Reviewed { note_id: Some(page_id) }) = s.review_statuses.get(&update_id)
+            && let Some(page) = s.notebook.page(*page_id)
+        {
+            (page.id, page.title.clone())
+        } else {
+            return None;
+        };
     Some(
         row()
             .key(format!("nb-link-{update_id}-{page_id}"))
@@ -1079,6 +1093,7 @@ fn render_slide(s: &State, p: &Palette, slide: &crate::MediaSlide, width: f32, f
     }
 
     let path = slide.path.clone();
+    let drag_path = path.clone();
     let button = el()
         .key(format!("shot-{mid}"))
         .role("button")
@@ -1090,35 +1105,73 @@ fn render_slide(s: &State, p: &Palette, slide: &crate::MediaSlide, width: f32, f
         .cursor(Cursor::Pointer)
         .press_scale(0.99)
         .on_press_tx(move |s: &mut State, tx: &mut Tx| s.open_lightbox(mid, tx));
-    let button = button.drag_out(move |_: &State| Some(DragItem::new().file(&path)));
+    let button = button.drag_out(move |_: &State| Some(DragItem::new().file(&drag_path)));
 
-    if let Some(img) = s.shots.get(&mid)
-        && let Some([w, h]) = img.size()
-    {
-        let ratio = w.max(1) as f32 / h.max(1) as f32;
-        if let Some(frame_h) = frame {
-            let fit = (width / w.max(1) as f32).min(frame_h / h.max(1) as f32);
-            let (shot_w, shot_h) = (w as f32 * fit, h as f32 * fit);
-            return Some((
-                button.h(frame_h).fill(p.bg.alpha(0.5)).center().child(el().w(shot_w).h(shot_h).pixels_fit(img.pixels(), SurfaceFit::Fit)),
-                frame_h,
-            ));
-        }
-        let natural_h = width / ratio;
-        if natural_h <= SHOT_MAX_H {
-            Some((button.h(natural_h).pixels_fit(img.pixels(), SurfaceFit::Fit), natural_h))
-        } else {
+    if let Some(img) = s.shots.get(&mid) {
+        if let Some([w, h]) = img.size() {
+            let ratio = w.max(1) as f32 / h.max(1) as f32;
+            if let Some(frame_h) = frame {
+                let fit = (width / w.max(1) as f32).min(frame_h / h.max(1) as f32);
+                let (shot_w, shot_h) = (w as f32 * fit, h as f32 * fit);
+                return Some((
+                    button
+                        .h(frame_h)
+                        .fill(p.bg.alpha(0.5))
+                        .center()
+                        .child(el().w(shot_w).h(shot_h).pixels_fit(img.pixels(), SurfaceFit::Fit)),
+                    frame_h,
+                ));
+            }
+            let natural_h = width / ratio;
+            if natural_h <= SHOT_MAX_H {
+                return Some((button.h(natural_h).pixels_fit(img.pixels(), SurfaceFit::Fit), natural_h));
+            }
             let shot_w = SHOT_MAX_H * ratio;
-            Some((
+            return Some((
                 button
                     .h(SHOT_MAX_H)
                     .fill(p.bg.alpha(0.5))
                     .center()
                     .child(el().w(shot_w).h(SHOT_MAX_H).pixels_fit(img.pixels(), SurfaceFit::Fit)),
                 SHOT_MAX_H,
-            ))
+            ));
+        } else if let Some(err) = img.error() {
+            let box_h = frame.unwrap_or_else(|| {
+                if let (Some(w), Some(h)) = (slide.width, slide.height)
+                    && w > 0
+                    && h > 0
+                {
+                    (width / (w as f32 / h as f32)).clamp(96.0, SHOT_MAX_H)
+                } else {
+                    112.0
+                }
+            });
+            let card = el()
+                .key(format!("shot-err-{mid}"))
+                .w_full()
+                .h(box_h)
+                .radius(10.0)
+                .border(1.0, p.hairline)
+                .fill(p.hover)
+                .center()
+                .px(16.0)
+                .child(
+                    col()
+                        .gap(8.0)
+                        .items_center()
+                        .child(
+                            text(format!("Couldn’t load image: {err}")).font(style::META).color(p.text_3).align(rune::Align::Center).wrap(),
+                        )
+                        .child(
+                            chrome::bar_button(&format!("shot-reveal-{mid}"), "Show in Finder", p)
+                                .border(1.0, p.hairline)
+                                .on_press(move |_: &mut State| chrome::reveal_path(&path)),
+                        ),
+                );
+            return Some((card, box_h));
         }
-    } else if slide.is_image()
+    }
+    if slide.is_image()
         && let (Some(w), Some(h)) = (slide.width, slide.height)
         && w > 0
         && h > 0

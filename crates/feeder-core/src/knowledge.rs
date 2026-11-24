@@ -231,6 +231,7 @@ impl Change {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Curation {
     Create { draft: PageDraft, project_id: Option<i64> },
+    CreateShared { draft: PageDraft },
     Revise { page_id: i64, draft: PageDraft },
     Archive { page_id: i64 },
 }
@@ -355,7 +356,7 @@ impl Store {
         if let Some(id) = flag.page_id
             && self.page(id)?.is_none()
         {
-            return Err(Error::NotFound(format!("no notebook page {id}")));
+            return Err(Error::NotFound(format!("no Library note {id}")));
         }
         self.conn.execute(
             "INSERT INTO knowledge_flags (kind, page_id, project_id, agent, note, suggestion, status, created_at, source_update_id)
@@ -430,7 +431,7 @@ impl Store {
         if let Some(change) = change_id
             && self.change(change)?.is_none()
         {
-            return Err(Error::NotFound(format!("no notebook change {change}")));
+            return Err(Error::NotFound(format!("no Library change {change}")));
         }
         let note = note.trim().to_string();
         self.conn.execute(
@@ -473,7 +474,7 @@ impl Store {
                 let draft = draft.checked()?;
                 if let Some(existing) = self.similar_pages(&draft)?.into_iter().find(|p| p.project_id == project_id) {
                     return Err(Error::Invalid(format!(
-                        "the notebook already has a page on this: #{} \"{}\". Revise it (pass id {}) rather than adding another, or file this as new only if it's a genuinely different note",
+                        "the Library already has a note on this: #{} \"{}\". Revise it (pass id {}) rather than adding another, or file this as new only if it's a genuinely different note",
                         existing.id, existing.title, existing.id
                     )));
                 }
@@ -487,13 +488,14 @@ impl Store {
                 }
                 (ChangeAction::Created, None, project_id, draft, None)
             }
+            Curation::CreateShared { .. } => unreachable!("resolved in prepare_gardener_curation"),
             Curation::Revise { page_id, draft } => {
-                let old = self.page(page_id)?.ok_or_else(|| Error::NotFound(format!("no notebook page {page_id}")))?;
+                let old = self.page(page_id)?.ok_or_else(|| Error::NotFound(format!("no Library note {page_id}")))?;
                 let draft = draft.checked()?;
                 (ChangeAction::Revised, Some(page_id), old.project_id, draft, Some(old))
             }
             Curation::Archive { page_id } => {
-                let old = self.page(page_id)?.ok_or_else(|| Error::NotFound(format!("no notebook page {page_id}")))?;
+                let old = self.page(page_id)?.ok_or_else(|| Error::NotFound(format!("no Library note {page_id}")))?;
                 let draft = PageDraft {
                     kind: old.kind,
                     topic: Some(old.topic.clone()),
@@ -545,6 +547,35 @@ impl Store {
         let limit = i64::try_from(limit.max(1)).unwrap_or(i64::MAX);
         let mut stmt = self.conn.prepare(&format!("SELECT {PROPOSAL_COLS} FROM curator_proposals ORDER BY id DESC LIMIT ?1"))?;
         let rows = stmt.query_map([limit], proposal_row)?;
+        rows.collect::<rusqlite::Result<Vec<_>>>()?.into_iter().collect()
+    }
+
+    pub fn pending_curator_proposals(&self, limit: usize) -> Result<Vec<Proposal>> {
+        let limit = i64::try_from(limit.max(1)).unwrap_or(i64::MAX);
+        let mut stmt = self
+            .conn
+            .prepare(&format!("SELECT {PROPOSAL_COLS} FROM curator_proposals WHERE status = 'pending' ORDER BY id DESC LIMIT ?1"))?;
+        let rows = stmt.query_map([limit], proposal_row)?;
+        rows.collect::<rusqlite::Result<Vec<_>>>()?.into_iter().collect()
+    }
+
+    pub fn curator_proposals_for_chat(&self, run_id: i64) -> Result<Vec<Proposal>> {
+        let mut stmt = self.conn.prepare(&format!(
+            "SELECT {PROPOSAL_COLS} FROM curator_proposals
+             WHERE run_id = ?1 OR run_id IN (SELECT run_id FROM curator_chats WHERE archived_under = ?1)
+             ORDER BY id DESC"
+        ))?;
+        let rows = stmt.query_map([run_id], proposal_row)?;
+        rows.collect::<rusqlite::Result<Vec<_>>>()?.into_iter().collect()
+    }
+
+    pub fn curator_changes_for_chat(&self, run_id: i64) -> Result<Vec<Change>> {
+        let mut stmt = self.conn.prepare(&format!(
+            "SELECT {CHANGE_COLS} FROM notebook_changes c
+             WHERE c.gardener_run_id = ?1 OR c.gardener_run_id IN (SELECT run_id FROM curator_chats WHERE archived_under = ?1)
+             ORDER BY c.id DESC"
+        ))?;
+        let rows = stmt.query_map([run_id], change_row)?;
         rows.collect::<rusqlite::Result<Vec<_>>>()?.into_iter().collect()
     }
 
@@ -604,10 +635,17 @@ impl Store {
         self.curator_proposal(id)?.ok_or_else(|| Error::NotFound(format!("no proposal {id}")))
     }
 
-    fn prepare_gardener_curation(&self, run_id: i64, mut curation: Curation, provenance: &Provenance) -> Result<(Curation, Provenance)> {
+    fn prepare_gardener_curation(&self, run_id: i64, curation: Curation, provenance: &Provenance) -> Result<(Curation, Provenance)> {
         let run = self.curator_run_with_budget(run_id)?;
         let mut evidence = provenance.clone();
-        let mut project = run.scope.project_id();
+        let mut evidence_projects: Vec<i64> = Vec::new();
+        let mut push_project = |source: Option<i64>| {
+            if let Some(id) = source
+                && !evidence_projects.contains(&id)
+            {
+                evidence_projects.push(id);
+            }
+        };
         for &id in &evidence.flags {
             let flag = self.gardener_flag(run.scope, id)?;
             if let Some(id) = flag.source_update_id
@@ -615,28 +653,58 @@ impl Store {
             {
                 evidence.updates.push(id);
             }
-            merge_evidence_project(&mut project, self.flag_project(&flag)?)?;
+            push_project(self.flag_project(&flag)?);
         }
         for &id in &evidence.updates {
             let update = self
                 .update(id)?
                 .filter(|u| run.scope.includes(Some(u.project_id)))
                 .ok_or_else(|| Error::NotFound(format!("no Feed update {id} in this session")))?;
-            merge_evidence_project(&mut project, Some(update.project_id))?;
+            push_project(Some(update.project_id));
         }
-        match &mut curation {
-            Curation::Create { project_id, .. } => *project_id = project,
-            Curation::Revise { page_id, .. } | Curation::Archive { page_id } => {
+        let resolved = match curation {
+            Curation::CreateShared { draft } => {
+                if run.scope.project_id().is_some() {
+                    return Err(Error::Invalid("a project-scoped Curator session cannot create shared Library notes".into()));
+                }
+                Curation::Create { draft, project_id: None }
+            }
+            Curation::Create { draft, .. } => {
+                let project_id = match run.scope.project_id() {
+                    Some(pid) => Some(pid),
+                    None => match evidence_projects.as_slice() {
+                        [only] => Some(*only),
+                        _ => None,
+                    },
+                };
+                Curation::Create { draft, project_id }
+            }
+            Curation::Revise { page_id, draft } => {
                 let page = self
-                    .page(*page_id)?
+                    .page(page_id)?
                     .filter(|p| run.scope.includes(p.project_id))
-                    .ok_or_else(|| Error::NotFound(format!("no Notebook page {page_id} in this session")))?;
-                if project.is_some() && page.project_id != project {
+                    .ok_or_else(|| Error::NotFound(format!("no Library note {page_id} in this session")))?;
+                if let Some(page_pid) = page.project_id
+                    && evidence_projects.iter().any(|&pid| pid != page_pid)
+                {
                     return Err(Error::Invalid("the evidence belongs to a different project than this note".into()));
                 }
+                Curation::Revise { page_id, draft }
             }
-        }
-        Ok((curation, evidence))
+            Curation::Archive { page_id } => {
+                let page = self
+                    .page(page_id)?
+                    .filter(|p| run.scope.includes(p.project_id))
+                    .ok_or_else(|| Error::NotFound(format!("no Library note {page_id} in this session")))?;
+                if let Some(page_pid) = page.project_id
+                    && evidence_projects.iter().any(|&pid| pid != page_pid)
+                {
+                    return Err(Error::Invalid("the evidence belongs to a different project than this note".into()));
+                }
+                Curation::Archive { page_id }
+            }
+        };
+        Ok((resolved, evidence))
     }
 
     pub fn dismiss_gardener_flag(&self, run_id: i64, id: i64, reason: String) -> Result<Flag> {
@@ -711,14 +779,19 @@ impl Store {
                 let page = self.create_page(draft, author, project_id, similar)?;
                 (page, ChangeAction::Created, None)
             }
+            Curation::CreateShared { draft } => {
+                let similar = if gardener_run_id.is_some() { crate::OnSimilar::RefuseInScope } else { crate::OnSimilar::Refuse };
+                let page = self.create_page(draft, author, None, similar)?;
+                (page, ChangeAction::Created, None)
+            }
             Curation::Revise { page_id, draft } => {
-                let old = self.page(page_id)?.ok_or_else(|| Error::NotFound(format!("no notebook page {page_id}")))?;
+                let old = self.page(page_id)?.ok_or_else(|| Error::NotFound(format!("no Library note {page_id}")))?;
                 let page = self.revise_page(page_id, draft, author)?;
                 (page, ChangeAction::Revised, Some(PageSnapshot::of(&old)))
             }
             Curation::Archive { page_id } => {
                 self.set_page_standing(page_id, Standing::Archived)?;
-                let page = self.page(page_id)?.ok_or_else(|| Error::NotFound(format!("no notebook page {page_id}")))?;
+                let page = self.page(page_id)?.ok_or_else(|| Error::NotFound(format!("no Library note {page_id}")))?;
                 (page, ChangeAction::Archived, None)
             }
         };
@@ -741,10 +814,10 @@ impl Store {
 
     fn check_gardener_edit(&self, curation: &Curation, provenance: &Provenance) -> Result<()> {
         if provenance.flags.is_empty() && provenance.updates.is_empty() {
-            return Err(Error::Invalid("the gardener must name the flag or Feed update an edit comes from".into()));
+            return Err(Error::Invalid("Curator must name the flag or Feed update an edit comes from".into()));
         }
         if provenance.reason.trim().is_empty() {
-            return Err(Error::Invalid("the gardener must say why it made an edit".into()));
+            return Err(Error::Invalid("Curator must say why it made an edit".into()));
         }
         for &id in &provenance.updates {
             if self.update(id)?.is_none() {
@@ -753,10 +826,11 @@ impl Store {
         }
         let (page_id, draft) = match curation {
             Curation::Create { draft, project_id } => return self.check_gardener_links(*project_id, None, &draft.body),
+            Curation::CreateShared { draft } => return self.check_gardener_links(None, None, &draft.body),
             Curation::Revise { page_id, draft } => (*page_id, Some(draft)),
             Curation::Archive { page_id } => (*page_id, None),
         };
-        let page = self.page(page_id)?.ok_or_else(|| Error::NotFound(format!("no notebook page {page_id}")))?;
+        let page = self.page(page_id)?.ok_or_else(|| Error::NotFound(format!("no Library note {page_id}")))?;
         if let Some(draft) = draft {
             self.check_gardener_links(page.project_id, Some(&page), &draft.body)?;
         }
@@ -768,7 +842,7 @@ impl Store {
             Ok(())
         } else {
             Err(Error::Invalid(format!(
-                "page #{page_id} was written by hand, so the gardener may only add to its end; flag it for the person instead"
+                "note #{page_id} was written by hand, so Curator may only add to its end; flag it for the person instead"
             )))
         }
     }
@@ -777,10 +851,10 @@ impl Store {
         let existing: std::collections::BTreeSet<_> = previous.into_iter().flat_map(|page| notebook_link_ids(&page.body)).collect();
         for id in notebook_link_ids(body).filter(|id| !existing.contains(id)) {
             if previous.is_some_and(|page| page.id == id) {
-                return Err(Error::Invalid(format!("page #{id} cannot link to itself")));
+                return Err(Error::Invalid(format!("note #{id} cannot link to itself")));
             }
             self.page(id)?.filter(|page| !page.is_archived() && (page.project_id.is_none() || page.project_id == project_id)).ok_or_else(
-                || Error::Invalid(format!("link target #{id} must be a current note in the same project or the shared Notebook")),
+                || Error::Invalid(format!("link target #{id} must be a current note in the same project or the shared Library")),
             )?;
         }
         Ok(())
@@ -822,7 +896,7 @@ impl Store {
 
     pub fn revert_change(&self, id: i64, by: &str) -> Result<Curated> {
         let tx = Transaction::new_unchecked(&self.conn, TransactionBehavior::Immediate)?;
-        let change = self.change(id)?.ok_or_else(|| Error::NotFound(format!("no notebook change {id}")))?;
+        let change = self.change(id)?.ok_or_else(|| Error::NotFound(format!("no Library change {id}")))?;
         if change.is_reverted() {
             return Err(Error::Invalid(format!("change {id} was already reverted")));
         }
@@ -837,7 +911,7 @@ impl Store {
         )?;
         if newer_live {
             return Err(Error::Invalid(format!(
-                "page #{} changed after this; revert its newer change first so nothing is lost",
+                "note #{} changed after this; revert its newer change first so nothing is lost",
                 change.page_id
             )));
         }
@@ -845,30 +919,30 @@ impl Store {
         if let Some(expected) = expected {
             let state: (PageSnapshot, bool) =
                 serde_json::from_str(&expected).map_err(|e| Error::Invalid(format!("change {id} has unreadable saved text: {e}")))?;
-            let current = self.page(change.page_id)?.ok_or_else(|| Error::NotFound(format!("no Notebook page {}", change.page_id)))?;
+            let current = self.page(change.page_id)?.ok_or_else(|| Error::NotFound(format!("no Library note {}", change.page_id)))?;
             if (PageSnapshot::of(&current), current.is_archived()) != state {
-                return Err(Error::Invalid("this note was edited after the gardener saved it; the current version was kept".into()));
+                return Err(Error::Invalid("this note was edited after Curator saved it; the current version was kept".into()));
             }
         }
         let reason = format!("Reverted: {}", change.reason.as_deref().unwrap_or(change.action.label()));
         let curated = match change.action {
             ChangeAction::Created | ChangeAction::Restored => {
-                let old = self.page(change.page_id)?.ok_or_else(|| Error::NotFound(format!("no notebook page {}", change.page_id)))?;
+                let old = self.page(change.page_id)?.ok_or_else(|| Error::NotFound(format!("no Library note {}", change.page_id)))?;
                 self.set_page_standing(old.id, Standing::Archived)?;
-                let page = self.page(old.id)?.ok_or_else(|| Error::NotFound(format!("no notebook page {}", old.id)))?;
+                let page = self.page(old.id)?.ok_or_else(|| Error::NotFound(format!("no Library note {}", old.id)))?;
                 let change_id = self.log_change(&page, ChangeAction::Archived, by, &reason, None)?;
                 (page, change_id)
             }
             ChangeAction::Revised => {
                 let before = change.before.clone().ok_or_else(|| Error::Invalid(format!("change {id} kept no earlier text")))?;
-                let old = self.page(change.page_id)?.ok_or_else(|| Error::NotFound(format!("no notebook page {}", change.page_id)))?;
+                let old = self.page(change.page_id)?.ok_or_else(|| Error::NotFound(format!("no Library note {}", change.page_id)))?;
                 let page = self.revise_page(change.page_id, before.into_draft(), by)?;
                 let change_id = self.log_change(&page, ChangeAction::Revised, by, &reason, Some(&PageSnapshot::of(&old)))?;
                 (page, change_id)
             }
             ChangeAction::Archived => {
                 self.set_page_standing(change.page_id, Standing::Current)?;
-                let page = self.page(change.page_id)?.ok_or_else(|| Error::NotFound(format!("no notebook page {}", change.page_id)))?;
+                let page = self.page(change.page_id)?.ok_or_else(|| Error::NotFound(format!("no Library note {}", change.page_id)))?;
                 let change_id = self.log_change(&page, ChangeAction::Restored, by, &reason, None)?;
                 (page, change_id)
             }
@@ -905,16 +979,6 @@ fn notebook_link_ids(body: &str) -> impl Iterator<Item = i64> + '_ {
             tail[..end].parse().ok()
         })
     })
-}
-
-fn merge_evidence_project(project: &mut Option<i64>, source: Option<i64>) -> Result<()> {
-    if let Some(id) = source {
-        if project.is_some_and(|existing| existing != id) {
-            return Err(Error::Invalid("use evidence from one project per note".into()));
-        }
-        *project = Some(id);
-    }
-    Ok(())
 }
 
 fn flag_row(r: &Row<'_>) -> rusqlite::Result<Flag> {
@@ -1073,17 +1137,12 @@ pub(crate) fn migrate(conn: &Connection) -> Result<()> {
         );
         CREATE INDEX IF NOT EXISTS curator_proposals_by_run ON curator_proposals(run_id, id DESC);",
     )?;
-    let has_baseline = |conn: &Connection| {
+    let has_baseline: bool =
         conn.query_row("SELECT EXISTS(SELECT 1 FROM pragma_table_info('curator_proposals') WHERE name = 'before_state')", [], |r| {
-            r.get::<_, bool>(0)
-        })
-    };
-    if !has_baseline(conn)? {
-        let tx = Transaction::new_unchecked(conn, TransactionBehavior::Immediate)?;
-        if !has_baseline(&tx)? {
-            tx.execute("ALTER TABLE curator_proposals ADD COLUMN before_state TEXT", [])?;
-        }
-        tx.commit()?;
+            r.get(0)
+        })?;
+    if !has_baseline {
+        conn.execute("ALTER TABLE curator_proposals ADD COLUMN before_state TEXT", [])?;
     }
     Ok(())
 }
@@ -1461,6 +1520,7 @@ mod tests {
         let revision = || Curation::Revise { page_id: page.id, draft: draft(title, revised) };
         let legacy = s.propose_gardener_run(run, revision(), &provenance).unwrap();
         s.conn.execute("ALTER TABLE curator_proposals DROP COLUMN before_state", []).unwrap();
+        s.conn.pragma_update(None, "user_version", 0).unwrap();
 
         let upgraded = Store::open(&t.dir).unwrap();
         assert_eq!(upgraded.curator_proposal(legacy.id).unwrap(), Some(legacy.clone()));
@@ -1522,5 +1582,58 @@ mod tests {
         assert_eq!(dismissed.status, ProposalStatus::Dismissed);
         assert!(s.dismiss_curator_proposal(p2.id).is_err(), "cannot dismiss twice");
         assert_eq!(s.flag(flag2.id).expect("read flag 2").expect("exists").status, FlagStatus::Open);
+    }
+
+    #[test]
+    fn global_curator_can_revise_and_create_shared_notes_from_project_evidence() {
+        use crate::gardener::Backend;
+
+        let t = temp_store("shared-curation");
+        let s = &t.store;
+        let alpha = s.project_named("Alpha", None).unwrap();
+        let beta = s.project_named("Beta", None).unwrap();
+        let shared =
+            s.create_page(draft("Shared SQLite rule", "Keep write locks brief."), "Codex", None, crate::OnSimilar::Refuse).unwrap();
+        let alpha_only =
+            s.create_page(draft("Alpha deploy steps", "Run alpha deploy."), "Codex", Some(alpha.id), crate::OnSimilar::Refuse).unwrap();
+        let alpha_flag = s
+            .flag_knowledge(
+                NewFlag { project_id: Some(alpha.id), page_id: Some(shared.id), ..missing("Add busy_timeout guidance") },
+                "Codex",
+            )
+            .unwrap();
+        let beta_update = s
+            .post(
+                beta.id,
+                crate::NewUpdate { agent: "Codex".into(), body: "Done: raised busy_timeout to 5s.".into(), ..Default::default() },
+            )
+            .unwrap();
+        let run = s.start_gardener_run(Backend::Codex).unwrap();
+
+        let revised = s
+            .propose_gardener_run(
+                run,
+                Curation::Revise { page_id: shared.id, draft: draft("Shared SQLite rule", "Keep write locks brief and set busy_timeout.") },
+                &Provenance { reason: "Observed across Alpha and Beta".into(), flags: vec![alpha_flag.id], updates: vec![beta_update.id] },
+            )
+            .expect("revise shared note with multi-project evidence");
+        assert_eq!(revised.project_id, None);
+        assert_eq!(s.apply_curator_proposal(revised.id).unwrap().page.project_id, None);
+
+        let created_shared = s
+            .propose_gardener_run(
+                run,
+                Curation::CreateShared { draft: draft("Cross-project lock rule", "Always copy media before SQLite transactions.") },
+                &Provenance { reason: "Applies everywhere".into(), flags: vec![], updates: vec![beta_update.id] },
+            )
+            .expect("create shared note from single project update");
+        assert_eq!(created_shared.project_id, None);
+
+        let cross_project = s.propose_gardener_run(
+            run,
+            Curation::Revise { page_id: alpha_only.id, draft: draft("Alpha deploy steps", "Wrong project edit.") },
+            &Provenance { reason: "Beta update".into(), flags: vec![], updates: vec![beta_update.id] },
+        );
+        assert!(cross_project.is_err(), "project-specific notes reject foreign project evidence");
     }
 }

@@ -71,7 +71,7 @@ impl Curator {
     }
 
     pub fn want_models(&mut self, backend: Backend, wake: Option<&Waker>) {
-        if matches!(self.models.get(&backend), Some(Models::Loading | Models::Ready(_))) {
+        if matches!(self.models.get(&backend), Some(Models::Loading | Models::Ready(_) | Models::Failed(_))) {
             return;
         }
         self.models.insert(backend, Models::Loading);
@@ -149,6 +149,12 @@ impl Curator {
         self.edit(|p| p.set_enabled(backend, on));
         if on {
             self.want_models(backend, wake);
+        }
+    }
+
+    pub fn clear_model_failure(&mut self, backend: Backend) {
+        if matches!(self.models.get(&backend), Some(Models::Failed(_))) {
+            self.models.remove(&backend);
         }
     }
 
@@ -381,7 +387,7 @@ fn model_select(s: &State, backend: Backend, p: &Palette, k: &Kit, layer: &mut V
             let show_default = matches_default_label(&query);
             let chosen = c.prefs.get(backend).model;
             let first_match_id = filtered.first().map(|m| m.id.clone());
-            let submit_default = show_default && (query.is_empty() || first_match_id.is_none());
+            let submit_choice = pick_model_on_submit(&query, show_default, first_match_id);
             let focus_back = anchor_key.clone();
             let esc_back = anchor_key.clone();
 
@@ -393,12 +399,8 @@ fn model_select(s: &State, backend: Backend, p: &Palette, k: &Kit, layer: &mut V
                 .on_edit(|s: &mut State| &mut s.curator.model_search)
                 .on_action(|s: &mut State, _| s.curator.model_search = TextEdit::new(""))
                 .on_submit(move |s: &mut State, tx: &mut Tx| {
-                    if let Some(id) = first_match_id.clone() {
-                        s.curator.choose_model(backend, Some(id));
-                        s.curator.close_select();
-                        tx.focus_when_shown(focus_back.clone(), false);
-                    } else if submit_default {
-                        s.curator.choose_model(backend, None);
+                    if let Some(choice) = submit_choice.clone() {
+                        s.curator.choose_model(backend, choice);
                         s.curator.close_select();
                         tx.focus_when_shown(focus_back.clone(), false);
                     }
@@ -600,7 +602,7 @@ pub fn picker(s: &State, current: Backend, p: &Palette, k: &Kit, layer: &mut Vec
 
             if searchable {
                 let first_match_id = filtered.first().map(|m| m.id.clone());
-                let submit_default = show_default && (query.is_empty() || first_match_id.is_none());
+                let submit_choice = pick_model_on_submit(&query, show_default, first_match_id);
                 let mut search = TextInput::new(&c.picker_search)
                     .placeholder("Search models")
                     .label("Search models")
@@ -609,12 +611,8 @@ pub fn picker(s: &State, current: Backend, p: &Palette, k: &Kit, layer: &mut Vec
                     .on_edit(|s: &mut State| &mut s.curator.picker_search)
                     .on_action(|s: &mut State, _| s.curator.picker_search = TextEdit::new(""))
                     .on_submit(move |s: &mut State, tx: &mut Tx| {
-                        if let Some(id) = first_match_id.clone() {
-                            s.curator.choose_model(current, Some(id));
-                            s.curator.close_picker();
-                            tx.focus_when_shown("curator-picker-chip", false);
-                        } else if submit_default {
-                            s.curator.choose_model(current, None);
+                        if let Some(choice) = submit_choice.clone() {
+                            s.curator.choose_model(current, choice);
                             s.curator.close_picker();
                             tx.focus_when_shown("curator-picker-chip", false);
                         }
@@ -668,7 +666,28 @@ pub fn picker(s: &State, current: Backend, p: &Palette, k: &Kit, layer: &mut Vec
             body = body
                 .child(scroll_bar(k, "curator-picker-models-area", "curator-picker-models", scroll_viewport).w_full().shrink().min_h(0.0));
         }
-        Some(Models::Failed(e)) => body = body.child(text(e.clone()).font(style::META).color(k.c.danger.fg).wrap().px(8.0).py(6.0)),
+        Some(Models::Failed(e)) => {
+            body = body.child(
+                row()
+                    .w_full()
+                    .gap(8.0)
+                    .center_y()
+                    .px(8.0)
+                    .py(6.0)
+                    .child(text(e.clone()).font(style::META).color(k.c.danger.fg).wrap().grow(1.0).min_w(0.0))
+                    .child(
+                        Button::new("Retry")
+                            .variant(ButtonVariant::GhostMuted)
+                            .control_size(ControlSize::Small)
+                            .on_press(move |s: &mut State| {
+                                s.curator.models.remove(&current);
+                                let wake = s.wake.clone();
+                                s.curator.want_models(current, wake.as_ref());
+                            })
+                            .build(k),
+                    ),
+            )
+        }
         Some(Models::Loading) | None => body = body.child(text("Loading models…").font(style::META).color(p.text_3).px(8.0).py(6.0)),
     }
 
@@ -807,6 +826,18 @@ fn field(p: &Palette, label: &str, control: El) -> El {
     row().w_full().gap(16.0).center_y().child(text(label.to_string()).font(style::BODY).color(p.text_2).grow(1.0)).child(control)
 }
 
+fn pick_model_on_submit(query: &str, show_default: bool, first_match_id: Option<String>) -> Option<Option<String>> {
+    if query.is_empty() && show_default {
+        Some(None)
+    } else if let Some(id) = first_match_id {
+        Some(Some(id))
+    } else if show_default {
+        Some(None)
+    } else {
+        None
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -826,11 +857,16 @@ mod tests {
         assert_eq!(hits.len(), 1);
         assert_eq!(hits[0].id, "opencode-go/deepseek-v4.1-flash");
 
-        let hits = filter_models(&models, "deepseek");
-        assert_eq!(hits.len(), 2);
+        let matches = filter_models(&models, "deepseek");
+        assert_eq!(matches.len(), 2);
 
         assert!(matches_default_label(""));
         assert!(matches_default_label("default"));
         assert!(!matches_default_label("deepseek"));
+        assert_eq!(pick_model_on_submit("", true, Some("openai/gpt-5.6-luna".into())), Some(None));
+        assert_eq!(
+            pick_model_on_submit("deep", false, Some("opencode-go/deepseek-v4-pro".into())),
+            Some(Some("opencode-go/deepseek-v4-pro".into()))
+        );
     }
 }

@@ -1,3 +1,4 @@
+use std::collections::HashSet;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
@@ -53,6 +54,12 @@ pub struct ToolResult {
     pub failed: bool,
 }
 
+#[derive(Clone, Debug, PartialEq)]
+enum LastLaunch {
+    Message(String),
+    Job { title: &'static str, prompt: String },
+}
+
 pub struct Chat {
     pub items: Vec<Item>,
     pub input: TextEdit,
@@ -62,8 +69,14 @@ pub struct Chat {
     pub scope: Scope,
     pub mode: SessionMode,
     pub viewing: Option<i64>,
+    pub loading_saved: bool,
+    pub delete_confirm: bool,
+    last_launch: Option<LastLaunch>,
     saved: Arc<Mutex<Option<SavedChat>>>,
     pub expanded: Vec<usize>,
+    pub expanded_diffs: HashSet<String>,
+    pub in_flight_proposals: HashSet<i64>,
+    pub in_flight_changes: HashSet<i64>,
     session: Arc<Mutex<Option<Session>>>,
     last_run: Arc<Mutex<Option<i64>>>,
     inbox: Arc<Mutex<Vec<Event>>>,
@@ -81,14 +94,24 @@ impl Default for Chat {
             scope: Scope::Notebook,
             mode: SessionMode::Review,
             viewing: None,
+            loading_saved: false,
+            delete_confirm: false,
+            last_launch: None,
             saved: Arc::new(Mutex::new(None)),
             expanded: Vec::new(),
+            expanded_diffs: HashSet::new(),
+            in_flight_proposals: HashSet::new(),
+            in_flight_changes: HashSet::new(),
             session: Arc::new(Mutex::new(None)),
             last_run: Arc::new(Mutex::new(None)),
             inbox: Arc::new(Mutex::new(Vec::new())),
             stop_requested: Arc::new(AtomicBool::new(false)),
         }
     }
+}
+
+fn drop_session_bg(session: Arc<Mutex<Option<Session>>>) {
+    std::thread::spawn(move || drop(session.lock().unwrap_or_else(|e| e.into_inner()).take()));
 }
 
 impl Chat {
@@ -107,6 +130,7 @@ impl Chat {
         if let Some((run_id, stored)) = saved
             && self.viewing == Some(run_id)
         {
+            self.loading_saved = false;
             show_saved(self, stored);
         }
         let events: Vec<Event> = std::mem::take(&mut *self.inbox.lock().unwrap_or_else(|e| e.into_inner()));
@@ -115,8 +139,7 @@ impl Chat {
             let ended = matches!(event, Event::Ended);
             apply(&mut self.items, &mut self.phase, self.backend, event);
             if ended {
-                let session = Arc::clone(&self.session);
-                std::thread::spawn(move || drop(session.lock().unwrap_or_else(|e| e.into_inner()).take()));
+                drop_session_bg(Arc::clone(&self.session));
             }
         }
         changed
@@ -216,6 +239,7 @@ impl State {
             let wake = self.wake.clone();
             let chat = &mut self.notebook.chat;
             chat.input = TextEdit::new("");
+            chat.last_launch = Some(LastLaunch::Message(typed.clone()));
             chat.items.push(Item::You(typed.clone()));
             chat.phase = Phase::Working;
             chat.session_send(typed, wake);
@@ -230,20 +254,38 @@ impl State {
     }
 
     fn gardener_retry(&mut self) {
-        let last = self.notebook.chat.items.iter().rev().find_map(|item| match item {
-            Item::You(text) => Some(text.clone()),
-            _ => None,
+        let launch = self.notebook.chat.last_launch.clone().or_else(|| {
+            self.notebook.chat.items.iter().rev().find_map(|item| match item {
+                Item::You(text) => Some(LastLaunch::Message(text.clone())),
+                _ => None,
+            })
         });
+        let Some(launch) = launch else { return };
         let scope = self.notebook.chat.scope;
+        let mode = self.notebook.chat.mode;
         let backend = self.notebook.chat.backend;
-        self.gardener_close();
-        self.notebook.chat.scope = scope;
+        let mut from = current_run(&self.notebook.chat);
+        while matches!(self.notebook.chat.items.last(), Some(Item::SignIn(_) | Item::Failed(_) | Item::Ended)) {
+            self.notebook.chat.items.pop();
+        }
+        if matches!(&launch, LastLaunch::Message(_)) && matches!(self.notebook.chat.items.last(), Some(Item::You(_))) {
+            self.notebook.chat.items.pop();
+        }
+        let preserve = from.is_some() && !self.notebook.chat.items.is_empty();
+        if !preserve {
+            from = None;
+            self.gardener_close();
+            self.notebook.chat.scope = scope;
+        }
         if let Some(backend) = backend {
             self.notebook.curator_backend = Some(backend);
         }
-        if let Some(question) = last {
-            self.notebook.chat.input = TextEdit::new(question);
-            self.gardener_submit();
+        match launch {
+            LastLaunch::Job { title, prompt } => self.gardener_start(scope, SessionMode::Review, prompt, Some(title)),
+            LastLaunch::Message(message) => {
+                let mode = if from.is_some() { mode } else { SessionMode::Review };
+                self.gardener_launch(scope, mode, message, None, from);
+            }
         }
     }
 
@@ -251,9 +293,14 @@ impl State {
         if self.notebook.chat.phase == Phase::Working {
             return;
         }
+        drop_session_bg(Arc::clone(&self.notebook.chat.session));
+        if let Some(w) = &self.watcher {
+            w.curator_chat(Some(summary.run_id));
+        }
         let chat = &mut self.notebook.chat;
         *chat = Chat::default();
         chat.viewing = Some(summary.run_id);
+        chat.loading_saved = true;
         chat.mode = summary.mode;
         chat.scope = summary.scope;
         chat.phase = Phase::Ended;
@@ -325,6 +372,10 @@ impl State {
         }
         *chat = Chat::default();
         chat.items = earlier;
+        chat.last_launch = Some(match job {
+            Some(title) => LastLaunch::Job { title, prompt: message.clone() },
+            None => LastLaunch::Message(message.clone()),
+        });
         if job.is_none() {
             chat.items.push(Item::You(message.clone()));
         }
@@ -336,6 +387,9 @@ impl State {
         chat.mode = mode;
         let (slot, inbox, last_run) = (Arc::clone(&chat.session), Arc::clone(&chat.inbox), Arc::clone(&chat.last_run));
         let stop_requested = Arc::clone(&chat.stop_requested);
+        if let Some(w) = &self.watcher {
+            w.curator_chat(from);
+        }
         std::thread::spawn(move || {
             if let Some(previous) = previous_session {
                 let session = previous.lock().unwrap_or_else(|e| e.into_inner()).take();
@@ -387,6 +441,10 @@ impl State {
 
     fn gardener_close(&mut self) {
         self.gardener_stop();
+        drop_session_bg(Arc::clone(&self.notebook.chat.session));
+        if let Some(w) = &self.watcher {
+            w.curator_chat(None);
+        }
         self.notebook.chat = Chat::default();
     }
 
@@ -395,6 +453,9 @@ impl State {
         self.select_tab(crate::Tab::Curator, tx);
         if already_here && self.notebook.chat.viewing.is_some() && self.notebook.chat.phase != Phase::Working {
             self.gardener_close();
+        }
+        if self.notebook.chat.phase != Phase::Working {
+            tx.focus_when_shown("gardener-input", false);
         }
     }
 
@@ -437,8 +498,10 @@ fn intro(s: &State, p: &Palette, k: &Kit) -> El {
         ORB * 0.35,
         [(0.0, rune::oklch(0.0, 0.0, 0.0).alpha(if p.dark { 0.55 } else { 0.18 })), (1.0, rune::oklch(0.0, 0.0, 0.0).alpha(0.0))],
     );
-    let n = scoped_flags(s).len();
+    let waiting = scoped_flags(s);
+    let n = waiting.len();
     let ready = selected_backend(s).is_some() && s.notebook.gardener.running.is_none();
+    let needs_sub = selected_backend(s).is_none() && !s.notebook.gardener.backends.is_empty();
     let sub = if n == 1 {
         "1 flagged lesson is waiting for review.".to_string()
     } else if n > 1 {
@@ -474,14 +537,54 @@ fn intro(s: &State, p: &Palette, k: &Kit) -> El {
             .build(k)
             .key("gardener-check-updates"),
     );
-    col()
+    let mut root = col()
         .key("gardener-intro")
         .items_center()
         .gap(14.0)
         .pb(24.0)
         .child(col().items_center().gap(10.0).child(crate::orb::orb(&chrome::CURATOR_ORB, ORB)).child(shadow))
-        .child(words)
-        .child(actions)
+        .child(words);
+    if !waiting.is_empty() {
+        let mut preview = col().w_full().max_w(460.0).gap(6.0);
+        for flag in waiting.iter().take(3) {
+            preview = preview.child(
+                row()
+                    .w_full()
+                    .gap(8.0)
+                    .px(10.0)
+                    .py(6.0)
+                    .center_y()
+                    .radius(8.0)
+                    .fill(p.card)
+                    .border(1.0, p.hairline)
+                    .child(Badge::new(flag.kind.label()).variant(BadgeVariant::Subtle).build(k))
+                    .child(text(flag.note.clone()).font(style::META).color(p.text_2).truncate().grow(1.0).min_w(0.0)),
+            );
+        }
+        root = root.child(preview);
+    }
+    if needs_sub {
+        root = root.child(
+            row()
+                .gap(10.0)
+                .px(12.0)
+                .py(8.0)
+                .center_y()
+                .radius(8.0)
+                .fill(k.c.layer_01)
+                .border(1.0, k.c.border_muted)
+                .child(text("Turn on a subscription to run Curator.").font(style::META).color(p.text_2))
+                .child(
+                    Button::new("Choose Subscription…")
+                        .variant(ButtonVariant::Outline)
+                        .control_size(ControlSize::Small)
+                        .on_press(crate::curator_settings::open_settings)
+                        .build(k)
+                        .key("intro-choose-subscription"),
+                ),
+        );
+    }
+    root.child(actions)
 }
 
 pub fn selected_backend(s: &State) -> Option<Backend> {
@@ -505,6 +608,18 @@ pub fn view(s: &State, p: &Palette, k: &Kit, max_w: f32, reduced_motion: bool) -
     let mut page = col().key("gardener").w_full().max_w(max_w.min(CHAT_MAX_W));
     if let Some(bar) = top_bar(s, p, k) {
         page = page.child(bar);
+    }
+    let chat = &s.notebook.chat;
+    if chat.viewing.is_some() && chat.loading_saved && chat.items.is_empty() {
+        return page.child(
+            row()
+                .key("gardener-loading")
+                .gap(8.0)
+                .center_y()
+                .py(18.0)
+                .child(Spinner::new().size(13.0).color(p.text_2).build(k))
+                .child(text("Loading chat…").font(style::META).color(p.text_2)),
+        );
     }
     if is_fresh(s) { page } else { page.child(transcript(s, p, k, reduced_motion)) }
 }
@@ -538,7 +653,7 @@ fn top_bar(s: &State, p: &Palette, k: &Kit) -> Option<El> {
         bar = bar.child(Badge::new(sum.project.name.clone()).variant(BadgeVariant::Subtle).build(k));
         if chat.phase == Phase::Idle {
             bar = bar.child(
-                Button::new("All projects")
+                Button::new("All Projects")
                     .variant(ButtonVariant::GhostMuted)
                     .control_size(ControlSize::Small)
                     .on_press(|s: &mut State| s.notebook.chat.scope = Scope::Notebook)
@@ -555,12 +670,34 @@ fn top_bar(s: &State, p: &Palette, k: &Kit) -> Option<El> {
         has_bar = true;
     }
 
-    let action = match (chat.phase, chat.viewing) {
-        (_, Some(run_id)) => Some(
+    let action = match (chat.delete_confirm, chat.viewing) {
+        (true, Some(run_id)) => Some(
+            row()
+                .gap(6.0)
+                .center_y()
+                .child(text("Delete chat?").font(style::META).color(p.text_2))
+                .child(
+                    Button::new("Keep")
+                        .variant(ButtonVariant::GhostMuted)
+                        .control_size(ControlSize::Small)
+                        .on_press(|s: &mut State| s.notebook.chat.delete_confirm = false)
+                        .build(k)
+                        .key("gardener-delete-keep"),
+                )
+                .child(
+                    Button::new("Delete Chat")
+                        .variant(ButtonVariant::Danger)
+                        .control_size(ControlSize::Small)
+                        .on_press(move |s: &mut State| s.gardener_delete_chat(run_id))
+                        .build(k)
+                        .key("gardener-delete-chat-confirm"),
+                ),
+        ),
+        (false, Some(_)) => Some(
             Button::new("Delete")
                 .variant(ButtonVariant::GhostMuted)
                 .control_size(ControlSize::Small)
-                .on_press(move |s: &mut State| s.gardener_delete_chat(run_id))
+                .on_press(|s: &mut State| s.notebook.chat.delete_confirm = true)
                 .build(k)
                 .key("gardener-delete-chat"),
         ),
@@ -705,7 +842,7 @@ fn sign_in_panel(s: &State, key: impl Into<String>, backend: Backend, p: &Palett
 }
 
 fn quiet_step(item: &Item) -> bool {
-    matches!(item, Item::Tool { call, result: Some(r), .. } if !r.failed && !is_edit(&call.name))
+    matches!(item, Item::Tool { call, result: Some(r), .. } if !r.failed && !is_edit(&call.name) && call.name != "dismiss_flag")
 }
 
 fn is_edit(tool: &str) -> bool {
@@ -758,9 +895,21 @@ fn item_view(s: &State, i: usize, p: &Palette, k: &Kit) -> El {
         Item::Tool { call, result: Some(r), .. } if is_edit(&call.name) && !r.failed => edit_card(s, i, call, r, p, k),
         Item::Tool { call, result, open } => tool_step(s, i, call, result.as_ref(), *open, p, k),
         Item::SignIn(backend) => sign_in_panel(s, format!("gardener-signin-{i}"), *backend, p, k, Some(State::gardener_retry)),
-        Item::Failed(why) => {
-            Card::new().accent(p.amber).title("Run stopped", None).description(why.clone()).build(k).key(format!("gardener-failed-{i}"))
-        }
+        Item::Failed(why) => col()
+            .key(format!("gardener-failed-{i}"))
+            .w_full()
+            .gap(8.0)
+            .child(Card::new().accent(p.amber).title("Run stopped", None).description(why.clone()).build(k))
+            .child(
+                row().child(
+                    Button::new("Try Again")
+                        .variant(ButtonVariant::Outline)
+                        .control_size(ControlSize::Small)
+                        .on_press(|s: &mut State| s.gardener_retry())
+                        .build(k)
+                        .key(format!("gardener-retry-{i}")),
+                ),
+            ),
         Item::Ended => text("Run ended").font(style::META).color(p.text_3).pt(2.0),
     }
 }
@@ -801,7 +950,7 @@ fn short_label(call: &ToolCall) -> String {
         "list_flags" => "flags".into(),
         "read_traces" => "updates".into(),
         "search_notebook" => format!("“{}”", call.text_arg("query").unwrap_or("")),
-        "read_page" => call.int_arg("id").map_or_else(|| "a page".into(), |id| format!("page #{id}")),
+        "read_page" => call.int_arg("id").map_or_else(|| "a note".into(), |id| format!("note #{id}")),
         other => other.replace('_', " "),
     }
 }
@@ -835,8 +984,8 @@ fn tool_label(s: &State, call: &ToolCall) -> String {
     let arg = |key: &str| call.text_arg(key).unwrap_or("").to_string();
     let id = call.int_arg("id");
     let page_title = || match id {
-        Some(id) => s.notebook.page(id).map_or_else(|| format!("page #{id}"), |pg| format!("“{}”", pg.title)),
-        None => "a page".to_string(),
+        Some(id) => s.notebook.page(id).map_or_else(|| format!("note #{id}"), |pg| format!("“{}”", pg.title)),
+        None => "a note".to_string(),
     };
     match call.name.as_str() {
         "list_flags" => "Read open flags".into(),
@@ -859,12 +1008,12 @@ fn live_label(call: &ToolCall) -> String {
         ("search_notebook", None) => "Searching Library…".into(),
         ("list_flags", _) => "Reading open flags…".into(),
         ("read_traces", _) => "Reading recent Feed updates…".into(),
-        ("read_page", _) => "Reading page…".into(),
+        ("read_page", _) => "Reading note…".into(),
         ("write_page", _) => match call.text_arg("title") {
             Some(t) => format!("Writing “{t}”…"),
-            None => "Writing page…".into(),
+            None => "Writing note…".into(),
         },
-        ("archive_page", _) => "Archiving page…".into(),
+        ("archive_page", _) => "Archiving note…".into(),
         ("dismiss_flag", _) => "Dismissing flag…".into(),
         (other, _) => format!("{}…", other.replace('_', " ")),
     }
@@ -895,7 +1044,7 @@ fn edit_card(s: &State, i: usize, call: &ToolCall, result: &ToolResult, p: &Pale
     let (verb, fallback) = match call.name.as_str() {
         "archive_page" => ("Archived", String::new()),
         _ if call.int_arg("id").is_some() => ("Updated", call.text_arg("title").unwrap_or("").to_string()),
-        _ => ("New page", call.text_arg("title").unwrap_or("").to_string()),
+        _ => ("New note", call.text_arg("title").unwrap_or("").to_string()),
     };
     let found = page.and_then(|id| s.notebook.page(id));
     let title = found.map_or(fallback, |pg| pg.title.clone());
@@ -919,7 +1068,7 @@ fn edit_card(s: &State, i: usize, call: &ToolCall, result: &ToolResult, p: &Pale
     let before = change.and_then(|c| c.before.as_ref()).map(|b| b.body.as_str());
     match found.filter(|pg| !pg.is_archived()) {
         Some(pg) if verb != "Updated" || before.is_some() => {
-            if let Some(diff) = diff_preview(before.unwrap_or(""), &pg.body, p, k) {
+            if let Some(diff) = diff_preview(s, &format!("edit:{i}"), before.unwrap_or(""), &pg.body, p, k) {
                 card = card.child(diff);
             }
         }
@@ -941,13 +1090,18 @@ fn edit_card(s: &State, i: usize, call: &ToolCall, result: &ToolResult, p: &Pale
     }
     if let Some(cid) = change.map(|c| c.id) {
         let reverted = s.notebook.gardener.changes.iter().find(|c| c.id == cid).is_some_and(Change::is_reverted);
+        let reverting = s.notebook.chat.in_flight_changes.contains(&cid);
         actions = actions.child(if reverted {
             Badge::new("Reverted").variant(BadgeVariant::Subtle).build(k)
         } else {
-            Button::new("Revert")
+            Button::new(if reverting { "Reverting…" } else { "Revert" })
                 .variant(ButtonVariant::Outline)
                 .control_size(ControlSize::Small)
-                .on_press(move |s: &mut State| s.gardener_send_op(NotebookOp::Revert(cid)))
+                .disabled(reverting)
+                .on_press(move |s: &mut State| {
+                    s.notebook.chat.in_flight_changes.insert(cid);
+                    s.gardener_send_op(NotebookOp::Revert(cid));
+                })
                 .build(k)
                 .key(format!("gardener-revert-{cid}"))
         });
@@ -958,6 +1112,7 @@ fn edit_card(s: &State, i: usize, call: &ToolCall, result: &ToolResult, p: &Pale
 fn proposal_card(s: &State, i: usize, pid: i64, call: &ToolCall, result: &ToolResult, p: &Palette, k: &Kit) -> El {
     let proposal = s.notebook.gardener.proposals.iter().find(|pr| pr.id == pid);
     let status = proposal.map_or(ProposalStatus::Pending, |pr| pr.status);
+    let busy = s.notebook.chat.in_flight_proposals.contains(&pid) || (s.notebook.chat.viewing.is_some() && proposal.is_none());
     let action = proposal.map_or_else(
         || match call.name.as_str() {
             "archive_page" => ChangeAction::Archived,
@@ -982,7 +1137,12 @@ fn proposal_card(s: &State, i: usize, pid: i64, call: &ToolCall, result: &ToolRe
         .or_else(|| existing.map(|pg| pg.title.as_str()))
         .unwrap_or_default()
         .to_string();
+    let topic = proposal.map(|pr| pr.topic.as_str()).or_else(|| existing.map(|pg| pg.topic.as_str())).or_else(|| call.text_arg("topic"));
     let reason = proposal.map(|pr| pr.reason.as_str()).or_else(|| call.text_arg("reason")).unwrap_or("").trim();
+    let mut eyebrow = row().w_full().gap(6.0).center_y().child(text(verb).font(style::META).color(p.text_3));
+    if let Some(slug) = topic.filter(|t| !t.trim().is_empty()) {
+        eyebrow = eyebrow.child(Badge::new(feeder_core::topic_label(slug)).variant(BadgeVariant::Subtle).build(k));
+    }
     let mut card = col()
         .key(format!("gardener-proposal-{pid}-{i}"))
         .role("group")
@@ -993,7 +1153,7 @@ fn proposal_card(s: &State, i: usize, pid: i64, call: &ToolCall, result: &ToolRe
         .py(10.0)
         .radius(8.0)
         .border(1.0, p.hairline)
-        .child(text(verb).font(style::META).color(p.text_3))
+        .child(eyebrow)
         .child(text(title).font(style::NAME).color(p.text).wrap());
     if !reason.is_empty() {
         card = card.child(text(reason.to_string()).font(style::META).color(p.text_2).wrap());
@@ -1001,7 +1161,7 @@ fn proposal_card(s: &State, i: usize, pid: i64, call: &ToolCall, result: &ToolRe
     let old_body = proposal.and_then(|pr| pr.before_body.as_deref()).or_else(|| existing.map(|pg| pg.body.as_str())).unwrap_or("");
     let new_body = proposal.map(|pr| pr.body.as_str()).or_else(|| call.text_arg("body")).unwrap_or("");
     if action != ChangeAction::Archived {
-        if let Some(diff) = diff_preview(old_body, new_body, p, k) {
+        if let Some(diff) = diff_preview(s, &format!("proposal:{pid}"), old_body, new_body, p, k) {
             card = card.child(diff);
         }
     } else if let Some(pg) = existing
@@ -1014,10 +1174,14 @@ fn proposal_card(s: &State, i: usize, pid: i64, call: &ToolCall, result: &ToolRe
         ProposalStatus::Pending => {
             actions = actions
                 .child(
-                    Button::new("Apply")
+                    Button::new(if busy { "Applying…" } else { "Apply" })
                         .variant(ButtonVariant::Contrast)
                         .control_size(ControlSize::Small)
-                        .on_press(move |s: &mut State| s.gardener_send_op(NotebookOp::ApplyProposal(pid)))
+                        .disabled(busy)
+                        .on_press(move |s: &mut State| {
+                            s.notebook.chat.in_flight_proposals.insert(pid);
+                            s.gardener_send_op(NotebookOp::ApplyProposal(pid));
+                        })
                         .build(k)
                         .key(format!("gardener-apply-proposal-{pid}")),
                 )
@@ -1025,7 +1189,11 @@ fn proposal_card(s: &State, i: usize, pid: i64, call: &ToolCall, result: &ToolRe
                     Button::new("Dismiss")
                         .variant(ButtonVariant::GhostMuted)
                         .control_size(ControlSize::Small)
-                        .on_press(move |s: &mut State| s.gardener_send_op(NotebookOp::DismissProposal(pid)))
+                        .disabled(busy)
+                        .on_press(move |s: &mut State| {
+                            s.notebook.chat.in_flight_proposals.insert(pid);
+                            s.gardener_send_op(NotebookOp::DismissProposal(pid));
+                        })
                         .build(k)
                         .key(format!("gardener-dismiss-proposal-{pid}")),
                 );
@@ -1056,13 +1224,18 @@ fn proposal_card(s: &State, i: usize, pid: i64, call: &ToolCall, result: &ToolRe
             }
             if let Some(cid) = proposal.and_then(|pr| pr.change_id) {
                 let reverted = s.notebook.gardener.changes.iter().find(|c| c.id == cid).is_some_and(Change::is_reverted);
+                let reverting = s.notebook.chat.in_flight_changes.contains(&cid);
                 actions = actions.child(if reverted {
                     Badge::new("Reverted").variant(BadgeVariant::Subtle).build(k)
                 } else {
-                    Button::new("Revert")
+                    Button::new(if reverting { "Reverting…" } else { "Revert" })
                         .variant(ButtonVariant::Outline)
                         .control_size(ControlSize::Small)
-                        .on_press(move |s: &mut State| s.gardener_send_op(NotebookOp::Revert(cid)))
+                        .disabled(reverting)
+                        .on_press(move |s: &mut State| {
+                            s.notebook.chat.in_flight_changes.insert(cid);
+                            s.gardener_send_op(NotebookOp::Revert(cid));
+                        })
                         .build(k)
                         .key(format!("gardener-revert-{cid}"))
                 });
@@ -1074,15 +1247,17 @@ fn proposal_card(s: &State, i: usize, pid: i64, call: &ToolCall, result: &ToolRe
 
 const DIFF_LINES: usize = 6;
 
-fn diff_preview(old: &str, new: &str, p: &Palette, k: &Kit) -> Option<El> {
+fn diff_preview(s: &State, diff_key: &str, old: &str, new: &str, p: &Palette, k: &Kit) -> Option<El> {
     let diff = FileDiff::from_texts("page.md", old, new);
     let changed: Vec<_> =
         diff.hunks.iter().flat_map(|h| h.lines.iter()).filter(|l| l.kind != LineKind::Context && !l.text.trim().is_empty()).collect();
     if changed.is_empty() {
         return None;
     }
+    let expanded = s.notebook.chat.expanded_diffs.contains(diff_key);
+    let shown = if expanded { changed.len() } else { DIFF_LINES };
     let mut lines = col().w_full().gap(2.0).label(format!("{} lines added, {} removed", diff.additions(), diff.deletions()));
-    for line in changed.iter().take(DIFF_LINES) {
+    for line in changed.iter().take(shown) {
         let (mark, tint) = match line.kind {
             LineKind::Added => ("+", k.c.success),
             _ => ("−", k.c.danger),
@@ -1100,7 +1275,20 @@ fn diff_preview(old: &str, new: &str, p: &Palette, k: &Kit) -> Option<El> {
         );
     }
     if changed.len() > DIFF_LINES {
-        lines = lines.child(text(format!("{} more lines", changed.len() - DIFF_LINES)).font(style::META).color(p.text_3).pl(8.0));
+        let label = if expanded { "Show Fewer Lines".to_string() } else { format!("Show {} More Lines", changed.len() - DIFF_LINES) };
+        let key_owned = diff_key.to_string();
+        lines = lines.child(
+            Button::new(label)
+                .variant(ButtonVariant::GhostMuted)
+                .control_size(ControlSize::Small)
+                .on_press(move |s: &mut State| {
+                    if !s.notebook.chat.expanded_diffs.remove(&key_owned) {
+                        s.notebook.chat.expanded_diffs.insert(key_owned.clone());
+                    }
+                })
+                .build(k)
+                .key(format!("diff-toggle-{diff_key}")),
+        );
     }
     Some(lines)
 }
@@ -1177,7 +1365,8 @@ fn bucket(started_at: i64, now: i64) -> &'static str {
 
 pub fn shell_view(s: &State, p: &Palette, k: &Kit, inset: f32, reduced_motion: bool, layer: &mut Vec<El>) -> El {
     let max_w = crate::notebook::INDEX_MAX_W;
-    let following = !s.notebook.chat.items.is_empty();
+    let following = s.notebook.chat.phase == Phase::Working;
+    let scroll_key = format!("curator-scroll-{}", current_run(&s.notebook.chat).map_or_else(|| "new".to_string(), |id| id.to_string()));
     let main_inner = if is_empty_idle(s) {
         empty_view(s, p, k, max_w, layer).transition(Transition::none())
     } else {
@@ -1189,8 +1378,11 @@ pub fn shell_view(s: &State, p: &Palette, k: &Kit, inset: f32, reduced_motion: b
             .child(col().w_full().items_center().px(crate::notebook::INDEX_PAD).pt(24.0).pb(24.0).child(body))
             .scroll(ScrollSpec { stick_bottom: following })
             .scroll_edge_fade(16.0);
-        let scroll_area =
-            scroll_bar(k, "curator-scroll-area", "curator-scroll", viewport).w_full().grow(1.0).min_h(0.0).transition(Transition::none());
+        let scroll_area = scroll_bar(k, &format!("{scroll_key}-area"), &scroll_key, viewport)
+            .w_full()
+            .grow(1.0)
+            .min_h(0.0)
+            .transition(Transition::none());
         col().w_full().grow(1.0).min_h(0.0).transition(Transition::none()).child(scroll_area).child(composer(s, p, k, max_w, layer))
     };
     let main_area = col().key("curator-main-area").w_full().grow(1.0).min_h(0.0).instant_changes().child(main_inner);
@@ -1216,9 +1408,10 @@ fn toolbar_breadcrumb(s: &State, p: &Palette, k: &Kit) -> El {
         let root_btn = Button::new("Curator")
             .variant(ButtonVariant::GhostMuted)
             .control_size(ControlSize::Small)
-            .on_press(|s: &mut State| {
+            .on_press_tx(|s: &mut State, tx: &mut Tx| {
                 if s.notebook.chat.phase != Phase::Working {
                     s.gardener_close();
+                    tx.focus_when_shown("gardener-input", false);
                 }
             })
             .build(k)
@@ -1317,9 +1510,10 @@ pub fn thread_list(s: &State, p: &Palette, k: &Kit) -> El {
 pub fn new_chat_row(k: &Kit) -> El {
     SidebarRow::new("New Chat")
         .icon(&crate::notebook::PLUS_ICON)
-        .on_select(|s: &mut State, _: &mut Tx| {
+        .on_select(|s: &mut State, tx: &mut Tx| {
             if s.notebook.chat.phase != Phase::Working {
                 s.gardener_close();
+                tx.focus_when_shown("gardener-input", false);
             }
         })
         .build(k)
@@ -1405,12 +1599,38 @@ mod tests {
 
     #[test]
     fn diffs_show_only_changed_lines() {
+        let s = State::new();
         let p = style::palette(false);
         let k = style::kit(&p);
-        assert!(diff_preview("same\n", "same\n", &p, &k).is_none(), "no card diff when nothing changed");
+        assert!(diff_preview(&s, "t:1", "same\n", "same\n", &p, &k).is_none(), "no card diff when nothing changed");
         let diff = FileDiff::from_texts("page.md", "a\nold\nc\n", "a\nnew\nc\nadded\n");
         assert_eq!((diff.additions(), diff.deletions()), (2, 1));
-        assert!(diff_preview("a\nold\nc\n", "a\nnew\nc\nadded\n", &p, &k).is_some());
+        assert!(diff_preview(&s, "t:2", "a\nold\nc\n", "a\nnew\nc\nadded\n", &p, &k).is_some());
+    }
+
+    #[test]
+    fn dismiss_flag_never_folds_and_retry_preserves_multi_turn_history() {
+        let dismiss = Item::Tool {
+            call: call("d1", "dismiss_flag"),
+            result: Some(ToolResult { output: "Dismissed".into(), failed: false }),
+            open: false,
+        };
+        assert!(!quiet_step(&dismiss));
+        let search = Item::Tool {
+            call: call("s1", "search_notebook"),
+            result: Some(ToolResult { output: "0 hits".into(), failed: false }),
+            open: false,
+        };
+        assert!(quiet_step(&search));
+
+        let mut s = State::new();
+        s.notebook.chat.items =
+            vec![Item::You("Turn 1".into()), Item::Reply("Answer 1".into()), Item::You("Turn 2".into()), Item::Failed("timeout".into())];
+        s.notebook.chat.last_launch = Some(LastLaunch::Message("Turn 2".into()));
+        *s.notebook.chat.last_run.lock().unwrap() = Some(7);
+        s.gardener_retry();
+        assert_eq!(s.notebook.chat.items.len(), 2);
+        assert!(matches!(&s.notebook.chat.items[0], Item::You(t) if t == "Turn 1"));
     }
 
     #[test]

@@ -1,5 +1,5 @@
 use std::cell::{Ref, RefCell};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::io::{BufRead, Write};
 use std::path::{Path, PathBuf};
 
@@ -199,8 +199,8 @@ impl Server {
 
     fn initialize(&mut self, params: &Value) -> Result<Value, String> {
         self.client = params.pointer("/clientInfo/name").and_then(Value::as_str).map(str::to_string);
-        let asked = params.get("protocolVersion").and_then(Value::as_str).unwrap_or(PROTOCOL_VERSIONS[1]);
-        let version = if PROTOCOL_VERSIONS.contains(&asked) { asked } else { PROTOCOL_VERSIONS[1] };
+        let asked = params.get("protocolVersion").and_then(Value::as_str).unwrap_or(PROTOCOL_VERSIONS[0]);
+        let version = if PROTOCOL_VERSIONS.contains(&asked) { asked } else { PROTOCOL_VERSIONS[0] };
         let (capabilities, instructions) = match self.role {
             Role::Agent => (
                 json!({ "tools": {}, "prompts": {}, "resources": {} }),
@@ -410,12 +410,30 @@ impl Server {
             if p.is_absolute() { p } else { base.join(p) }
         };
         let screenshot = str_arg(args, "screenshot_path").map(resolve_path);
+        let mut seen = HashSet::new();
+        if let Some(ref first) = screenshot {
+            seen.insert(first.clone());
+        }
         let screenshots: Vec<PathBuf> = args
             .get("screenshots")
             .and_then(Value::as_array)
-            .map(|items| items.iter().filter_map(Value::as_str).map(str::trim).filter(|s| !s.is_empty()).map(resolve_path).collect())
+            .map(|items| {
+                items
+                    .iter()
+                    .filter_map(Value::as_str)
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                    .map(resolve_path)
+                    .filter(|path| seen.insert(path.clone()))
+                    .collect()
+            })
             .unwrap_or_default();
-        let meta = detect_git_meta(&base);
+        let git_dir = if str_arg(args, "project_path").is_some() || str_arg(args, "project").is_none() {
+            Some(base)
+        } else {
+            project.path.as_deref().map(PathBuf::from).filter(|p| p.exists())
+        };
+        let meta = git_dir.as_deref().map(detect_git_meta).unwrap_or_default();
         let branch = str_arg(args, "branch").map(str::to_string).or(meta.branch);
         let diff_stat = str_arg(args, "diff_stat").map(str::to_string).or(meta.diff_stat);
         let commit_sha = meta.commit_sha;
@@ -568,8 +586,7 @@ impl Server {
         let timeline = store.timeline(limit).map_err(|e| e.to_string())?;
         let ids: Vec<i64> = timeline.iter().map(|u| u.id).collect();
         let replies = store.replies_for_updates(&ids).map_err(|e| e.to_string())?;
-        let projects: HashMap<i64, Project> =
-            store.projects().map_err(|e| e.to_string())?.into_iter().map(|s| (s.project.id, s.project)).collect();
+        let projects = store.project_names().map_err(|e| e.to_string())?;
         let now = now_ms();
         let mut text = if timeline.is_empty() {
             "No recent updates across active projects.".to_string()
@@ -578,7 +595,7 @@ impl Server {
         };
         let mut list = Vec::new();
         for u in &timeline {
-            let pname = projects.get(&u.project_id).map(|p| p.name.as_str()).unwrap_or("Unknown");
+            let pname = projects.get(&u.project_id).map(String::as_str).unwrap_or("Unknown");
             text.push_str(&format!("\n\n{}", format_update_line(Some(pname), u, &replies, now)));
             let mut v = update_json(u);
             v["project"] = json!(pname);
@@ -601,8 +618,7 @@ impl Server {
         let hits = store.search_updates(query, pid, include_archived || pid.is_some(), limit).map_err(|e| e.to_string())?;
         let ids: Vec<i64> = hits.iter().map(|u| u.id).collect();
         let replies = store.replies_for_updates(&ids).map_err(|e| e.to_string())?;
-        let projects: HashMap<i64, Project> =
-            store.projects().map_err(|e| e.to_string())?.into_iter().map(|s| (s.project.id, s.project)).collect();
+        let projects = store.project_names().map_err(|e| e.to_string())?;
         let now = now_ms();
         let mut text = if hits.is_empty() {
             format!("No updates matching \"{query}\".")
@@ -611,10 +627,11 @@ impl Server {
         };
         let mut list = Vec::new();
         for u in &hits {
-            let pname = projects.get(&u.project_id).map(|p| p.name.as_str()).unwrap_or("Unknown");
+            let pname = projects.get(&u.project_id).map(String::as_str).unwrap_or("Unknown");
             text.push_str(&format!("\n\n{}", format_update_line(Some(pname), u, &replies, now)));
             let mut v = update_json(u);
             v["project"] = json!(pname);
+            v["replies"] = json!(replies.iter().filter(|r| r.update_id == u.id).map(reply_json).collect::<Vec<_>>());
             list.push(v);
         }
         Ok(ToolOutput::text(text, json!({ "updates": list })))
@@ -783,7 +800,12 @@ impl Server {
         let store = self.open_store()?;
         let project = self.project(&store, args, true)?.ok_or("no project")?;
         let clear = args.get("clear").and_then(Value::as_bool).unwrap_or(false);
-        let brief = if clear { None } else { str_arg(args, "brief") };
+        let brief = if clear {
+            None
+        } else {
+            let text = str_arg(args, "brief").map(str::trim).filter(|s| !s.is_empty()).ok_or("pass `brief` text or set `clear: true`")?;
+            Some(text)
+        };
         store.set_project_brief(project.id, brief).map_err(|e| e.to_string())?;
         let updated = store.project(project.id).map_err(|e| e.to_string())?.ok_or("project vanished")?;
         let text = match &updated.brief {
@@ -806,7 +828,12 @@ impl Server {
             ));
         }
         let status = str_arg(args, "status").unwrap_or("Working");
-        let meta = detect_git_meta(&self.base(args));
+        let git_dir = if str_arg(args, "project_path").is_some() || str_arg(args, "project").is_none() {
+            Some(self.base(args))
+        } else {
+            project.path.as_deref().map(PathBuf::from).filter(|p| p.exists())
+        };
+        let meta = git_dir.as_deref().map(detect_git_meta).unwrap_or_default();
         let branch = str_arg(args, "branch").map(str::to_string).or(meta.branch);
         let ttl_secs = args.get("ttl_seconds").and_then(Value::as_u64).unwrap_or(120).clamp(5, 3600);
         let ttl_ms = (ttl_secs * 1000) as i64;
@@ -1858,8 +1885,8 @@ mod tests {
 
         let store = Store::open(&store_dir).unwrap();
         let open = store.flags(Some(feeder_core::FlagStatus::Open), 10).unwrap();
-        assert_eq!(open.len(), 3, "two explicit flags and one from the repeated empty search");
-        assert!(open.iter().any(|f| f.note.contains("notarize the dmg") && f.kind == feeder_core::FlagKind::Missing));
+        assert_eq!(open.len(), 2, "only the two explicit flags; empty searches must not file flags");
+        assert!(!open.iter().any(|f| f.note.contains("notarize the dmg")));
         assert!(open.iter().any(|f| f.suggestion.as_deref() == Some("It moved to scripts/")));
 
         let refused = call(&mut server, 5, "flag_knowledge", json!({ "note": "no" }));
@@ -2142,6 +2169,100 @@ mod tests {
             }
         }
         assert_eq!(refused, 1, "five changes per session, however many servers it starts");
+        let _ = std::fs::remove_dir_all(store_dir);
+        let _ = std::fs::remove_dir_all(work_dir);
+    }
+
+    #[test]
+    fn wave_b_shared_notes_brief_guard_replies_and_git_meta_scoping() {
+        let store_dir = temp_dir("store-wave-b");
+        let work_dir = temp_dir("work-wave-b");
+        std::fs::create_dir_all(&work_dir).unwrap();
+        let init_status =
+            std::process::Command::new("git").args(["init", "-q", "-b", "feature/cwd-branch"]).current_dir(&work_dir).status().unwrap();
+        assert!(init_status.success());
+
+        let shot = work_dir.join("screen.png");
+        std::fs::write(&shot, [0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]).unwrap();
+
+        let mut server = Server::new(Some("codex".into()), work_dir.clone(), Some(store_dir.clone()));
+        let call = |server: &mut Server, id: i64, name: &str, arguments: Value| {
+            server
+                .handle(&json!({ "jsonrpc": "2.0", "id": id, "method": "tools/call", "params": { "name": name, "arguments": arguments } }))
+                .unwrap()
+        };
+
+        let shared_flag = call(&mut server, 1, "flag_knowledge", json!({ "shared": true, "note": "Keep release scripts reproducible" }));
+        assert_eq!(shared_flag.pointer("/result/isError"), Some(&json!(false)));
+        assert_eq!(shared_flag.pointer("/result/structuredContent/project_id"), Some(&Value::Null));
+
+        let conflict =
+            call(&mut server, 2, "flag_knowledge", json!({ "shared": true, "project": "Other", "note": "Should conflict with project" }));
+        assert_eq!(conflict.pointer("/result/isError"), Some(&json!(true)));
+
+        let posted = call(
+            &mut server,
+            3,
+            "post_update",
+            json!({
+                "project": "UnlinkedRepo",
+                "summary": "Done: Shipped clean APIs\nWhy: Keep git meta scoped\nNext: Add tests",
+                "screenshot_path": "screen.png",
+                "screenshots": ["screen.png"]
+            }),
+        );
+        assert_eq!(posted.pointer("/result/isError"), Some(&json!(false)));
+        assert_eq!(posted.pointer("/result/structuredContent/update/branch"), Some(&Value::Null));
+        assert_eq!(posted.pointer("/result/structuredContent/update/media").and_then(Value::as_array).map(Vec::len), Some(1));
+        let update_id = posted.pointer("/result/structuredContent/update/id").and_then(Value::as_i64).unwrap();
+
+        let reply_res = call(&mut server, 4, "reply_to_update", json!({ "id": update_id, "summary": "Verified!" }));
+        assert_eq!(reply_res.pointer("/result/isError"), Some(&json!(false)));
+
+        let found = call(&mut server, 5, "search_updates", json!({ "query": "clean APIs" }));
+        assert_eq!(found.pointer("/result/structuredContent/updates/0/replies/0/body"), Some(&json!("Verified!")));
+
+        let empty_brief = call(&mut server, 6, "set_project_brief", json!({ "project": "UnlinkedRepo" }));
+        assert_eq!(empty_brief.pointer("/result/isError"), Some(&json!(true)));
+
+        let store = Store::open(&store_dir).unwrap();
+        let proj = store.project_named("UnlinkedRepo", None).unwrap();
+        let run = store
+            .start_curator_run(
+                feeder_core::gardener::Backend::Codex,
+                feeder_core::gardener::Scope::Notebook,
+                feeder_core::gardener::SessionMode::Review,
+            )
+            .unwrap();
+        let f = store
+            .flag_knowledge(
+                feeder_core::NewFlag {
+                    kind: feeder_core::FlagKind::Missing,
+                    page_id: None,
+                    project_id: Some(proj.id),
+                    note: "Cross-project release note".into(),
+                    suggestion: None,
+                },
+                "Codex",
+            )
+            .unwrap();
+        drop(store);
+        server.role = Role::Gardener(run);
+        let wrote = call(
+            &mut server,
+            7,
+            "write_page",
+            json!({
+                "title": "Shared CI checklist",
+                "body": "Always verify release builds cleanly.",
+                "shared": true,
+                "reason": "Cross-project rule",
+                "flags": [f.id]
+            }),
+        );
+        assert_eq!(wrote.pointer("/result/isError"), Some(&json!(false)));
+        assert_eq!(wrote.pointer("/result/structuredContent/page/project"), Some(&Value::Null));
+
         let _ = std::fs::remove_dir_all(store_dir);
         let _ = std::fs::remove_dir_all(work_dir);
     }

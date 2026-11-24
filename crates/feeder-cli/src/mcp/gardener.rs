@@ -3,7 +3,7 @@ use feeder_core::{Curation, FlagStatus, Kind, PageDraft, PageFilter, Provenance,
 use serde_json::{Value, json};
 
 use super::{Server, ToolOutput, str_arg};
-use crate::notebook::page_json;
+use crate::notebook::{page_json_with, project_name};
 
 pub(super) fn tool_names(mode: SessionMode) -> &'static [&'static str] {
     mode.mcp_tools()
@@ -55,7 +55,9 @@ impl Server {
                 .collect::<Vec<_>>()
                 .join("\n")
         };
-        let pages: Vec<Value> = hits.iter().map(|p| gardener_page_json(store, p)).collect();
+        let projects = store.project_names().map_err(|e| e.to_string())?;
+        let pages: Vec<Value> =
+            hits.iter().map(|p| gardener_page_json(p, p.project_id.and_then(|id| projects.get(&id).map(String::as_str)))).collect();
         Ok(ToolOutput::text(text, json!({ "query": query, "pages": pages })))
     }
 
@@ -65,7 +67,7 @@ impl Server {
             .page(id)
             .map_err(|e| e.to_string())?
             .filter(|p| p.project_id.is_none() || scope.includes(p.project_id))
-            .ok_or_else(|| format!("no Notebook page {id} in this session"))?;
+            .ok_or_else(|| format!("no Library note {id} in this session"))?;
         let note = if !scope.includes(page.project_id) {
             "\n\n(Shared note. This project session can read it but cannot edit it.)"
         } else if page.human_edited {
@@ -73,7 +75,11 @@ impl Server {
         } else {
             ""
         };
-        Ok(ToolOutput::text(format!("{}{note}", page.to_markdown(None, now_ms())), gardener_page_json(store, &page)))
+        let project = project_name(store, &page);
+        Ok(ToolOutput::text(
+            format!("{}{note}", page.to_markdown(project.as_deref(), now_ms())),
+            gardener_page_json(&page, project.as_deref()),
+        ))
     }
 
     fn list_flags(store: &Store, scope: Scope) -> Result<ToolOutput, String> {
@@ -162,9 +168,12 @@ impl Server {
             tags: string_list(args, "tags"),
             body: str_arg(args, "body").ok_or("`body` is required")?.to_string(),
         };
-        let curation = match args.get("id").and_then(Value::as_i64) {
-            Some(page_id) => Curation::Revise { page_id, draft },
-            None => Curation::Create { draft, project_id: None },
+        let shared = args.get("shared").and_then(Value::as_bool).unwrap_or(false);
+        let curation = match (args.get("id").and_then(Value::as_i64), shared) {
+            (Some(_), true) => return Err("`shared` only applies when creating a new note without `id`".into()),
+            (Some(page_id), false) => Curation::Revise { page_id, draft },
+            (None, true) => Curation::CreateShared { draft },
+            (None, false) => Curation::Create { draft, project_id: None },
         };
         Self::curate(store, run_id, curation, args)
     }
@@ -182,11 +191,15 @@ impl Server {
         };
         if store.is_curator_chat_run(run_id).map_err(|e| e.to_string())? {
             let proposal = store.propose_gardener_run(run_id, curation, &provenance).map_err(|e| e.to_string())?;
+            let action_phrase = match proposal.action {
+                feeder_core::ChangeAction::Created => "creating",
+                feeder_core::ChangeAction::Revised => "revising",
+                feeder_core::ChangeAction::Archived => "archiving",
+                feeder_core::ChangeAction::Restored => "restoring",
+            };
             let text = format!(
-                "Proposed {} “{}” (proposal #{}). The person can apply or dismiss this in chat.",
-                proposal.action.as_str(),
-                proposal.title,
-                proposal.id
+                "Proposed {action_phrase} “{}” (proposal #{}). The person can apply or dismiss this in chat.",
+                proposal.title, proposal.id
             );
             return Ok(ToolOutput::text(
                 text,
@@ -209,12 +222,13 @@ impl Server {
             done.page.title,
             done.change.id
         );
+        let page_json = gardener_page_json(&done.page, project_name(store, &done.page).as_deref());
         Ok(ToolOutput::text(
             text,
             json!({
                 "change_id": done.change.id,
                 "action": done.change.action.as_str(),
-                "page": gardener_page_json(store, &done.page),
+                "page": page_json,
                 "source_updates": done.change.source_updates,
                 "source_flags": done.change.source_flags,
             }),
@@ -229,8 +243,8 @@ impl Server {
     }
 }
 
-fn gardener_page_json(store: &Store, p: &feeder_core::Page) -> Value {
-    let mut v = page_json(store, p);
+fn gardener_page_json(p: &feeder_core::Page, project: Option<&str>) -> Value {
+    let mut v = page_json_with(p, project);
     v["human_edited"] = json!(p.human_edited);
     v
 }
@@ -293,10 +307,11 @@ pub(super) fn tools(mode: SessionMode) -> Vec<Value> {
             "inputSchema": { "type": "object", "properties": {
                 "id": id,
                 "title": { "type": "string" },
-                "body": { "type": "string", "description": "Markdown. Link useful current notes from this project or the shared Notebook as [title](feeder://notebook/ID)." },
+                "body": { "type": "string", "description": "Markdown. Link useful current notes from this project or the shared Library as [title](feeder://notebook/ID)." },
                 "topic": { "type": "string", "description": "Short slug such as rust, design, tooling or general. Inferred when omitted." },
                 "tags": { "type": "array", "items": { "type": "string" } },
                 "kind": { "type": "string", "enum": ["note", "fix", "pitfall", "pattern", "decision"] },
+                "shared": { "type": "boolean", "description": "Set true in a Library-wide session to file a shared cross-project note instead of inferring a project from sources." },
                 "reason": reason,
                 "flags": ids("Open flag ids this fixes; they are resolved with it."),
                 "updates": ids("Feed update ids this draws on.")

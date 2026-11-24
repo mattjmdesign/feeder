@@ -91,7 +91,7 @@ export default function HomeDemo() {
         const compact = layout === 'compact'
         const list = compact ? PROJECTS.slice(0, 3) : PROJECTS
         return (
-          <Window className="hd-win" toolbar={compact ? undefined : <Segmented className="demo-seg" items={['Home', 'Feed', 'Notebook']} value={0} />}>
+          <Window className="hd-win" toolbar={compact ? undefined : <Segmented className="demo-seg" items={['Home', 'Feed', 'Library']} value={0} />}>
             <div className="hd-body">
               <div className="hd-filters">
                 <span className="demo-chip" data-on>All</span>
@@ -108,6 +108,9 @@ export default function HomeDemo() {
                 {list.map(p => (
                   <Tile key={p.key} p={p} s={s} size={compact ? 64 : 104} />
                 ))}
+              </div>
+              <div className="hd-preview" data-on={s.needs || undefined}>
+                <strong>Lumen</strong> · Needs you: Show EU prices with tax?
               </div>
             </div>
           </Window>

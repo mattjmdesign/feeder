@@ -18,6 +18,7 @@ struct NativeSnapshot {
     notes: *const c_char,
     message: *const c_char,
     reveal: bool,
+    can_advance: bool,
 }
 
 unsafe extern "C" {
@@ -81,6 +82,7 @@ impl TryFrom<u32> for Phase {
 impl Phase {
     fn status(self) -> Option<&'static str> {
         match self {
+            Self::Checking => Some("Checking for updates…"),
             Self::Available => Some("Feeder update available"),
             Self::Downloading => Some("Downloading update…"),
             Self::Preparing => Some("Preparing update…"),
@@ -98,6 +100,7 @@ struct Snapshot {
     version: String,
     notes: String,
     message: String,
+    can_advance: bool,
 }
 
 #[derive(Default)]
@@ -115,8 +118,14 @@ pub fn poll(s: &mut State) -> bool {
         (native, strings)
     };
     let phase = Phase::try_from(native.phase).unwrap_or(Phase::Idle);
-    let snapshot =
-        Snapshot { phase, progress: (0.0..=1.0).contains(&native.progress).then_some(native.progress as f32), version, notes, message };
+    let snapshot = Snapshot {
+        phase,
+        progress: (0.0..=1.0).contains(&native.progress).then_some(native.progress as f32),
+        version,
+        notes,
+        message,
+        can_advance: native.can_advance,
+    };
     let changed = snapshot != s.updates.snapshot || native.reveal;
     let was_active = s.updates.snapshot.phase.status().is_some();
     s.updates.requested |= native.reveal;
@@ -219,15 +228,16 @@ pub fn view(s: &State, p: &style::Palette, k: &Kit, layer: &mut Vec<El>) {
         );
     }
     if !update.message.is_empty() {
-        content = content.child(text(update.message.clone()).font(style::CONTROL).color(k.c.std_text));
+        content = content.child(text(update.message.clone()).font(style::CONTROL).color(k.c.std_text).wrap());
     }
     if matches!(update.phase, Phase::Downloading | Phase::Preparing | Phase::Installing) {
         let progress = if matches!(update.phase, Phase::Downloading | Phase::Preparing) { update.progress } else { None };
         content = content.child(Progress::new(progress).label(status).show_value().build(&accent));
     }
     let action = match update.phase {
-        Phase::Available => Some("Download"),
-        Phase::Ready => Some("Restart to Update"),
+        Phase::Available if update.can_advance => Some("Download"),
+        Phase::Ready if update.can_advance => Some("Restart to Update"),
+        Phase::Installing if update.can_advance => Some("Retry Restart"),
         _ => None,
     };
     if let Some(label) = action {

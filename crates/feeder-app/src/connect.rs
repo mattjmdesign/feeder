@@ -1,8 +1,15 @@
 use std::path::PathBuf;
+use std::sync::mpsc::{self, Sender};
 use std::sync::{Arc, Mutex};
 
 use feeder_core::setup::{self, Outcome, Status, Tool};
 use rune::Waker;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ToolAction {
+    Connect,
+    Disconnect,
+}
 
 #[derive(Clone, Debug, PartialEq)]
 pub enum Link {
@@ -11,7 +18,7 @@ pub enum Link {
     Missing,
     Connecting,
     Disconnecting,
-    Failed(String),
+    Failed { action: ToolAction, reason: String },
 }
 
 impl From<Status> for Link {
@@ -24,10 +31,31 @@ impl From<Status> for Link {
     }
 }
 
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub enum CliStatus {
+    #[default]
+    Checking,
+    Installed {
+        path: PathBuf,
+        on_path: bool,
+    },
+    NotInstalled,
+    Installing,
+    Failed(String),
+}
+
 enum Msg {
-    Scanned(Vec<(Tool, Link)>, Vec<(String, PathBuf)>),
+    Scanned(Vec<(Tool, Link)>, Vec<(String, PathBuf)>, CliStatus),
     Linked(Tool, Link),
-    Uninstalled,
+    Uninstalled(bool),
+    Cli(CliStatus),
+}
+
+enum Job {
+    Connect { tool: Tool, wake: Option<Waker> },
+    Disconnect { tool: Tool, wake: Option<Waker> },
+    DisconnectAll { wake: Option<Waker> },
+    InstallCli { wake: Option<Waker> },
 }
 
 #[derive(Default)]
@@ -35,11 +63,73 @@ pub struct Agents {
     pub rows: Option<Vec<(Tool, Link)>>,
     fresh: bool,
     pub uninstalled: bool,
+    pub cli: CliStatus,
     pub icons: Vec<(String, PathBuf)>,
     inbox: Arc<Mutex<Vec<Msg>>>,
+    worker: Option<Sender<Job>>,
 }
 
 impl Agents {
+    fn worker(&mut self) -> &Sender<Job> {
+        let inbox = self.inbox.clone();
+        self.worker.get_or_insert_with(|| {
+            let (tx, rx) = mpsc::channel::<Job>();
+            let _ = std::thread::Builder::new().name("feeder-connect".to_string()).spawn(move || {
+                while let Ok(job) = rx.recv() {
+                    match job {
+                        Job::Connect { tool, wake } => {
+                            let bin = setup::feeder_binary();
+                            let skipped: Vec<String> = setup::connect(tool, &bin)
+                                .into_iter()
+                                .filter_map(|(_, outcome)| match outcome {
+                                    Outcome::Skipped(why) => Some(why),
+                                    _ => None,
+                                })
+                                .collect();
+                            setup::install_skills();
+                            let link = match (setup::status(tool, &bin), skipped.into_iter().next()) {
+                                (Status::Connected, _) => Link::Connected,
+                                (_, Some(why)) => Link::Failed { action: ToolAction::Connect, reason: why },
+                                (status, None) => status.into(),
+                            };
+                            send(&inbox, wake.as_ref(), Msg::Linked(tool, link));
+                        }
+                        Job::Disconnect { tool, wake } => {
+                            let link = unlink(tool, &setup::feeder_binary());
+                            send(&inbox, wake.as_ref(), Msg::Linked(tool, link));
+                        }
+                        Job::DisconnectAll { wake } => {
+                            let bin = setup::feeder_binary();
+                            let mut all_disconnected = true;
+                            for tool in Tool::ALL {
+                                if setup::status(tool, &bin) != Status::Missing {
+                                    let link = unlink(tool, &bin);
+                                    if link != Link::Missing {
+                                        all_disconnected = false;
+                                    }
+                                    send(&inbox, wake.as_ref(), Msg::Linked(tool, link));
+                                }
+                            }
+                            if all_disconnected {
+                                setup::remove_skills();
+                            }
+                            send(&inbox, wake.as_ref(), Msg::Uninstalled(all_disconnected));
+                        }
+                        Job::InstallCli { wake } => {
+                            let bin = setup::feeder_binary();
+                            let status = match setup::install_cli_link(&bin) {
+                                Ok((path, on_path)) => CliStatus::Installed { path, on_path },
+                                Err(err) => CliStatus::Failed(err.to_string()),
+                            };
+                            send(&inbox, wake.as_ref(), Msg::Cli(status));
+                        }
+                    }
+                }
+            });
+            tx
+        })
+    }
+
     pub fn follow_settings(&mut self, open: bool, wake: Option<&Waker>) {
         if !open {
             self.fresh = false;
@@ -59,39 +149,27 @@ impl Agents {
                 .filter_map(|t| Some((t.name().to_string(), setup::app_path(*t)?)))
                 .collect();
             let rows = found.into_iter().map(|t| (t, setup::status(t, &bin).into())).collect();
-            send(&inbox, wake.as_ref(), Msg::Scanned(rows, icons));
+            let cli = match setup::cli_on_path(&bin) {
+                Some((path, on_path)) => CliStatus::Installed { path, on_path },
+                None => CliStatus::NotInstalled,
+            };
+            send(&inbox, wake.as_ref(), Msg::Scanned(rows, icons, cli));
         });
     }
 
     pub fn connect(&mut self, tool: Tool, wake: Option<&Waker>) {
         self.set(tool, Link::Connecting);
-        let (inbox, wake) = (self.inbox.clone(), wake.cloned());
-        std::thread::spawn(move || {
-            let bin = setup::feeder_binary();
-            let skipped: Vec<String> = setup::connect(tool, &bin)
-                .into_iter()
-                .filter_map(|(_, outcome)| match outcome {
-                    Outcome::Skipped(why) => Some(why),
-                    _ => None,
-                })
-                .collect();
-            setup::install_skills();
-            let link = match (setup::status(tool, &bin), skipped.into_iter().next()) {
-                (Status::Connected, _) => Link::Connected,
-                (_, Some(why)) => Link::Failed(why),
-                (status, None) => status.into(),
-            };
-            send(&inbox, wake.as_ref(), Msg::Linked(tool, link));
-        });
+        let _ = self.worker().send(Job::Connect { tool, wake: wake.cloned() });
     }
 
     pub fn disconnect(&mut self, tool: Tool, wake: Option<&Waker>) {
         self.set(tool, Link::Disconnecting);
-        let (inbox, wake) = (self.inbox.clone(), wake.cloned());
-        std::thread::spawn(move || {
-            let link = unlink(tool, &setup::feeder_binary());
-            send(&inbox, wake.as_ref(), Msg::Linked(tool, link));
-        });
+        let _ = self.worker().send(Job::Disconnect { tool, wake: wake.cloned() });
+    }
+
+    pub fn install_cli(&mut self, wake: Option<&Waker>) {
+        self.cli = CliStatus::Installing;
+        let _ = self.worker().send(Job::InstallCli { wake: wake.cloned() });
     }
 
     pub fn disconnect_all(&mut self, wake: Option<&Waker>) {
@@ -100,18 +178,7 @@ impl Agents {
                 *link = Link::Disconnecting;
             }
         }
-        let (inbox, wake) = (self.inbox.clone(), wake.cloned());
-        std::thread::spawn(move || {
-            let bin = setup::feeder_binary();
-            for tool in Tool::ALL {
-                if setup::status(tool, &bin) != Status::Missing {
-                    let link = unlink(tool, &bin);
-                    send(&inbox, wake.as_ref(), Msg::Linked(tool, link));
-                }
-            }
-            setup::remove_skills();
-            send(&inbox, wake.as_ref(), Msg::Uninstalled);
-        });
+        let _ = self.worker().send(Job::DisconnectAll { wake: wake.cloned() });
     }
 
     pub fn take(&mut self) -> bool {
@@ -122,7 +189,7 @@ impl Agents {
         let changed = !msgs.is_empty();
         for msg in msgs {
             match msg {
-                Msg::Scanned(mut rows, icons) => {
+                Msg::Scanned(mut rows, icons, cli) => {
                     self.icons.extend(icons);
                     for (tool, link) in &mut rows {
                         if let Some(busy @ (Link::Connecting | Link::Disconnecting)) = self.link(*tool) {
@@ -130,6 +197,9 @@ impl Agents {
                         }
                     }
                     self.rows = Some(rows);
+                    if self.cli != CliStatus::Installing {
+                        self.cli = cli;
+                    }
                 }
                 Msg::Linked(tool, link) => {
                     if link != Link::Missing {
@@ -137,7 +207,8 @@ impl Agents {
                     }
                     self.set(tool, link);
                 }
-                Msg::Uninstalled => self.uninstalled = true,
+                Msg::Uninstalled(done) => self.uninstalled = done,
+                Msg::Cli(status) => self.cli = status,
             }
         }
         changed
@@ -161,7 +232,7 @@ fn unlink(tool: Tool, bin: &std::path::Path) -> Link {
     });
     match (setup::status(tool, bin), skipped) {
         (Status::Missing, _) => Link::Missing,
-        (_, Some(why)) => Link::Failed(why),
+        (_, Some(why)) => Link::Failed { action: ToolAction::Disconnect, reason: why },
         (status, None) => status.into(),
     }
 }

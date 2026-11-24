@@ -1,11 +1,10 @@
-use std::io::{self, BufRead, BufReader, Read, Write};
+use std::io::{self, Read};
 use std::os::unix::process::CommandExt;
 use std::path::Path;
 use std::process::{Command, ExitStatus, Stdio};
-use std::sync::mpsc::{self, RecvTimeoutError};
 use std::time::{Duration, Instant};
 
-use serde_json::{Value, json};
+use serde_json::Value;
 
 use super::{Backend, profile, session};
 
@@ -41,7 +40,11 @@ impl Backend {
             Self::OpenCode => &["auth", "list", "--format", "json", "--standalone"],
             Self::Antigravity => &["models"],
         };
-        let Ok((status, stdout, stderr)) = read_output(cmd.args(args), Duration::from_secs(5)) else {
+        cmd.args(args);
+        if self == Self::Antigravity && profile::add_antigravity_gemini_dir(&mut cmd, data_dir).is_err() {
+            return AccountStatus::from_status(ConnectionStatus::Unknown);
+        }
+        let Ok((status, stdout, stderr)) = read_output(&mut cmd, Duration::from_secs(5)) else {
             return AccountStatus::from_status(ConnectionStatus::Unknown);
         };
         let conn = classify(self, status.code(), &stdout, &stderr);
@@ -116,80 +119,8 @@ fn parse_codex_account(result: &Value) -> Option<String> {
 }
 
 fn codex_account_label(bin: &Path, data_dir: &Path) -> Option<String> {
-    let mut cmd = profile::command(Backend::Codex, bin, data_dir).ok()?;
-    cmd.args(["app-server", "--listen", "stdio://"]);
-    let mut child = cmd.process_group(0).stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::null()).spawn().ok()?;
-    let mut input = child.stdin.take()?;
-    let output = child.stdout.take()?;
-    let (tx, rx) = mpsc::sync_channel(16);
-    if std::thread::Builder::new()
-        .name("feeder-codex-account".into())
-        .spawn(move || {
-            let mut reader = BufReader::new(output);
-            let mut line = Vec::new();
-            loop {
-                line.clear();
-                const MAX_LINE: u64 = 128 * 1024;
-                let Ok(bytes) = (&mut reader).take(MAX_LINE).read_until(b'\n', &mut line) else { break };
-                if bytes == 0 || (!line.ends_with(b"\n") && bytes as u64 == MAX_LINE) {
-                    break;
-                }
-                if let Ok(message) = serde_json::from_slice::<Value>(&line)
-                    && tx.send(message).is_err()
-                {
-                    break;
-                }
-            }
-        })
-        .is_err()
-    {
-        drop(input);
-        let _ = session::terminate_child(&mut child);
-        return None;
-    }
-
-    let label = (|| -> Option<String> {
-        let deadline = Instant::now() + CODEX_ACCOUNT_TIMEOUT;
-        writeln!(
-            input,
-            "{}",
-            json!({
-                "id": 1,
-                "method": "initialize",
-                "params": { "clientInfo": { "name": "feeder", "title": "Feeder", "version": env!("CARGO_PKG_VERSION") } }
-            })
-        )
-        .ok()?;
-        input.flush().ok()?;
-
-        let mut initialized = false;
-        loop {
-            let remaining = deadline.saturating_duration_since(Instant::now());
-            if remaining.is_zero() {
-                return None;
-            }
-            let message = match rx.recv_timeout(remaining.min(Duration::from_millis(80))) {
-                Ok(message) => message,
-                Err(RecvTimeoutError::Timeout) => continue,
-                Err(RecvTimeoutError::Disconnected) => return None,
-            };
-            match message["id"].as_u64() {
-                Some(1) if !initialized && message.get("result").is_some() => {
-                    initialized = true;
-                    writeln!(input, "{}", json!({ "method": "initialized" })).ok()?;
-                    writeln!(input, "{}", json!({ "id": 2, "method": "account/read", "params": {} })).ok()?;
-                    input.flush().ok()?;
-                }
-                Some(2) => return message.get("result").and_then(parse_codex_account),
-                Some(1) => return None,
-                _ => {}
-            }
-        }
-    })();
-
-    drop(input);
-    let _ = session::terminate_child(&mut child);
-    label
+    let result = profile::codex_rpc(bin, data_dir, "account/read", CODEX_ACCOUNT_TIMEOUT, 128 * 1024, "feeder-codex-account").ok()?;
+    parse_codex_account(&result)
 }
 
 fn classify(backend: Backend, code: Option<i32>, stdout: &[u8], stderr: &[u8]) -> ConnectionStatus {
@@ -215,6 +146,7 @@ fn classify(backend: Backend, code: Option<i32>, stdout: &[u8], stderr: &[u8]) -
         (Backend::Codex, Some(1)) if has_line("Not logged in") => SignedOut,
         (Backend::OpenCode, Some(0)) => match serde_json::from_slice::<Vec<Value>>(stdout) {
             Ok(accounts) if accounts.iter().any(Value::is_object) => Connected,
+            Ok(accounts) if accounts.is_empty() => SignedOut,
             _ => Unknown,
         },
         (Backend::Antigravity, Some(0))
@@ -283,7 +215,8 @@ mod tests {
         assert_eq!(classify(Codex, Some(1), b"Not logged in\n", b""), SignedOut);
         assert_eq!(classify(Codex, Some(1), b"", b"couldn't open credentials"), Unknown);
         assert_eq!(classify(OpenCode, Some(0), br#"[{"provider":"openai"}]"#, b""), Connected);
-        assert_eq!(classify(OpenCode, Some(0), b"[]", b""), Unknown);
+        assert_eq!(classify(OpenCode, Some(0), b"[]", b""), SignedOut);
+        assert_eq!(classify(OpenCode, Some(0), b"not json", b""), Unknown);
         assert_eq!(classify(Antigravity, Some(0), b"Fetching available models...\nGemini\n", b""), Connected);
         assert_eq!(
             classify(
@@ -304,7 +237,7 @@ mod tests {
             Some("alex@example.com · Team")
         );
         assert_eq!(
-            parse_codex_account(&json!({ "account": { "email": "alex@example.com", "planType": "plus" } })).as_deref(),
+            parse_codex_account(&serde_json::json!({ "account": { "email": "alex@example.com", "planType": "plus" } })).as_deref(),
             Some("alex@example.com · Plus")
         );
         assert_eq!(

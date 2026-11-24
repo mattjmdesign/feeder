@@ -16,11 +16,13 @@ const SVG_PATHS: Partial<Record<ToolKey, { d: string; color?: string }>> = {
   opencode: {
     d: 'M22 24H2V0h20zM17 4.8H7v14.4h10z',
   },
+  antigravity: {
+    d: 'M20.599 21.040C21.775 21.922 23.538 21.334 21.922 19.717C17.071 15.013 18.100 2.078 12.073 2.078C6.047 2.078 7.076 15.013 2.225 19.717C0.462 21.481 2.372 21.922 3.548 21.040C8.105 17.953 7.811 12.514 12.073 12.514C16.336 12.514 16.042 17.953 20.599 21.040Z',
+  },
 }
 
 const MONOGRAMS: Partial<Record<ToolKey, string>> = {
   t3code: 'T',
-  antigravity: 'A',
 }
 
 export function ToolLogo({ tool, size = 16 }: { tool: ToolKey; size?: number }) {
@@ -57,7 +59,7 @@ export function ToolLogo({ tool, size = 16 }: { tool: ToolKey; size?: number }) 
         border: '1px solid currentColor',
         opacity: 0.68,
         fontSize: Math.round(size * 0.56),
-        fontWeight: 600,
+        fontWeight: 500,
         lineHeight: 1,
       }}
     >

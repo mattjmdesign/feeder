@@ -149,7 +149,10 @@ fn enrich(md: &str) -> String {
             let first: String = md.chars().take(n).collect();
             let enriched_first = enrich(&first);
             match out.strip_prefix(&enriched_first) {
-                Some(rest) => format!("**{}**{rest}", enriched_first.trim_end()),
+                Some(rest) => {
+                    let clean = enriched_first.trim_end().replace("**", "");
+                    format!("**{clean}**{rest}")
+                }
                 None => out,
             }
         }
@@ -293,6 +296,7 @@ mod tests {
             enrich("Wave 3 planning is underway. The specs landed today."),
             "**Wave 3 planning is underway.** The specs landed today."
         );
+        assert_eq!(enrich("Cut frame time to 14 ms. Next check passed 99%."), "**Cut frame time to 14 ms.** Next check passed **99%**.");
         assert_eq!(enrich("Only one sentence here."), "Only one sentence here.");
         let long =
             "A very long first sentence that goes on and on about many things in great detail, far past what a lead should be. Then more.";

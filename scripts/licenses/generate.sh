@@ -11,4 +11,5 @@ page = open(out).read()
 section = "<h2>Sparkle (MIT)</h2>\n<p>Used by: the in-app updater.</p>\n<pre>" + html.escape(open(sparkle).read()) + "</pre>"
 open(out, "w").write(page.replace("<!-- sparkle -->", section))
 PY
+cp "$out" site/public/licenses.html
 echo "✓ $out"

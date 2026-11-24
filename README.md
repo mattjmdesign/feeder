@@ -13,14 +13,14 @@
 
 Each project gets an orb on the Home screen and its own feed of updates. Agents post through a
 local MCP server or the `feeder` command. It's built in Rust on [Rune](https://github.com/anomalyco/rune),
-so it opens instantly and stays small. Your Feed and Notebook are stored on your Mac.
+so it opens instantly and stays small. Your Feed and Library are stored on your Mac.
 
 ## Install
 
 1. Download [Feeder.dmg](https://github.com/mattjmdesign/feeder/releases/latest/download/Feeder.dmg),
    open it and drag Feeder into Applications.
 2. Open Feeder.
-3. Go to **Settings → Connected Tools**, press **Connect** next to each tool you use, then restart those tools.
+3. Go to **Settings → Connected Tools**, press **Connect** next to each tool you use, then restart those tools. You can also choose **Install Command Line Tool** there so `feeder` is on your `PATH`.
 
 Supported tools: Claude Code, Claude Desktop, Codex, Cursor, Antigravity, T3 Code and OpenCode.
 For any other tool, **Copy Config** gives you a snippet to paste into its MCP settings.
@@ -43,31 +43,31 @@ In the app:
 
 - **Home** (⌘1) shows every project. A ring means an agent is working on it right now.
 - **Feed** (⌘2) shows updates from every project in one list. ⌘F searches the current view (Feed,
-  an open project, or Notebook).
-- **Notebook** (⌘3) holds freeform Markdown notes and engineering lessons across projects, with
+  an open project, or Library).
+- **Library** (⌘3) holds freeform Markdown notes and engineering lessons across projects, with
   callouts, code blocks, tables, and interactive checklists. Agents search it before they start debugging.
-- **⌘K** jumps to any project, update or notebook page.
+- **⌘K** jumps to any project, update or library note.
 
 ### Curator
 
-The **Feed** records what happened. The **Notebook** keeps what you'll want to know next time.
-If an update or its replies explain a reusable fix or decision, choose **Flag for Notebook**.
-Working agents can search and read the Notebook (`search_notebook`, `read_page`), record when a
+The **Feed** records what happened. The **Library** keeps what you'll want to know next time.
+If an update or its replies explain a reusable fix or decision, choose **Flag for Library**.
+Working agents can search and read the Library (`search_notebook`, `read_page`), record when a
 page helped (`mark_page_helped`), and report gaps (`flag_knowledge`). They can include a verified
-fix as a `suggestion` for Curator to review. You can edit notes directly in the Notebook.
+fix as a `suggestion` for Curator to review. You can edit notes directly in the Library.
 
 When an agent starts or resumes work, it can pass task keywords to `get_feed` to get up to three
 matching current notes alongside the project's updates. This includes notes from that project
-and the shared Notebook. Save personal design and writing preferences as **Taste** notes in the
-shared Notebook. Project notes keep their project scope regardless of category.
+and the shared Library. Save personal design and writing preferences as **Taste** notes in the
+shared Library. Project notes keep their project scope regardless of category.
 
-Open **Notebook → Curator** to ask a question from saved notes or review those flags:
+Open **Curator** (⌘4, or click its orb in the top-right corner) to ask a question from saved notes or review those flags:
 
-- **Ask** searches the Notebook and links to the pages it used. It can't edit notes or read Feed threads.
-- **Review Open Flags** reads flags and relevant Feed replies. It uses that evidence to add or update notes.
-  Curator looks for a reusable lesson or a pointer to a source that stays current. It checks for an
-  existing note first and leaves gaps open when the evidence is unclear. Each page edit has a source
-  and can be reverted.
+- **Ask** searches the Library and links to the pages it used. It can't edit notes or read Feed threads.
+- **Review Open Flags** reads flags and relevant Feed replies. It uses that evidence to propose new
+  or updated notes, citing the updates they came from. Press **Apply** to save a proposal to the
+  Library or **Dismiss** to skip it. Curator checks for an existing note first and leaves gaps open
+  when the evidence is unclear. Every applied edit can be reverted.
 - **Find Duplicate Notes** links to overlapping pages so you can decide what to keep.
 
 Open Curator from a project's **Update Notes** button to limit the session to that project.
@@ -81,7 +81,8 @@ or `--with antigravity`. The provider CLI manages its credentials and the accoun
 configured there determines usage.
 
 From Terminal, use `feeder curator run --ask "How do we sign releases?"` for a read-only
-answer or `feeder curator run --project "My Project" --with codex` to review a project.
+answer or `feeder curator run --project "My Project" --with codex` to review a project, then
+`feeder curator proposals`, `feeder curator apply <id>`, or `feeder curator dismiss <id>`.
 Use `feeder flag --update 42` to flag a Feed thread and its replies for review.
 
 You can also post from Terminal:

@@ -29,11 +29,14 @@ case "$RUST_TARGET" in
 esac
 RELEASE_DIR="target/$RUST_TARGET/release"
 DEST="$HOME/Applications/$APP_NAME.app"
-if [[ "$MODE" != "--package" && -z "${FEEDER_REPLACE_RELEASE:-}" ]] \
-  && /usr/libexec/PlistBuddy -c 'Print :SUFeedURL' "$DEST/Contents/Info.plist" >/dev/null 2>&1; then
-  echo "$DEST is a release build that updates itself; a local build would replace it and its updater." >&2
-  echo "Use 'cargo run -p feeder-app' to try changes, or set FEEDER_REPLACE_RELEASE=1 to replace it anyway." >&2
-  exit 1
+if [[ "$MODE" != "--package" && -z "${FEEDER_REPLACE_RELEASE:-}" ]]; then
+  for existing in "$DEST" "/Applications/$APP_NAME.app"; do
+    if /usr/libexec/PlistBuddy -c 'Print :SUFeedURL' "$existing/Contents/Info.plist" >/dev/null 2>&1; then
+      echo "$existing is a release build that updates itself; a local build would replace or shadow it and its updater." >&2
+      echo "Use 'cargo run -p feeder-app' to try changes, or set FEEDER_REPLACE_RELEASE=1 to install anyway." >&2
+      exit 1
+    fi
+  done
 fi
 SIGN_IDENTITY="${FEEDER_SIGN_IDENTITY:--}"
 NOTARY_PROFILE="${FEEDER_NOTARY_PROFILE:-}"
@@ -79,23 +82,31 @@ if LC_ALL=C /usr/bin/grep -aFq -e "$HOME/" -e "$PWD/" "$RELEASE_DIR/feeder-app" 
   exit 1
 fi
 
-echo "› rendering the icon"
-env -u FEEDER_SPARKLE_DIR cargo build --locked --target-dir target -p feeder-app
-ICONSET="$WORK/AppIcon.iconset"
-mkdir -p "$ICONSET"
-RAW="$WORK/icon-1024.png"
-FEEDER_HOME="$WORK/icon-data" target/debug/feeder-app --snap "$RAW" --scene app-icon --size 1024x1024 --scale 1 >/dev/null
-for size in 16 32 128 256 512; do
-  sips -z $size $size "$RAW" --out "$ICONSET/icon_${size}x${size}.png" >/dev/null
-  sips -z $((size * 2)) $((size * 2)) "$RAW" --out "$ICONSET/icon_${size}x${size}@2x.png" >/dev/null
-done
-iconutil -c icns "$ICONSET" -o "$ICONSET/../AppIcon.icns"
+if [[ -n "${FEEDER_REGEN_ICON:-}" || ! -f "assets/AppIcon.icns" ]]; then
+  echo "› rendering the icon"
+  env -u FEEDER_SPARKLE_DIR cargo build --locked --target-dir target -p feeder-app
+  ICONSET="$WORK/AppIcon.iconset"
+  mkdir -p "$ICONSET"
+  RAW="$WORK/icon-1024.png"
+  FEEDER_HOME="$WORK/icon-data" target/debug/feeder-app --snap "$RAW" --scene app-icon --size 1024x1024 --scale 1 >/dev/null
+  for size in 16 32 128 256 512; do
+    sips -z $size $size "$RAW" --out "$ICONSET/icon_${size}x${size}.png" >/dev/null
+    sips -z $((size * 2)) $((size * 2)) "$RAW" --out "$ICONSET/icon_${size}x${size}@2x.png" >/dev/null
+  done
+  iconutil -c icns "$ICONSET" -o "$WORK/AppIcon.icns"
+  if [[ -n "${FEEDER_REGEN_ICON:-}" ]]; then
+    mkdir -p assets
+    cp "$WORK/AppIcon.icns" "assets/AppIcon.icns"
+  fi
+else
+  cp "assets/AppIcon.icns" "$WORK/AppIcon.icns"
+fi
 
 echo "› assembling $APP_NAME.app"
 mkdir -p "$STAGE/Contents/MacOS" "$STAGE/Contents/Resources" "$STAGE/Contents/Helpers"
 cp "$RELEASE_DIR/feeder-app" "$STAGE/Contents/MacOS/$APP_NAME"
 cp "$RELEASE_DIR/feeder" "$STAGE/Contents/Helpers/feeder"
-cp "$ICONSET/../AppIcon.icns" "$STAGE/Contents/Resources/AppIcon.icns"
+cp "$WORK/AppIcon.icns" "$STAGE/Contents/Resources/AppIcon.icns"
 cp assets/Credits.html "$STAGE/Contents/Resources/Credits.html"
 cp assets/ThirdPartyLicenses.html "$STAGE/Contents/Resources/ThirdPartyLicenses.html"
 cat > "$STAGE/Contents/Info.plist" <<PLIST
@@ -116,6 +127,11 @@ cat > "$STAGE/Contents/Info.plist" <<PLIST
   <key>NSHumanReadableCopyright</key><string>Copyright © 2026 Matt Mitchell. MIT License.</string>
   <key>NSHighResolutionCapable</key><true/>
   <key>NSPrincipalClass</key><string>NSApplication</string>
+  <key>LSEnvironment</key>
+  <dict>
+    <key>RUNE_LAUNCH_PLAIN</key><string>1</string>
+    <key>RUNE_WINDOW_AFTER_LAUNCH</key><string>1</string>
+  </dict>
   <key>CFBundleURLTypes</key>
   <array>
     <dict>
@@ -170,6 +186,9 @@ if [[ "$MODE" == "--package" ]]; then
     uvx --quiet --from 'dmgbuild==1.6.5' dmgbuild -s scripts/dmg/settings.py \
       -D app="$STAGE" -D background=scripts/dmg/background.tiff -D volume_icon="$STAGE/Contents/Resources/AppIcon.icns" \
       "$APP_NAME" "$DMG" >/dev/null
+  elif [[ -n "${NOTARY_PROFILE:-}" ]]; then
+    echo "uvx is required to build the styled release disk image." >&2
+    exit 1
   else
     echo "› uvx not found; building a plain disk image" >&2
     mkdir "$WORK/image"

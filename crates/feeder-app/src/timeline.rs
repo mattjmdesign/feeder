@@ -93,7 +93,7 @@ fn posts(s: &State, p: &Palette, k: &Kit, visible: &[(&FeedUpdate, &ProjectSumma
         })
         .collect();
     let keys = rows.clone();
-    let menu = s.post_menu.filter(|id| rows.iter().any(|r| r.id == *id)).map(|id| (id, post_menu(id, p, k, layer)));
+    let menu = s.post_menu.filter(|id| rows.iter().any(|r| r.id == *id)).map(|id| (id, post_menu(s, id, p, k, layer)));
     let (p, k) = (*p, k.clone());
     let md = feed::markdown_style(&p, &k);
     col()
@@ -119,8 +119,10 @@ fn posts(s: &State, p: &Palette, k: &Kit, visible: &[(&FeedUpdate, &ProjectSumma
             },
         )
         .on_visible_rows(|s: &mut State, range| {
-            s.feed_visible_rows = Some(range);
-            crate::media::sync(s);
+            if s.feed_visible_rows.as_ref() != Some(&range) {
+                s.feed_visible_rows = Some(range);
+                s.sync_media();
+            }
             false
         })
 }
@@ -138,9 +140,16 @@ fn filter_row(s: &State, p: &Palette) -> El {
         .help("Search updates (Command-F)")
         .on_edit(|s: &mut State| &mut s.feed_search)
         .on_input_key(|s: &mut State, e: &KeyEvent, _tx: &mut Tx| {
-            if matches!(e.key, Key::Escape) && !s.feed_search.text.is_empty() {
-                s.feed_search.text.clear();
-                return true;
+            if matches!(e.key, Key::Escape) {
+                if !s.feed_search.text.is_empty() {
+                    s.feed_search.text.clear();
+                    s.sync_search();
+                    return true;
+                }
+                if s.feed_search.focused {
+                    s.feed_search.focused = false;
+                    return true;
+                }
             }
             false
         });
@@ -158,7 +167,10 @@ fn filter_row(s: &State, p: &Palette) -> El {
                 .radius(5.0)
                 .hover(p.hover)
                 .cursor(Cursor::Pointer)
-                .on_press(|s: &mut State| s.feed_search.text.clear())
+                .on_press(|s: &mut State| {
+                    s.feed_search.text.clear();
+                    s.sync_search();
+                })
                 .child(text("×").font(style::META).color(p.text_3)),
         );
     }
@@ -188,7 +200,9 @@ fn filter_row(s: &State, p: &Palette) -> El {
     }
     if unseen > 0 {
         row_el = row_el.child(
-            chrome::bar_button("timeline-mark-read", "Mark Read", p).border(1.0, p.hairline).on_press(|s: &mut State| s.mark_all_seen()),
+            chrome::bar_button("timeline-mark-read", "Mark All Read", p)
+                .border(1.0, p.hairline)
+                .on_press(|s: &mut State| s.mark_all_seen()),
         );
     }
     row_el
@@ -334,7 +348,7 @@ fn post(s: &State, (p, k, md): (&Palette, &Kit, &MarkdownStyle), u: &FeedUpdate,
         .child(text(u.agent.clone()).font(style::META).color(p.text_2).truncate().shrink())
         .child(action_dot(p))
         .child(text(ago(u.created_at, s.now)).font(style::META).color(p.text_3));
-    header = header.child(rune::spacer()).child(post_actions(s, p, u, menu_trigger));
+    header = header.child(rune::spacer()).child(post_actions(s, p, u, selected, menu_trigger));
 
     let mut words = col().grow(1.0).min_w(0.0).gap(8.0).child(header);
     let mut attention = feed::card_attention_tags(s, p, u);
@@ -425,56 +439,92 @@ fn more_action(uid: i64, p: &Palette) -> El {
         .on_press(move |s: &mut State| s.post_menu = if s.post_menu == Some(uid) { None } else { Some(uid) })
 }
 
-fn post_actions(s: &State, p: &Palette, u: &FeedUpdate, menu_trigger: Option<El>) -> El {
+fn post_actions(s: &State, p: &Palette, u: &FeedUpdate, selected: bool, menu_trigger: Option<El>) -> El {
     let uid = u.id;
+    let project_id = u.project_id;
     let body = u.body.clone();
-    let copy_label = if s.is_copied(CopyTarget::Update(uid)) { "Copied" } else { "Copy" };
+    let copied = s.is_copied(CopyTarget::Update(uid));
+    let copy_label = if copied { "Copied" } else { "Copy" };
     let copy = post_action(p, format!("copy-u-{uid}"), "Copy update", text(copy_label).font(style::META).color(p.text_3)).on_press_tx(
         move |s: &mut State, tx: &mut Tx| {
             tx.copy(body.clone());
             s.mark_copied(CopyTarget::Update(uid));
         },
     );
-    let shown = menu_trigger.is_some();
+    let reply = post_action(p, format!("reply-u-{uid}"), "Reply to update", text("Reply").font(style::META).color(p.text_3)).on_press_tx(
+        move |s: &mut State, tx: &mut Tx| {
+            s.open_project_at(project_id, Some(uid));
+            s.start_reply(uid, tx);
+        },
+    );
+    let shown = selected || copied || menu_trigger.is_some();
     let more = menu_trigger.unwrap_or_else(|| more_action(uid, p));
-    row().gap(2.0).center_y().group_opacity(if shown { 1.0 } else { 0.0 }, 1.0).child(copy).child(more)
+    row().gap(2.0).center_y().group_opacity(if shown { 1.0 } else { 0.0 }, 1.0).child(copy).child(reply).child(more)
 }
 
-fn post_menu(uid: i64, p: &Palette, k: &Kit, layer: &mut Vec<El>) -> El {
-    Menu::new(format!("post-menu-{uid}"))
+fn post_menu(s: &State, uid: i64, p: &Palette, k: &Kit, layer: &mut Vec<El>) -> El {
+    let mut menu = Menu::new(format!("post-menu-{uid}"))
         .trigger(more_action(uid, p))
         .open(true)
         .placement(Placement::BottomEnd)
         .min_width(176.0)
-        .on_close(|s: &mut State| s.post_menu = None)
-        .item(MenuItem::new("Flag for Library").on_select(move |s: &mut State| {
+        .on_close(|s: &mut State| s.post_menu = None);
+    if !s.update_is_flagged_or_reviewed(uid) {
+        menu = menu.item(MenuItem::new("Flag for Library").on_select(move |s: &mut State| {
             s.post_menu = None;
             s.flag_update_for_notebook(uid);
-        }))
-        .item(MenuItem::new("Edit").on_select_tx(move |s: &mut State, tx: &mut Tx| {
-            s.post_menu = None;
-            s.start_edit_update(uid, tx);
-        }))
-        .separator()
-        .item(MenuItem::new("Delete…").danger(true).on_select(move |s: &mut State| {
-            s.post_menu = None;
-            s.delete_confirm = Some(uid);
-        }))
-        .build(k, layer)
+        }));
+    }
+    menu.item(MenuItem::new("Edit").on_select_tx(move |s: &mut State, tx: &mut Tx| {
+        s.post_menu = None;
+        s.start_edit_update(uid, tx);
+    }))
+    .separator()
+    .item(MenuItem::new("Delete…").danger(true).on_select(move |s: &mut State| {
+        s.post_menu = None;
+        s.delete_confirm = Some(uid);
+    }))
+    .build(k, layer)
 }
 
 fn post_footer(s: &State, p: &Palette, u: &FeedUpdate) -> Option<El> {
     let diff = u.diff_stat.as_deref().map(str::trim).filter(|d| !d.is_empty());
     let link = feed::notebook_link(s, p, u.id);
-    if diff.is_none() && link.is_none() {
+    let reply_count = s.replies.get(&u.id).map_or(0, Vec::len);
+    let reply_link = (reply_count > 0).then(|| {
+        let label = if reply_count == 1 { "1 reply".to_string() } else { format!("{reply_count} replies") };
+        let (uid, pid) = (u.id, u.project_id);
+        row()
+            .key(format!("t-replies-{uid}"))
+            .role("button")
+            .label(format!("{label}, open thread"))
+            .focusable(true)
+            .center_y()
+            .cursor(Cursor::Pointer)
+            .on_press_tx(move |s: &mut State, tx: &mut Tx| {
+                s.open_project_at(pid, Some(uid));
+                s.start_reply(uid, tx);
+            })
+            .child(text(label).font(style::META).color(p.text_2))
+    });
+    if reply_link.is_none() && diff.is_none() && link.is_none() {
         return None;
     }
     let mut r = row().w_full().gap(8.0).center_y();
+    let mut has_item = false;
+    if let Some(reply_link) = reply_link {
+        r = r.child(reply_link);
+        has_item = true;
+    }
     if let Some(diff) = diff {
+        if has_item {
+            r = r.child(action_dot(p));
+        }
         r = r.child(text(diff.to_string()).font(style::META).color(p.text_3).truncate().max_w(220.0));
+        has_item = true;
     }
     if let Some(link) = link {
-        if diff.is_some() {
+        if has_item {
             r = r.child(action_dot(p));
         }
         r = r.child(link);

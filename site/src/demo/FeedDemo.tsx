@@ -1,6 +1,6 @@
 import { Stage } from '../stageshow/kit/stage'
 import type { Act } from '../stageshow/kit/act'
-import { Bar, Window } from '../stageshow/kit/window'
+import { Window } from '../stageshow/kit/window'
 import { Collapse } from '../stageshow/kit/motion/Collapse'
 import { Badge } from '../stageshow/kit/controls/Badge'
 import { Segmented } from '../stageshow/kit/controls/Segmented'
@@ -30,8 +30,6 @@ async function script(a: Act<S>) {
   a.mark('slide-3')
   await a.set({ slide: 2 })
   await a.wait(2200)
-  await a.set({ posted: false, slide: 0 })
-  await a.wait(700)
 }
 
 function OrbDot({ orb, size = 22 }: { orb: Orb; size?: number }) {
@@ -121,6 +119,7 @@ export default function FeedDemo() {
       compact={{ below: 720, width: 358, height: 400 }}
       theme={theme}
       greys="cool"
+      play="once"
       initial={initial}
       poster={{ working: false, posted: true, slide: 0 }}
       script={script}
@@ -130,16 +129,17 @@ export default function FeedDemo() {
       {(s, _rect, layout) => (
         <Window
           className="fd-win"
-          toolbar={layout === 'compact' ? undefined : <Segmented className="fd-seg" items={['Home', 'Feed', 'Notebook']} value={1} />}
+          toolbar={layout === 'compact' ? undefined : <Segmented className="fd-seg" items={['Home', 'Feed', 'Library']} value={1} />}
         >
           <div className="fd-body">
             <div className="fd-filters">
-              <span className="fd-search">
-                <Bar w={96} h={6} tone={2} />
-              </span>
+              <span className="fd-search">Search updates</span>
               <span className="fd-chip" data-on>All</span>
-              <span className="fd-chip"><Bar w={54} h={6} tone={2} /></span>
-              <span className="fd-chip">Media</span>
+              <span className="fd-chip">
+                <i className="fd-chip__dot" />
+                Needs you
+              </span>
+              <span className="fd-chip">Mark All Read</span>
             </div>
             <div className="fd-day">
               <span>Today</span>

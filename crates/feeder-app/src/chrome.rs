@@ -1,7 +1,7 @@
 use std::path::Path;
 
 use feeder_core::setup::{self, Tool};
-use feeder_core::{OrbSize, Order, Theme, ago};
+use feeder_core::{OrbSize, Order, Standing, Theme, ago};
 use rune::{
     ClipboardImage, Cursor, Drag, El, Icon, Key, KeyEvent, ScrollSpec, SurfaceFit, Transition, Tx, col, el, oklch, row, text, text_input,
 };
@@ -10,7 +10,7 @@ use rune_kit::{
     Button, ButtonVariant, ControlSize, Kit, Menu, MenuItem, Placement, Preview, SegmentedControl, Switch, Toast, ToastRegion, Toolbar,
 };
 
-use crate::connect::Link;
+use crate::connect::{CliStatus, Link, ToolAction};
 use crate::style::{self, Palette};
 use crate::{CopyTarget, State, Tab, ToastItem, ToastKind, agents, curator_settings, feed, orb};
 
@@ -51,7 +51,7 @@ fn curator_here(s: &State) -> bool {
 
 pub fn curator_button(s: &State, p: &Palette) -> El {
     let size = 26.0;
-    let flags = s.notebook.gardener.open_flags.len();
+    let flags = s.notebook.gardener.open_flag_count;
     let mut b = el()
         .key("curator-button")
         .role("button")
@@ -344,7 +344,7 @@ pub fn lightbox(s: &State, inset: f32, p: &Palette, k: &Kit, reduced_motion: boo
         let mut top = lightbox_top_chrome(s, inset, p, &caption, pos, total, false, None);
         if let Some(path) = media_path {
             top = top.child(
-                bar_button("lightbox-open", "Open File", p)
+                bar_button("lightbox-open", "Show in Finder", p)
                     .fill(p.card)
                     .border(1.0, p.hairline)
                     .on_press(move |_: &mut State| reveal_path(&path)),
@@ -376,7 +376,18 @@ pub fn lightbox(s: &State, inset: f32, p: &Palette, k: &Kit, reduced_motion: boo
     }
 
     let Some((img, [w, h])) = s.shots.get(&id).and_then(|img| Some((img, img.size()?))) else {
+        let err = s.shots.get(&id).and_then(rune::Image::error);
         let mut top = lightbox_top_chrome(s, inset, p, &caption, pos, total, false, None);
+        if err.is_some()
+            && let Some(path) = media_path.clone()
+        {
+            top = top.child(
+                bar_button("lightbox-open", "Show in Finder", p)
+                    .fill(p.card)
+                    .border(1.0, p.hairline)
+                    .on_press(move |_: &mut State| reveal_path(&path)),
+            );
+        }
         top = top.child(
             bar_button("lightbox-close", "×", p)
                 .fill(p.card)
@@ -384,6 +395,20 @@ pub fn lightbox(s: &State, inset: f32, p: &Palette, k: &Kit, reduced_motion: boo
                 .label("Close preview")
                 .on_press(|s: &mut State| s.close_lightbox()),
         );
+        let msg = match err {
+            Some(e) => format!("Couldn’t load image: {e}"),
+            None => "Loading…".to_string(),
+        };
+        let mut center = col().gap(10.0).items_center().child(text(msg).font(style::META).color(p.text_2));
+        if err.is_some()
+            && let Some(path) = media_path
+        {
+            center = center.child(
+                bar_button("lightbox-err-reveal", "Show in Finder", p)
+                    .border(1.0, p.hairline)
+                    .on_press(move |_: &mut State| reveal_path(&path)),
+            );
+        }
         let mut scrim = el()
             .key("lightbox-scrim")
             .absolute(0.0, 0.0)
@@ -392,14 +417,7 @@ pub fn lightbox(s: &State, inset: f32, p: &Palette, k: &Kit, reduced_motion: boo
             .fill(backdrop)
             .center()
             .on_press(|s: &mut State| s.close_lightbox())
-            .child(
-                el().px(18.0)
-                    .py(12.0)
-                    .radius(10.0)
-                    .fill(p.card)
-                    .border(1.0, p.hairline)
-                    .child(text("Loading…").font(style::META).color(p.text_2)),
-            )
+            .child(el().px(18.0).py(12.0).radius(10.0).fill(p.card).border(1.0, p.hairline).on_press(|_: &mut State| {}).child(center))
             .child(top);
         if let Some(strip) = strip {
             scrim = scrim.child(strip);
@@ -428,14 +446,16 @@ pub fn lightbox(s: &State, inset: f32, p: &Palette, k: &Kit, reduced_motion: boo
         );
     }
 
-    if let Some(before_id) = compare_target
-        && let Some(before_img) = s.shots.get(&before_id)
+    if let Some(compare_id) = compare_target
+        && let Some((before_id, after_id)) = s.lightbox_compare_pair(id, compare_id)
+        && let (Some(before_img), Some(after_img)) = (s.shots.get(&before_id), s.shots.get(&after_id))
     {
+        let [aw, ah] = after_img.size().unwrap_or([w, h]);
         let max_w = (s.window_size[0] - 120.0).max(280.0);
         let max_h = (s.window_size[1] - 140.0).max(220.0);
-        let scale = (max_w / w.max(1) as f32).min(max_h / h.max(1) as f32).min(1.0);
-        let box_w = (w.max(1) as f32 * scale).max(240.0);
-        let box_h = (h.max(1) as f32 * scale).max(160.0);
+        let scale = (max_w / aw.max(1) as f32).min(max_h / ah.max(1) as f32).min(1.0);
+        let box_w = (aw.max(1) as f32 * scale).max(240.0);
+        let box_h = (ah.max(1) as f32 * scale).max(160.0);
         let split = s.lightbox_split.clamp(0.02, 0.98);
         let left_w = box_w * split;
 
@@ -453,6 +473,7 @@ pub fn lightbox(s: &State, inset: f32, p: &Palette, k: &Kit, reduced_motion: boo
             .w(box_w)
             .h(box_h)
             .radius(12.0)
+            .clip_rounded(12.0)
             .border(1.0, p.hairline)
             .shadow(18.0, 60.0, oklch(0.0, 0.0, 0.0).alpha(if p.dark { 0.65 } else { 0.30 }))
             .cursor(Cursor::Grab)
@@ -468,7 +489,7 @@ pub fn lightbox(s: &State, inset: f32, p: &Palette, k: &Kit, reduced_motion: boo
                     .w(left_w)
                     .h(box_h)
                     .clip_rounded(0.0)
-                    .child(el().w(box_w).h(box_h).pixels_fit(img.pixels(), SurfaceFit::Fit)),
+                    .child(el().w(box_w).h(box_h).pixels_fit(after_img.pixels(), SurfaceFit::Fit)),
             )
             .child(el().absolute(left_w - 1.0, 0.0).w(2.0).h(box_h).fill(oklch(1.0, 0.0, 0.0).alpha(0.92)))
             .child(
@@ -640,6 +661,7 @@ fn lightbox_top_chrome(
 #[derive(Clone)]
 pub enum PaletteAction {
     OpenProject(i64),
+    OpenUpdate(i64, i64),
     GoHome,
     GoFeed,
     GoNotebook,
@@ -744,7 +766,7 @@ pub fn palette_items(s: &State) -> Vec<PaletteItem> {
             let preview = feed::first_line(&u.body, 52);
             let subtitle = format!("{proj} · {} · {}", u.agent, ago(u.created_at, s.now));
             items.push(PaletteItem {
-                action: PaletteAction::OpenProject(u.project_id),
+                action: PaletteAction::OpenUpdate(u.project_id, u.id),
                 title: if preview.is_empty() { format!("Update #{}", u.id) } else { preview },
                 subtitle,
                 badge: u.branch.clone().or_else(|| Some("Update".into())),
@@ -756,13 +778,14 @@ pub fn palette_items(s: &State) -> Vec<PaletteItem> {
     items
 }
 
-pub fn move_palette(s: &mut State, delta: isize) {
+pub fn move_palette(s: &mut State, delta: isize, tx: &mut Tx) {
     let len = palette_items(s).len();
     if len == 0 {
         s.palette_index = 0;
         return;
     }
     s.palette_index = (s.palette_index.min(len - 1) as isize + delta).rem_euclid(len as isize) as usize;
+    tx.scroll_into_view(format!("pal-{}", s.palette_index));
 }
 
 pub fn run_palette(s: &mut State, tx: &mut Tx) {
@@ -778,6 +801,7 @@ fn execute_palette_action(s: &mut State, action: PaletteAction, tx: &mut Tx) {
     s.close_palette();
     match action {
         PaletteAction::OpenProject(id) => s.open_project(id),
+        PaletteAction::OpenUpdate(pid, uid) => s.open_project_at(pid, Some(uid)),
         PaletteAction::GoHome => s.select_tab(Tab::Home, tx),
         PaletteAction::GoFeed => s.select_tab(Tab::Feed, tx),
         PaletteAction::GoNotebook => s.select_tab(Tab::Notebook, tx),
@@ -816,26 +840,29 @@ pub fn palette(s: &State, p: &Palette, _k: &Kit) -> Option<El> {
             &mut s.palette_query
         })
         .on_submit(run_palette)
-        .on_input_key(|s: &mut State, e: &KeyEvent, _tx: &mut Tx| match e.key {
+        .on_input_key(|s: &mut State, e: &KeyEvent, tx: &mut Tx| match e.key {
             Key::Escape => {
                 s.close_palette();
                 true
             }
             Key::Up => {
-                move_palette(s, -1);
+                move_palette(s, -1, tx);
                 true
             }
             Key::Down => {
-                move_palette(s, 1);
+                move_palette(s, 1, tx);
                 true
             }
             _ => false,
         });
 
+    let q = s.palette_query.text.trim();
+    let searching = !q.is_empty() && s.search_snapshot_query != q;
     let item_count = items.len();
     let mut list = col().w_full().gap(2.0).padding(8.0);
     if items.is_empty() {
-        list = list.child(text("No matching projects, actions, or updates").font(style::META).color(p.text_3).padding(12.0));
+        let msg = if searching { "Searching…" } else { "No matching projects, actions, or updates" };
+        list = list.child(text(msg).font(style::META).color(p.text_3).padding(12.0));
     } else {
         for (i, item) in items.into_iter().enumerate() {
             let active = i == selected;
@@ -890,9 +917,15 @@ pub fn palette(s: &State, p: &Palette, _k: &Kit) -> Option<El> {
             row_el = row_el.child(text(item.subtitle).font(style::META).color(p.text_3).truncate());
             list = list.child(row_el);
         }
+        if searching {
+            list = list.child(row().w_full().px(10.0).py(6.0).child(text("Searching…").font(style::META).color(p.text_3)));
+        }
     }
 
-    let list_h = if item_count == 0 { 56.0 } else { (14.0 + item_count as f32 * 38.0).min(380.0) };
+    let top_pad = (s.window_size[1] * 0.12).clamp(24.0, 96.0);
+    let max_list_h = (s.window_size[1] - top_pad - 76.0).clamp(120.0, 380.0);
+    let rows_total = item_count + usize::from(searching && item_count > 0);
+    let list_h = if rows_total == 0 { 56.0 } else { (14.0 + rows_total as f32 * 38.0).min(max_list_h) };
 
     let panel = col()
         .key("palette-panel")
@@ -915,7 +948,7 @@ pub fn palette(s: &State, p: &Palette, _k: &Kit) -> Option<El> {
             .absolute(0.0, 0.0)
             .w_full()
             .h_full()
-            .pt(96.0)
+            .pt(top_pad)
             .items_center()
             .fill(p.scrim)
             .transition(Transition::opacity())
@@ -940,6 +973,20 @@ pub fn toasts(s: &State, k: &Kit) -> Option<El> {
                 t = t.icon(k, k.glyph.check).action(k, "Undo", true, move |s: &mut State, _tx: &mut Tx| {
                     s.dismiss_toast(tid);
                     s.set_archived_inner(project_id, was_archived, false);
+                });
+            }
+            ToastKind::UndoNoteArchive { page_id, was_archived } => {
+                t = t.icon(k, k.glyph.check).action(k, "Undo", true, move |s: &mut State, _tx: &mut Tx| {
+                    s.dismiss_toast(tid);
+                    let standing = if was_archived { Standing::Archived } else { Standing::Current };
+                    if let Some(page) = s.notebook.pages.iter_mut().find(|p| p.id == page_id) {
+                        page.standing = standing;
+                    }
+                    s.notebook.open = Some(page_id);
+                    s.notebook.sync_tree();
+                    if let Some(w) = &s.watcher {
+                        w.notebook(crate::watch::NotebookOp::SetStanding(page_id, standing));
+                    }
                 });
             }
             ToastKind::UndoDismiss { update_id } => {
@@ -1115,7 +1162,8 @@ pub fn settings(s: &State, p: &Palette, k: &Kit, layer: &mut Vec<El>) {
                 "Connected Tools",
                 "Tools connected here can post updates to Feeder and read the Library. This doesn’t give Curator your subscription.",
             ))
-            .child(agents_section(s, p, k)),
+            .child(agents_section(s, p, k))
+            .child(cli_section(s, p, k)),
         SettingsPage::Curator => curator_settings::pane(s, p, k, &mut pops),
         SettingsPage::Storage => col()
             .w_full()
@@ -1276,7 +1324,7 @@ fn agent_row(s: &State, p: &Palette, k: &Kit, tool: Tool, link: &Link) -> El {
         Link::Connected => action("Disconnect", ButtonVariant::GhostMuted, false),
         Link::Missing => action("Connect", ButtonVariant::Outline, true),
         Link::Outdated => action("Update", ButtonVariant::Outline, true),
-        Link::Failed(_) => action("Try again", ButtonVariant::Outline, true),
+        Link::Failed { action: failed_action, .. } => action("Try Again", ButtonVariant::Outline, *failed_action == ToolAction::Connect),
         Link::Connecting => busy("Connecting…"),
         Link::Disconnecting => busy("Disconnecting…"),
     };
@@ -1286,7 +1334,9 @@ fn agent_row(s: &State, p: &Palette, k: &Kit, tool: Tool, link: &Link) -> El {
             Some(row().gap(6.0).center_y().child(el().size(6.0, 6.0).radius(3.0).fill(p.live)).child(status("Connected".into(), p.text_2)))
         }
         Link::Outdated => Some(row().child(status("Set up for another copy of Feeder".into(), p.text_3))),
-        Link::Failed(why) => Some(row().min_w(0.0).child(status(format!("Couldn't change it: {why}"), k.c.danger.fg).help(why.clone()))),
+        Link::Failed { reason, .. } => {
+            Some(row().min_w(0.0).child(status(format!("Couldn’t change it: {reason}"), k.c.danger.fg).help(reason.clone())))
+        }
         _ => None,
     };
     let mut words = col().grow(1.0).min_w(0.0).gap(2.0).child(text(tool.name()).font(style::NAME).color(p.text).truncate());
@@ -1304,13 +1354,60 @@ fn agent_row(s: &State, p: &Palette, k: &Kit, tool: Tool, link: &Link) -> El {
         .child(control)
 }
 
+fn cli_section(s: &State, p: &Palette, k: &Kit) -> El {
+    let install_btn = |label: &str| {
+        Button::new(label.to_string())
+            .variant(ButtonVariant::Outline)
+            .control_size(ControlSize::Small)
+            .on_press(|s: &mut State| {
+                let wake = s.wake.clone();
+                s.agents.install_cli(wake.as_ref());
+            })
+            .build(k)
+            .key("cli-install")
+    };
+    let busy = |t: &str| text(t.to_string()).font(style::META).color(p.text_3);
+    let (subtitle, subtitle_color, dot, control): (String, rune::Color, bool, El) = match &s.agents.cli {
+        CliStatus::Checking => ("Checking this Mac…".into(), p.text_3, false, busy("Checking…")),
+        CliStatus::Installed { path, on_path: true } => {
+            (format!("Installed at {}", style::home_relative(path)), p.text_2, true, busy("Installed"))
+        }
+        CliStatus::Installed { path, on_path: false } => (
+            format!("Found at {}, not in your PATH", style::home_relative(path)),
+            p.text_3,
+            false,
+            install_btn("Install Command Line Tool"),
+        ),
+        CliStatus::NotInstalled => {
+            ("Lets scripts and tools run feeder from the terminal".into(), p.text_3, false, install_btn("Install Command Line Tool"))
+        }
+        CliStatus::Installing => ("Linking feeder into ~/.local/bin…".into(), p.text_3, false, busy("Installing…")),
+        CliStatus::Failed(reason) => (format!("Couldn’t install it: {reason}"), k.c.danger.fg, false, install_btn("Try Again")),
+    };
+    let mut detail = row().gap(6.0).center_y();
+    if dot {
+        detail = detail.child(el().size(6.0, 6.0).radius(3.0).fill(p.live));
+    }
+    detail = detail.child(text(subtitle).font(style::META).color(subtitle_color).truncate());
+    let cli_row = row()
+        .key("settings-cli-row")
+        .w_full()
+        .min_h(36.0)
+        .gap(12.0)
+        .center_y()
+        .child(col().grow(1.0).min_w(0.0).gap(2.0).child(text("feeder").font(style::NAME).color(p.text)).child(detail))
+        .child(control);
+    section(p, "Command line tool", vec![cli_row])
+}
+
 fn uninstall_section(s: &State, p: &Palette, k: &Kit) -> El {
     let note = |t: &str| text(t.to_string()).font(style::META).color(p.text_3).wrap();
     let any_connected = s.agents.rows.iter().flatten().any(|(_, l)| matches!(l, Link::Connected | Link::Outdated | Link::Disconnecting));
+    let any_failed = s.agents.rows.iter().flatten().any(|(_, l)| matches!(l, Link::Failed { .. }));
     let mut rows = vec![note(
         "Removing Feeder from your tools deletes its MCP server and skills from their settings. Each file keeps a .feeder-backup copy.",
     )];
-    if s.agents.uninstalled && !any_connected {
+    if s.agents.uninstalled && !any_connected && !any_failed {
         rows.push(note("Feeder is out of your tools. Quit Feeder and move it to the Trash. To delete your projects and library too, delete the data folder above."));
     } else {
         rows.push(

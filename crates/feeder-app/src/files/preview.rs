@@ -10,12 +10,12 @@ use rune::{Direction, El, GrowthSpec, Image, ImageCache, ScrollSpec, Span, Surfa
 use rune_kit::syntax::{self, Paint, SyntaxTheme};
 use rune_kit::{Button, ButtonVariant, ControlSize, Kit, scroll_bar};
 
-use crate::State;
 use crate::style::{self, Palette};
+use crate::{CopyTarget, State};
 
 const CODE_LINE_H: f32 = 20.0;
-const CODE_FONT_SIZE: f32 = 12.5;
-const GUTTER_FONT_SIZE: f32 = 11.5;
+const CODE_FONT_SIZE: f32 = style::META.size;
+const GUTTER_FONT_SIZE: f32 = style::META.size;
 const MONO_ADVANCE: f32 = 7.6;
 const MAX_LINE_BYTES: usize = 4096;
 const WRAP_PAGE_LINES: usize = 500;
@@ -26,12 +26,17 @@ pub(super) struct Preview {
     sequence: u64,
     selected: Option<Selected>,
     wrap: bool,
-    copied_until: Option<(u64, i64)>,
+}
+
+enum PreparedPreview {
+    Text(CodeDoc),
+    Image(Vec<u8>),
+    Notice(&'static str),
 }
 
 struct Worker {
     requests: Sender<Request>,
-    results: Receiver<(u64, io::Result<FilePreview>)>,
+    results: Receiver<(u64, PreparedPreview)>,
 }
 
 struct Request {
@@ -176,10 +181,10 @@ impl Preview {
     pub(super) fn poll(&mut self, images: Option<&ImageCache>) -> bool {
         let latest = self.worker.as_ref().and_then(|w| w.results.try_iter().find(|(seq, _)| *seq == self.sequence));
         let Some(selected) = &mut self.selected else { return false };
-        if let Some((_, result)) = latest {
-            selected.content = match result {
-                Ok(FilePreview::Text(source)) => Content::Text(CodeDoc::from_source(&selected.path, source)),
-                Ok(FilePreview::Image(bytes)) => {
+        if let Some((_, prepared)) = latest {
+            selected.content = match prepared {
+                PreparedPreview::Text(doc) => Content::Text(doc),
+                PreparedPreview::Image(bytes) => {
                     let Some(images) = images else {
                         selected.content = Content::Notice("Couldn’t display this image.");
                         return true;
@@ -191,10 +196,7 @@ impl Preview {
                     let ready = image.is_ready();
                     Content::Image { image, ready }
                 }
-                Ok(FilePreview::Unsupported) => Content::Notice("This file type can’t be previewed."),
-                Ok(FilePreview::TooLarge) => Content::Notice("This file is too large to preview."),
-                Err(err) if err.kind() == io::ErrorKind::NotFound => Content::Notice("This file is no longer in the project."),
-                Err(_) => Content::Notice("Couldn’t open this file."),
+                PreparedPreview::Notice(msg) => Content::Notice(msg),
             };
             return true;
         }
@@ -225,10 +227,6 @@ impl Preview {
             _ => "",
         }
     }
-
-    fn is_copied(&self, now: i64) -> bool {
-        self.copied_until.is_some_and(|(seq, until)| seq == self.sequence && now <= until)
-    }
 }
 
 impl Worker {
@@ -238,8 +236,15 @@ impl Worker {
         let _ = std::thread::Builder::new().name("feeder-file-preview".into()).spawn(move || {
             while let Ok(first) = inbox.recv() {
                 let request = inbox.try_iter().last().unwrap_or(first);
-                let result = read_file_preview(&request.root, Path::new(&request.path));
-                if out.send((request.sequence, result)).is_err() {
+                let prepared = match read_file_preview(&request.root, Path::new(&request.path)) {
+                    Ok(FilePreview::Text(source)) => PreparedPreview::Text(CodeDoc::from_source(&request.path, source)),
+                    Ok(FilePreview::Image(bytes)) => PreparedPreview::Image(bytes),
+                    Ok(FilePreview::Unsupported) => PreparedPreview::Notice("This file type can’t be previewed."),
+                    Ok(FilePreview::TooLarge) => PreparedPreview::Notice("This file is too large to preview."),
+                    Err(err) if err.kind() == io::ErrorKind::NotFound => PreparedPreview::Notice("This file is no longer in the project."),
+                    Err(_) => PreparedPreview::Notice("Couldn’t open this file."),
+                };
+                if out.send((request.sequence, prepared)).is_err() {
                     break;
                 }
                 if let Some(wake) = &wake {
@@ -286,14 +291,15 @@ pub(super) fn view(s: &State, p: &Palette, k: &Kit) -> Option<El> {
             .on_press(|s: &mut State| s.files.preview.toggle_wrap())
             .build(k)
             .key("file-preview-wrap");
-        let copied = preview.is_copied(s.now);
+        let copied = s.is_copied(CopyTarget::FilePreview(preview.sequence));
         let copy_btn = Button::new(if copied { "Copied" } else { "Copy" })
             .variant(ButtonVariant::GhostMuted)
             .control_size(ControlSize::Small)
             .on_press_tx(|s: &mut State, tx: &mut Tx| {
                 if let Some(Selected { content: Content::Text(doc), .. }) = &s.files.preview.selected {
+                    let seq = s.files.preview.sequence;
                     tx.copy(doc.source.clone());
-                    s.files.preview.copied_until = Some((s.files.preview.sequence, s.now + 2));
+                    s.mark_copied(CopyTarget::FilePreview(seq));
                 }
             })
             .build(k)

@@ -134,6 +134,7 @@ struct Inner {
     recording: Mutex<Recorder>,
     send_lock: Mutex<()>,
     last_reply: Mutex<String>,
+    claude_busy: AtomicBool,
     stopping: AtomicBool,
     ended: AtomicBool,
 }
@@ -174,12 +175,13 @@ impl Session {
 
     pub fn start_curator_chat(
         backend: Backend,
-        env: SessionEnv,
+        mut env: SessionEnv,
         scope: Scope,
         mode: SessionMode,
         opening: ChatOpening<'_>,
         sink: impl Fn(Event) + Send + Sync + 'static,
     ) -> Result<Session> {
+        env.run.effort = env.run.effort.map(|e| e.trim().to_ascii_lowercase()).filter(|e| !e.is_empty());
         env.run.validate()?;
         if !env.feeder.is_file() {
             return Err(Error::NotFound("Curator couldn't find the Feeder CLI. Reinstall Feeder and try again.".into()));
@@ -206,6 +208,7 @@ impl Session {
             recording: Mutex::new(Recorder::new(store, run_id)),
             send_lock: Mutex::new(()),
             last_reply: Mutex::new(String::new()),
+            claude_busy: AtomicBool::new(backend == Backend::ClaudeCode),
             stopping: AtomicBool::new(false),
             ended: AtomicBool::new(false),
         });
@@ -237,16 +240,26 @@ impl Session {
     pub fn send(&self, text: &str) -> Result<()> {
         let _send = lock(&self.inner.send_lock);
         if self.inner.stopping.load(Ordering::Acquire) || self.inner.ended.load(Ordering::SeqCst) {
-            return Err(Error::Invalid("this gardener session has ended; start a new one".into()));
+            return Err(Error::Invalid("this Curator session has ended; start a new one".into()));
         }
         let sent = match self.backend {
             Backend::ClaudeCode => {
-                self.inner.record_user(text)?;
-                self.inner.send_claude(text)
+                if self.inner.claude_busy.swap(true, Ordering::AcqRel) {
+                    return Err(Error::Invalid("Curator is still answering".into()));
+                }
+                if let Err(e) = self.inner.record_user(text) {
+                    self.inner.claude_busy.store(false, Ordering::Release);
+                    return Err(e);
+                }
+                let res = self.inner.send_claude(text);
+                if res.is_err() {
+                    self.inner.claude_busy.store(false, Ordering::Release);
+                }
+                res
             }
             Backend::Codex => {
                 if lock(&self.inner.child).is_some() {
-                    return Err(Error::Invalid("the gardener is still answering".into()));
+                    return Err(Error::Invalid("Curator is still answering".into()));
                 }
                 let bin = self.backend.binary().ok_or_else(|| Error::NotFound(format!("{} isn't installed", self.backend.label())))?;
                 self.inner.record_user(text)?;
@@ -327,7 +340,7 @@ impl Inner {
         let servers = json!([]);
         let (pipes, monitor) = self.spawn_provider(cmd, true, None)?;
         let stdout = pipes.stdout.ok_or_else(|| Error::Invalid("The provider has no ACP output".into()))?;
-        let opening = format!("{}\n\n{opening}", self.mode.instructions());
+        let opening = opening.to_string();
         let inner = Arc::clone(self);
         let worker = std::thread::Builder::new().name("feeder-curator-acp".into()).spawn(move || {
             let errors = pipes.stderr.map(|stderr| std::thread::spawn(move || stderr_tail(stderr)));
@@ -483,21 +496,48 @@ impl Inner {
             let mut turn_done = false;
             let mut stream_error: Option<String> = None;
             let mut needs_sign_in = false;
-            for line in pipes.stdout.into_iter().flat_map(|out| BufReader::new(out).lines().map_while(std::io::Result::ok)) {
-                let events = parse(&line, &mut lock(&inner.state));
-                for event in events {
-                    match &event {
-                        Event::TurnFinished => {
-                            turn_done = true;
-                            if inner.backend == Backend::Codex {
-                                continue;
-                            }
-                        }
-                        Event::Failed(why) => stream_error = Some(why.clone()),
-                        Event::NeedsSignIn => needs_sign_in = true,
-                        _ => {}
+            if let Some(out) = pipes.stdout {
+                let mut reader = BufReader::new(out);
+                let mut buf = Vec::new();
+                loop {
+                    buf.clear();
+                    let Ok(n) = (&mut reader).take(ACP_FRAME_BYTES + 1).read_until(b'\n', &mut buf) else { break };
+                    if n == 0 {
+                        break;
                     }
-                    inner.forward(event);
+                    if u64::try_from(n).unwrap_or(u64::MAX) > ACP_FRAME_BYTES {
+                        let msg = "A provider message exceeded the Curator size limit".to_string();
+                        stream_error = Some(msg.clone());
+                        inner.claude_busy.store(false, Ordering::Release);
+                        inner.forward(Event::Failed(msg));
+                        break;
+                    }
+                    while matches!(buf.last(), Some(b'\n' | b'\r')) {
+                        buf.pop();
+                    }
+                    let line = String::from_utf8_lossy(&buf);
+                    let events = parse(&line, &mut lock(&inner.state));
+                    for event in events {
+                        match &event {
+                            Event::TurnFinished => {
+                                turn_done = true;
+                                inner.claude_busy.store(false, Ordering::Release);
+                                if inner.backend == Backend::Codex {
+                                    continue;
+                                }
+                            }
+                            Event::Failed(why) => {
+                                stream_error = Some(why.clone());
+                                inner.claude_busy.store(false, Ordering::Release);
+                            }
+                            Event::NeedsSignIn => {
+                                needs_sign_in = true;
+                                inner.claude_busy.store(false, Ordering::Release);
+                            }
+                            _ => {}
+                        }
+                        inner.forward(event);
+                    }
                 }
             }
             let status = process_status(monitor);
@@ -602,12 +642,31 @@ impl Inner {
     }
 
     fn monitor(&self, id: u32, timeout: Option<Duration>) -> std::io::Result<Option<ExitStatus>> {
+        let Some(limit) = timeout else {
+            loop {
+                match wait_child_exit(id) {
+                    Ok(()) => break,
+                    Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {
+                        if self.stopping.load(Ordering::Acquire) {
+                            return Ok(None);
+                        }
+                    }
+                    Err(error) if error.raw_os_error() == Some(libc::ECHILD) => return Ok(None),
+                    Err(error) => return Err(error),
+                }
+            }
+            let mut slot = lock(&self.child);
+            let Some(child) = slot.as_mut().filter(|child| child.id() == id) else { return Ok(None) };
+            let status = terminate_child(child);
+            *slot = None;
+            return status.map(Some);
+        };
         let started = Instant::now();
         loop {
             {
                 let mut slot = lock(&self.child);
                 let Some(child) = slot.as_mut().filter(|child| child.id() == id) else { return Ok(None) };
-                if timeout.is_some_and(|limit| started.elapsed() >= limit) {
+                if started.elapsed() >= limit {
                     let _ = terminate_child(child);
                     *slot = None;
                     return Err(std::io::Error::new(std::io::ErrorKind::TimedOut, "provider startup timed out"));
@@ -652,6 +711,12 @@ impl Inner {
 
 fn process_status(monitor: ProcessMonitor) -> std::io::Result<Option<ExitStatus>> {
     monitor.join().map_err(|_| std::io::Error::other("provider monitor stopped unexpectedly"))?
+}
+
+fn wait_child_exit(id: u32) -> std::io::Result<()> {
+    let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
+    let result = unsafe { libc::waitid(libc::P_PID, id, &mut info, libc::WEXITED | libc::WNOWAIT) };
+    if result == 0 { Ok(()) } else { Err(std::io::Error::last_os_error()) }
 }
 
 pub(super) fn child_exited(id: u32) -> std::io::Result<bool> {

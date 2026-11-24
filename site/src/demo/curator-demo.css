@@ -17,7 +17,7 @@
     top: 16px;
     left: 16px;
     width: 400px;
-    height: 360px;
+    height: 460px;
   }
 
   .cd2-tools {
@@ -195,7 +195,14 @@
   .cd2-note__title {
     color: var(--ss-text-strong);
     font-size: 13.5px;
-    font-weight: 600;
+    font-weight: 500;
+  }
+
+  .cd2-note__actions {
+    display: inline-flex;
+    flex: none;
+    align-items: center;
+    gap: 6px;
   }
 
   .cd2-revert {

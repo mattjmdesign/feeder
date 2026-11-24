@@ -6,8 +6,8 @@ use std::time::{Duration, Instant};
 
 use feeder_core::gardener::{Backend, ChatSummary, Run, RunStatus};
 use feeder_core::{
-    Change, FeedUpdate, Flag, FlagStatus, GARDENER, HUMAN_AUTHOR, OnSimilar, Page, PageDraft, PageFilter, ProjectSummary, Proposal, Reply,
-    Settings, Standing, Store, WorkingTree, now_ms, read_working_tree,
+    Change, FeedReviewStatus, FeedUpdate, Flag, FlagStatus, GARDENER, HUMAN_AUTHOR, OnSimilar, Page, PageDraft, PageFilter, ProjectSummary,
+    Proposal, Reply, Settings, Standing, Store, WorkingTree, now_ms, read_working_tree,
 };
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
@@ -37,6 +37,7 @@ enum Msg {
     SaveSettings(Settings),
     Notebook(NotebookOp),
     Timeline(usize),
+    CuratorChat(Option<i64>),
 }
 
 #[derive(Clone, Debug)]
@@ -44,6 +45,8 @@ pub enum FailedWrite {
     Reply { update_id: i64, body: String },
     EditUpdate { update_id: i64, body: String },
     Brief { project_id: i64, body: Option<String> },
+    CreatePage(PageDraft),
+    RevisePage { id: i64, draft: PageDraft },
 }
 
 pub enum NotebookOp {
@@ -64,6 +67,7 @@ pub struct GardenerView {
     pub changes: Vec<Change>,
     pub proposals: Vec<Proposal>,
     pub open_flags: Vec<Flag>,
+    pub open_flag_count: usize,
     pub last_run: Option<Run>,
     pub running: Option<Run>,
     pub chats: Vec<ChatSummary>,
@@ -72,11 +76,31 @@ pub struct GardenerView {
 
 const GARDENER_LIST: usize = 30;
 
-fn gardener_view(s: &Store, backends: &[Backend]) -> feeder_core::Result<GardenerView> {
+fn gardener_view(s: &Store, backends: &[Backend], chat_run: Option<i64>) -> feeder_core::Result<GardenerView> {
+    let mut changes = s.changes(Some(GARDENER), None, GARDENER_LIST)?;
+    let mut proposals = s.curator_proposals(GARDENER_LIST)?;
+    for p in s.pending_curator_proposals(100)? {
+        if !proposals.iter().any(|existing| existing.id == p.id) {
+            proposals.push(p);
+        }
+    }
+    if let Some(run_id) = chat_run {
+        for p in s.curator_proposals_for_chat(run_id)? {
+            if !proposals.iter().any(|existing| existing.id == p.id) {
+                proposals.push(p);
+            }
+        }
+        for c in s.curator_changes_for_chat(run_id)? {
+            if !changes.iter().any(|existing| existing.id == c.id) {
+                changes.push(c);
+            }
+        }
+    }
     Ok(GardenerView {
-        changes: s.changes(Some(GARDENER), None, GARDENER_LIST)?,
-        proposals: s.curator_proposals(GARDENER_LIST)?,
+        changes,
+        proposals,
         open_flags: s.flags(Some(FlagStatus::Open), GARDENER_LIST)?,
+        open_flag_count: s.open_flag_count()?,
         last_run: s.gardener_runs(1)?.into_iter().find(|r| r.status != RunStatus::Running),
         running: s.running_gardener()?,
         chats: s.curator_chats(GARDENER_LIST)?,
@@ -91,6 +115,7 @@ pub struct Snapshot {
     pub timeline: Vec<FeedUpdate>,
     pub timeline_limit: usize,
     pub replies: HashMap<i64, Vec<Reply>>,
+    pub review_statuses: HashMap<i64, FeedReviewStatus>,
     pub search_query: String,
     pub search_hits: Vec<FeedUpdate>,
     pub pages: Option<Vec<Page>>,
@@ -98,6 +123,7 @@ pub struct Snapshot {
     pub agent_apps: Vec<(String, PathBuf)>,
     pub error: Option<String>,
     pub mutation_error: Option<String>,
+    pub created_page: Option<i64>,
     pub failed_writes: Vec<FailedWrite>,
 }
 
@@ -160,6 +186,7 @@ impl Watcher {
                 let mut files_refresh = FilesRefresh::default();
                 let mut search_query = String::new();
                 let mut timeline_limit = TIMELINE_PAGE;
+                let mut curator_chat: Option<i64> = None;
                 let mut apps: HashMap<String, Option<PathBuf>> = Default::default();
                 let mut seen: Option<i64> = None;
                 let mut last_notebook_stamp: Option<(i64, i64, i64, i64)> = None;
@@ -179,6 +206,7 @@ impl Watcher {
                     let mut new_replies = Vec::new();
                     let mut notebook_ops = Vec::new();
                     let mut mutation_error: Option<String> = None;
+                    let mut created_page: Option<i64> = None;
                     let mut failed_writes = Vec::new();
                     let poll_interval = if want.visible { Duration::from_millis(400) } else { Duration::from_secs(2) };
                     match rx.recv_timeout(poll_interval) {
@@ -191,6 +219,7 @@ impl Watcher {
                                     }
                                     Msg::Search(q) => search_query = q,
                                     Msg::Timeline(n) => timeline_limit = timeline_limit.max(n),
+                                    Msg::CuratorChat(run_id) => curator_chat = run_id,
                                     Msg::Rename(id, name) => renames.push((id, name)),
                                     Msg::SetBrief(id, brief) => briefs.push((id, brief)),
                                     Msg::SetArchived(id, archived) => archives.push((id, archived)),
@@ -227,6 +256,13 @@ impl Watcher {
                                 for (update_id, body) in new_replies {
                                     failed_writes.push(FailedWrite::Reply { update_id, body });
                                 }
+                                for op in notebook_ops {
+                                    match op {
+                                        NotebookOp::Create(draft) => failed_writes.push(FailedWrite::CreatePage(draft)),
+                                        NotebookOp::Revise(id, draft) => failed_writes.push(FailedWrite::RevisePage { id, draft }),
+                                        _ => {}
+                                    }
+                                }
                                 publish(
                                     &slot,
                                     &wake,
@@ -237,6 +273,7 @@ impl Watcher {
                                         timeline: vec![],
                                         timeline_limit,
                                         replies: HashMap::new(),
+                                        review_statuses: HashMap::new(),
                                         search_query: search_query.clone(),
                                         search_hits: vec![],
                                         pages: None,
@@ -244,6 +281,7 @@ impl Watcher {
                                         agent_apps: vec![],
                                         error: Some(e.to_string()),
                                         mutation_error,
+                                        created_page,
                                         failed_writes,
                                     },
                                 );
@@ -310,8 +348,23 @@ impl Watcher {
                     }
                     for op in notebook_ops {
                         let res = match op {
-                            NotebookOp::Create(draft) => s.create_page(draft, "You", None, OnSimilar::Allow).map(|_| ()),
-                            NotebookOp::Revise(id, draft) => s.revise_page(id, draft, "You").map(|_| ()),
+                            NotebookOp::Create(draft) => match s.create_page(draft.clone(), "You", None, OnSimilar::Allow) {
+                                Ok(page) => {
+                                    created_page = Some(page.id);
+                                    Ok(())
+                                }
+                                Err(e) => {
+                                    failed_writes.push(FailedWrite::CreatePage(draft));
+                                    Err(e)
+                                }
+                            },
+                            NotebookOp::Revise(id, draft) => match s.revise_page(id, draft.clone(), "You") {
+                                Ok(_) => Ok(()),
+                                Err(e) => {
+                                    failed_writes.push(FailedWrite::RevisePage { id, draft });
+                                    Err(e)
+                                }
+                            },
                             NotebookOp::ToggleTask(id, task_index, checked) => s.toggle_page_task(id, task_index, checked).map(|_| ()),
                             NotebookOp::SetStanding(id, standing) => s.set_page_standing(id, standing),
                             NotebookOp::Delete(id) => s.delete_page(id),
@@ -349,17 +402,18 @@ impl Watcher {
                         ids.sort_unstable();
                         ids.dedup();
                         let flat_replies = s.replies_for_updates(&ids)?;
+                        let review_statuses = s.feed_review_statuses(&ids)?;
                         let mut replies: HashMap<i64, Vec<Reply>> = HashMap::new();
                         for r in flat_replies {
                             replies.entry(r.update_id).or_default().push(r);
                         }
                         let pages =
                             if need_pages { Some(s.pages(&PageFilter { include_archived: true, ..PageFilter::default() })?) } else { None };
-                        let gardener = gardener_view(s, &backends)?;
-                        Ok((projects, feed, timeline, replies, search_hits, pages, gardener))
+                        let gardener = gardener_view(s, &backends, curator_chat)?;
+                        Ok((projects, feed, timeline, replies, review_statuses, search_hits, pages, gardener))
                     });
                     let snapshot = match loaded {
-                        Ok((projects, feed, timeline, replies, search_hits, pages, gardener)) => {
+                        Ok((projects, feed, timeline, replies, review_statuses, search_hits, pages, gardener)) => {
                             if pages.is_some() {
                                 last_notebook_stamp = nb_stamp;
                             }
@@ -388,6 +442,7 @@ impl Watcher {
                                 timeline,
                                 timeline_limit,
                                 replies,
+                                review_statuses,
                                 search_query: search_query.clone(),
                                 search_hits,
                                 pages,
@@ -395,6 +450,7 @@ impl Watcher {
                                 agent_apps,
                                 error: None,
                                 mutation_error,
+                                created_page,
                                 failed_writes,
                             }
                         }
@@ -407,6 +463,7 @@ impl Watcher {
                                 timeline: vec![],
                                 timeline_limit,
                                 replies: HashMap::new(),
+                                review_statuses: HashMap::new(),
                                 search_query: search_query.clone(),
                                 search_hits: vec![],
                                 pages: None,
@@ -414,6 +471,7 @@ impl Watcher {
                                 agent_apps: vec![],
                                 error: Some(e.to_string()),
                                 mutation_error,
+                                created_page,
                                 failed_writes,
                             }
                         }
@@ -482,6 +540,10 @@ impl Watcher {
         self.tx.send(Msg::Timeline(n)).ok();
     }
 
+    pub fn curator_chat(&self, run_id: Option<i64>) {
+        self.tx.send(Msg::CuratorChat(run_id)).ok();
+    }
+
     pub fn notebook(&self, op: NotebookOp) {
         self.tx.send(Msg::Notebook(op)).ok();
     }
@@ -499,8 +561,24 @@ impl Watcher {
     }
 }
 
-fn publish(slot: &Mutex<Option<Snapshot>>, wake: &rune::Waker, snapshot: Snapshot) {
+fn publish(slot: &Mutex<Option<Snapshot>>, wake: &rune::Waker, mut snapshot: Snapshot) {
     if let Ok(mut s) = slot.lock() {
+        if let Some(prev) = s.take() {
+            if snapshot.pages.is_none() {
+                snapshot.pages = prev.pages;
+            }
+            if snapshot.mutation_error.is_none() {
+                snapshot.mutation_error = prev.mutation_error;
+            }
+            if snapshot.created_page.is_none() {
+                snapshot.created_page = prev.created_page;
+            }
+            if !prev.failed_writes.is_empty() {
+                let mut merged = prev.failed_writes;
+                merged.extend(snapshot.failed_writes);
+                snapshot.failed_writes = merged;
+            }
+        }
         *s = Some(snapshot);
     }
     wake();
@@ -560,5 +638,45 @@ mod tests {
         );
         files.select(Want { project: Some(2), files: true, ..Want::default() });
         assert_eq!(files.poll(at(32), |_| Some(sample.clone())), Some((2, sample)));
+    }
+
+    #[test]
+    fn publish_merges_unconsumed_pages_errors_created_page_and_failed_writes() {
+        let slot = Mutex::new(None);
+        let wake: rune::Waker = Arc::new(|| {});
+        let make = || Snapshot {
+            projects: vec![],
+            want: Want::default(),
+            feed: vec![],
+            timeline: vec![],
+            timeline_limit: TIMELINE_PAGE,
+            replies: HashMap::new(),
+            review_statuses: HashMap::new(),
+            search_query: String::new(),
+            search_hits: vec![],
+            pages: None,
+            gardener: None,
+            agent_apps: vec![],
+            error: None,
+            mutation_error: None,
+            created_page: None,
+            failed_writes: vec![],
+        };
+        let mut first = make();
+        first.pages = Some(vec![]);
+        first.mutation_error = Some("oops".into());
+        first.created_page = Some(42);
+        first.failed_writes.push(FailedWrite::CreatePage(PageDraft::new("T", "B")));
+        publish(&slot, &wake, first);
+
+        let mut second = make();
+        second.failed_writes.push(FailedWrite::Brief { project_id: 1, body: None });
+        publish(&slot, &wake, second);
+
+        let merged = slot.lock().unwrap().take().unwrap();
+        assert!(merged.pages.is_some());
+        assert_eq!(merged.mutation_error.as_deref(), Some("oops"));
+        assert_eq!(merged.created_page, Some(42));
+        assert_eq!(merged.failed_writes.len(), 2);
     }
 }

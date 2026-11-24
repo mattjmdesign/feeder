@@ -79,6 +79,9 @@ pub enum NotebookCmd {
         #[arg(help = "The project it came from. Defaults to the current folder's project, if it has a feed.")]
         #[arg(short, long)]
         project: Option<String>,
+        #[arg(help = "Save as a shared cross-project note instead of linking it to the current folder's project.")]
+        #[arg(long, conflicts_with_all = ["id", "project"])]
+        shared: bool,
         #[arg(help = "File it even if a similar page exists (only for a genuinely different note).")]
         #[arg(long)]
         new: bool,
@@ -123,14 +126,15 @@ pub fn run(store: &Store, cmd: Option<NotebookCmd>, author: &str) -> Result<(), 
             let query = query.join(" ");
             let hits = store.search_pages(&query, &filter, limit).map_err(|e| e.to_string())?;
             if json {
-                println!("{}", json!({ "query": query, "pages": hits.iter().map(|p| page_json(store, p)).collect::<Vec<_>>() }));
+                let pages = pages_json(store, &hits)?;
+                println!("{}", json!({ "query": query, "pages": pages }));
             } else if hits.is_empty() {
-                println!("Nothing in the notebook matches “{query}”.");
+                println!("Nothing in the Library matches “{query}”.");
             } else {
                 for p in &hits {
                     println!("{}", p.summary_line());
                 }
-                println!("\nOpen one: feeder notebook show <id>");
+                println!("\nOpen one: feeder library show <id>");
             }
         }
         NotebookCmd::List { kind, topic, tag, project, all, json } => {
@@ -141,10 +145,10 @@ pub fn run(store: &Store, cmd: Option<NotebookCmd>, author: &str) -> Result<(), 
             let filter = PageFilter { kind: parse_kind(kind)?, topic, tag, project_id, include_archived: all };
             let pages = store.pages(&filter).map_err(|e| e.to_string())?;
             if json {
-                println!("{}", Value::Array(pages.iter().map(|p| page_json(store, p)).collect()));
+                println!("{}", Value::Array(pages_json(store, &pages)?));
             } else if pages.is_empty() {
                 println!(
-                    "The notebook is empty so far. Write a note in Feeder or via `feeder notebook write`; `feeder notebook guide` explains how."
+                    "The Library is empty so far. Write a note in Feeder or via `feeder library write`; `feeder library guide` explains how."
                 );
             } else {
                 for p in &pages {
@@ -154,14 +158,15 @@ pub fn run(store: &Store, cmd: Option<NotebookCmd>, author: &str) -> Result<(), 
             }
         }
         NotebookCmd::Show { id, json } => {
-            let page = store.page(id).map_err(|e| e.to_string())?.ok_or(format!("no notebook page {id}"))?;
+            let page = store.page(id).map_err(|e| e.to_string())?.ok_or(format!("no Library note {id}"))?;
+            let project = project_name(store, &page);
             if json {
-                println!("{}", page_json(store, &page));
+                println!("{}", page_json_with(&page, project.as_deref()));
             } else {
-                print!("{}", page.to_markdown(project_name(store, &page).as_deref(), now));
+                print!("{}", page.to_markdown(project.as_deref(), now));
             }
         }
-        NotebookCmd::Write { id, kind, topic, title, tags, body, file, what, why, rule, project, new, agent, json } => {
+        NotebookCmd::Write { id, kind, topic, title, tags, body, file, what, why, rule, project, shared, new, agent, json } => {
             let kind = parse_kind(kind)?.unwrap_or(Kind::Note);
             let draft = if let Some(path) = file {
                 let text = std::fs::read_to_string(&path).map_err(|e| format!("can't read {}: {e}", path.display()))?;
@@ -188,7 +193,7 @@ pub fn run(store: &Store, cmd: Option<NotebookCmd>, author: &str) -> Result<(), 
             let page = match id {
                 Some(id) => store.revise_page(id, draft, &author),
                 None => {
-                    let project_id = origin_project(store, project.as_deref())?;
+                    let project_id = if shared { None } else { origin_project(store, project.as_deref())? };
                     let on_similar = if new { OnSimilar::Allow } else { OnSimilar::Refuse };
                     store.create_page(draft, &author, project_id, on_similar)
                 }
@@ -198,7 +203,7 @@ pub fn run(store: &Store, cmd: Option<NotebookCmd>, author: &str) -> Result<(), 
                 println!("{}", page_json(store, &page));
             } else {
                 let verb = if page.revision > 1 { "Revised" } else { "Wrote" };
-                println!("{verb} page #{}: {}", page.id, page.title);
+                println!("{verb} note #{}: {}", page.id, page.title);
             }
         }
         NotebookCmd::Helped { id } => {
@@ -282,6 +287,10 @@ pub(crate) fn project_name(store: &Store, page: &Page) -> Option<String> {
 }
 
 pub(crate) fn page_json(store: &Store, p: &Page) -> Value {
+    page_json_with(p, project_name(store, p).as_deref())
+}
+
+pub(crate) fn page_json_with(p: &Page, project: Option<&str>) -> Value {
     json!({
         "id": p.id,
         "kind": p.kind.as_str(),
@@ -291,7 +300,7 @@ pub(crate) fn page_json(store: &Store, p: &Page) -> Value {
         "tags": p.tags,
         "body": p.body,
         "excerpt": p.excerpt(160),
-        "project": project_name(store, p),
+        "project": project,
         "agent": p.agent,
         "revision": p.revision,
         "helped": p.helped,
@@ -299,4 +308,9 @@ pub(crate) fn page_json(store: &Store, p: &Page) -> Value {
         "created_at": p.created_at,
         "updated_at": p.updated_at,
     })
+}
+
+pub(crate) fn pages_json(store: &Store, pages: &[Page]) -> Result<Vec<Value>, String> {
+    let projects = store.project_names().map_err(|e| e.to_string())?;
+    Ok(pages.iter().map(|p| page_json_with(p, p.project_id.and_then(|id| projects.get(&id).map(String::as_str)))).collect())
 }

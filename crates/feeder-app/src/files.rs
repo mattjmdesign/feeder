@@ -4,7 +4,9 @@ use std::cell::{Cell, RefCell};
 use std::collections::{BTreeMap, BTreeSet};
 
 use feeder_core::{ChangeKind, TreeStatus, WorkingTree, ago};
-use rune::{Color, Drag, El, KeyEvent, LineCap, MagnifyEvent, Phase, Shape, Transition, Tx, WheelEvent, canvas, col, el, row, text};
+use rune::{
+    Color, Cursor, Drag, El, KeyEvent, LineCap, MagnifyEvent, Phase, Shape, Transition, Tx, WheelEvent, canvas, col, el, row, text,
+};
 use rune_kit::{Button, ButtonVariant, FileNode, FileTree, Kit, Tree, TreeItem, TreeModel, TreeRow, TreeStyle};
 
 use crate::State;
@@ -564,7 +566,7 @@ fn map_layout(fs: &FilesState, name: &str, revision: u64) -> MapLayout {
     MapLayout { name: name.to_owned(), font_epoch: text::font_epoch(), revision, nodes, columns, size: [width, height], latest, kinds }
 }
 
-fn map_stage(layout: &MapLayout, p: &Palette, recent: bool) -> El {
+fn map_stage(layout: &MapLayout, p: &Palette, k: &Kit, recent: bool) -> El {
     let [width, height] = layout.size;
     let nodes = &layout.nodes;
     let col_x = &layout.columns;
@@ -592,12 +594,12 @@ fn map_stage(layout: &MapLayout, p: &Palette, recent: bool) -> El {
         .child(canvas(active).key("files-active").size(width, height).absolute(0.0, 0.0));
     for n in nodes {
         let position = [col_x[n.depth], n.y];
-        stage = stage.child(map_node(n, position, p, recent).absolute(position[0], position[1]));
+        stage = stage.child(map_node(n, position, p, k, recent).absolute(position[0], position[1]));
     }
     stage
 }
 
-fn map_node(n: &MapNode, position: [f32; 2], p: &Palette, recent: bool) -> El {
+fn map_node(n: &MapNode, position: [f32; 2], p: &Palette, k: &Kit, recent: bool) -> El {
     let deleted = n.kind == Kind::File(Some(Change::Deleted));
     let (fg, border, fill) = match n.kind {
         Kind::Root => (p.text, p.text_3, p.card),
@@ -633,10 +635,11 @@ fn map_node(n: &MapNode, position: [f32; 2], p: &Palette, recent: bool) -> El {
     };
     let r = r.key(key);
     let r = if matches!(n.kind, Kind::Folder { .. } | Kind::File(_)) { r.help(n.full.clone()) } else { r };
+    let interactive = |el: El| el.cursor(Cursor::Pointer).hover(p.hover).focusable(true).focus_ring(2.0, 0.0, k.c.border_focus);
     match n.kind {
         Kind::Root => r.label(format!("{}, {}", n.full, n.meta)),
         Kind::Folder { open } => {
-            r.label(format!("{}, folder, {}", n.full, n.meta)).role("button").expanded(open).on_press(move |s: &mut State| {
+            interactive(r).label(format!("{}, folder, {}", n.full, n.meta)).role("button").expanded(open).on_press(move |s: &mut State| {
                 if open {
                     s.files.open.remove(&id);
                 } else {
@@ -659,13 +662,14 @@ fn map_node(n: &MapNode, position: [f32; 2], p: &Palette, recent: bool) -> El {
             if deleted {
                 r
             } else {
-                r.role("button").on_press_tx(move |s: &mut State, tx: &mut Tx| {
+                interactive(r).role("button").on_press_tx(move |s: &mut State, tx: &mut Tx| {
                     s.files.follow = false;
                     s.files.list.reveal(&id, tx);
+                    preview_file(s, &id);
                 })
             }
         }
-        Kind::Fold | Kind::FoldChanged => r.label(format!("Show {}", n.full)).role("button").on_press(move |s: &mut State| {
+        Kind::Fold | Kind::FoldChanged => interactive(r).label(format!("Show {}", n.full)).role("button").on_press(move |s: &mut State| {
             s.files.show_files.insert(id.clone());
             s.files.invalidate_layout();
         }),
@@ -750,7 +754,7 @@ fn map_canvas(fs: &FilesState, now: i64, p: &Palette, k: &Kit, m: &MapLayout, vi
     let fit = fit_camera(size, view);
     let centre = [view[0] / 2.0, view[1] / 2.0];
     let recent = fs.recent(now);
-    let stage = rune::memo("files-map-stage", (m.revision, p.bg == style::palette(true).bg, recent), || map_stage(m, p, recent));
+    let stage = rune::memo("files-map-stage", (m.revision, p.bg == style::palette(true).bg, recent), || map_stage(m, p, k, recent));
     let placed = stage.scale(cam.zoom).absolute(cam.x - (mw - mw * cam.zoom) / 2.0, cam.y - (mh - mh * cam.zoom) / 2.0);
 
     let set = move |to: Camera| move |s: &mut State| s.files.camera.set(Some(clamp_camera(to, size, view)));
@@ -899,6 +903,7 @@ fn file_list(s: &State, p: &Palette, k: &Kit) -> El {
         .build(s, k)
         .grow(1.0)
         .min_h(0.0)
+        .pb(crate::notebook::SETTINGS_CORNER_H)
 }
 
 fn notice(p: &Palette, title: &str, detail: Option<String>, action: Option<El>) -> El {

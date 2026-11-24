@@ -3,6 +3,15 @@
 What changed in each version of Feeder, newest first. Each section is copied from
 `release-notes/<version>.md` by `scripts/changelog.sh`; edit those files, not this one.
 
+## 0.5.11
+
+- Fixed Feeder showing "Application Not Responding" in the Dock on macOS.
+- Library notes ask before discarding unsaved edits, offer Undo after archiving a note, and sync sidebar search and new notes automatically.
+- Curator keeps your scroll position cleanly across chats, preserves multi-turn retries, shows diff previews and categories on proposals, and prevents duplicate Apply, Dismiss, or Revert taps while saving.
+- Feed and Quick Jump show image load errors with Show in Finder, let you reply from the Feed tab or jump to matched updates, hide Flag on queued or reviewed posts, and sort Before/After comparisons chronologically.
+- Settings adds Command line tool setup under Connected Tools, retries tool disconnects accurately, and suppresses notification banners when you are already viewing that project.
+- `feeder curator` adds `proposals`, `apply`, and `dismiss` subcommands, and agents can flag or write shared Library notes via MCP and the CLI.
+
 ## 0.5.10
 
 - Library cards are wider and give titles two lines. Cards stay the same size across categories.

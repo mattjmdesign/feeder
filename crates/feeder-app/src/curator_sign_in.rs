@@ -14,12 +14,16 @@ use rune_kit::{Button, ButtonVariant, ControlSize, Kit};
 use crate::State;
 use crate::style::{self, Palette};
 
+type AccountScan = (Vec<Backend>, Vec<(Backend, AccountStatus)>);
+
 #[derive(Default)]
 pub struct SignIn {
     active: Option<(Backend, Receiver<Status>, Arc<AtomicBool>)>,
-    status: Option<(Backend, Status)>,
+    status: HashMap<Backend, Status>,
     scanned: HashMap<Backend, AccountStatus>,
-    scan_rx: Option<Receiver<Vec<(Backend, AccountStatus)>>>,
+    scan_rx: Option<Receiver<AccountScan>>,
+    installed_update: Option<Vec<Backend>>,
+    connected_backend: Option<Backend>,
     scan_fresh: bool,
 }
 
@@ -55,8 +59,16 @@ fn primary_label(backend: Backend) -> &'static str {
 impl SignIn {
     pub fn begin_run(&mut self) {
         if self.active.is_none() {
-            self.status = None;
+            self.status.clear();
         }
+    }
+
+    pub fn take_installed(&mut self) -> Option<Vec<Backend>> {
+        self.installed_update.take()
+    }
+
+    pub fn take_connected(&mut self) -> Option<Backend> {
+        self.connected_backend.take()
     }
 
     pub fn follow_accounts(&mut self, open: bool, wake: Option<&Waker>) {
@@ -77,7 +89,8 @@ impl SignIn {
                 let installed = Backend::installed();
                 let results = std::thread::scope(|scope| {
                     let jobs: Vec<_> = installed
-                        .into_iter()
+                        .iter()
+                        .copied()
                         .map(|backend| {
                             let data_dir = &data_dir;
                             scope.spawn(move || (backend, backend.account_status(data_dir)))
@@ -85,7 +98,7 @@ impl SignIn {
                         .collect();
                     jobs.into_iter().filter_map(|job| job.join().ok()).collect::<Vec<_>>()
                 });
-                let _ = tx.send(results);
+                let _ = tx.send((installed, results));
                 if let Some(wake) = wake {
                     wake();
                 }
@@ -103,13 +116,13 @@ impl SignIn {
         let cancel = Arc::new(AtomicBool::new(false));
         let stop = Arc::clone(&cancel);
         let (tx, rx) = mpsc::channel();
-        self.status = Some((
+        self.status.insert(
             backend,
             match action {
                 Action::Browser => Status::Browser,
                 Action::Terminal | Action::Check => Status::Checking,
             },
-        ));
+        );
         self.active = Some((backend, rx, cancel));
         if std::thread::Builder::new()
             .name("feeder-curator-sign-in".into())
@@ -145,7 +158,7 @@ impl SignIn {
             .is_err()
         {
             self.active = None;
-            self.status = Some((backend, Status::Failed("Couldn’t start sign-in.".into())));
+            self.status.insert(backend, Status::Failed("Couldn’t start sign-in.".into()));
         }
     }
 
@@ -153,7 +166,8 @@ impl SignIn {
         let mut changed = false;
         if let Some(rx) = &self.scan_rx {
             match rx.try_recv() {
-                Ok(results) => {
+                Ok((installed, results)) => {
+                    self.installed_update = Some(installed);
                     for (backend, account) in results {
                         self.scanned.insert(backend, account);
                     }
@@ -177,8 +191,9 @@ impl SignIn {
                 let backend = *backend;
                 if let Status::Connected(label) = &status {
                     self.scanned.insert(backend, AccountStatus { status: ConnectionStatus::Connected, label: label.clone() });
+                    self.connected_backend = Some(backend);
                 }
-                self.status = Some((backend, status));
+                self.status.insert(backend, status);
                 self.active = None;
                 changed = true;
             }
@@ -242,7 +257,7 @@ impl SignIn {
     }
 
     pub fn usable(&self, backend: Backend) -> bool {
-        if matches!(self.status.as_ref(), Some((b, Status::Connected(_))) if *b == backend) {
+        if matches!(self.status.get(&backend), Some(Status::Connected(_))) {
             return true;
         }
         matches!(self.scanned.get(&backend).map(|a| a.status), Some(ConnectionStatus::Connected | ConnectionStatus::Unknown))
@@ -251,11 +266,15 @@ impl SignIn {
 
 pub fn cells(s: &State, backend: Backend, p: &Palette, k: &Kit) -> (El, El) {
     let sign_in = &s.curator_sign_in;
-    let transient = sign_in.status.as_ref().filter(|(b, _)| *b == backend).map(|(_, st)| st);
+    let transient = sign_in.status.get(&backend);
     let scanned = sign_in.scanned.get(&backend);
     let busy_other = sign_in.active.as_ref().is_some_and(|(b, _, _)| *b != backend);
     let browser = browser_supported(backend);
     let default_action = if browser { Action::Browser } else { Action::Terminal };
+    let has_nickname = !s.curator.prefs.get(backend).nickname.trim().is_empty();
+    let named = |detail: &str| {
+        if has_nickname { format!("{} · {detail}", backend.label()) } else { detail.to_string() }
+    };
 
     let start = |action| move |s: &mut State| s.curator_sign_in.start(backend, action, s.wake.clone());
     let btn = |label: &str, variant: ButtonVariant, action: Action, suffix: &str| {
@@ -281,8 +300,8 @@ pub fn cells(s: &State, backend: Backend, p: &Palette, k: &Kit) -> (El, El) {
     };
     let line = |t: &str, c| text(t.to_string()).font(style::META).color(c).truncate();
     let signed_in = |account_label: Option<&str>| match account_label {
-        Some(detail) => line(&format!("{} · {detail}", backend.label()), p.text_2),
-        None => line(&format!("{} · signed in", backend.label()), p.text_2),
+        Some(detail) => line(&named(detail), p.text_2),
+        None => line(&named("Signed in"), p.text_2),
     };
 
     match transient {
@@ -297,30 +316,35 @@ pub fn cells(s: &State, backend: Backend, p: &Palette, k: &Kit) -> (El, El) {
                 "term",
             )),
         ),
-        Some(Status::Failed(err)) => (
-            text(err.clone()).font(style::META).color(k.c.danger.fg).truncate().help(err.clone()),
-            btn("Try Again", ButtonVariant::Outline, default_action, "retry"),
-        ),
+        Some(Status::Failed(err)) => {
+            let mut actions = row().gap(6.0).child(btn("Try Again", ButtonVariant::Outline, default_action, "retry"));
+            if browser {
+                actions = actions.child(btn("Open in Terminal", ButtonVariant::GhostMuted, Action::Terminal, "term"));
+            }
+            (text(err.clone()).font(style::META).color(k.c.danger.fg).truncate().help(err.clone()), actions)
+        }
         Some(Status::Connected(label)) => (signed_in(label.as_deref()), el()),
         Some(Status::Cancelled) | None => match scanned.map(|a| a.status) {
             Some(ConnectionStatus::Connected) => (signed_in(scanned.and_then(|a| a.label.as_deref())), el()),
             Some(ConnectionStatus::Unknown) if backend == Backend::OpenCode => {
-                (line("OpenCode · no account listed", p.text_3), btn("Sign In…", ButtonVariant::Outline, default_action, "connect"))
+                (line(&named("No account listed"), p.text_3), btn("Sign In…", ButtonVariant::Outline, default_action, "connect"))
             }
-            Some(ConnectionStatus::SignedOut | ConnectionStatus::Unknown) => (
-                line(&format!("{} · Sign in to use", backend.label()), p.text_3),
+            Some(ConnectionStatus::SignedOut | ConnectionStatus::Unknown) => {
+                (line(&named("Sign in to use"), p.text_3), btn("Sign In…", ButtonVariant::Outline, default_action, "connect"))
+            }
+            Some(ConnectionStatus::NotInstalled) => (line(&named("Not installed"), p.text_3), el()),
+            None if sign_in.scan_rx.is_some() || busy_other => (line("Checking…", p.text_3), el()),
+            None => (
+                line(if has_nickname { backend.label() } else { "Sign in to use" }, p.text_3),
                 btn("Sign In…", ButtonVariant::Outline, default_action, "connect"),
             ),
-            Some(ConnectionStatus::NotInstalled) => (line(&format!("{} · not installed", backend.label()), p.text_3), el()),
-            None if sign_in.scan_rx.is_some() || busy_other => (line("Checking…", p.text_3), el()),
-            None => (line(backend.label(), p.text_3), btn("Sign In…", ButtonVariant::Outline, default_action, "connect")),
         },
     }
 }
 
 pub fn controls(s: &State, backend: Backend, p: &Palette, k: &Kit, retry: Option<fn(&mut State)>) -> El {
     let sign_in = &s.curator_sign_in;
-    let status = sign_in.status.as_ref().filter(|(b, _)| *b == backend).map(|(_, status)| status);
+    let status = sign_in.status.get(&backend);
     let browser = browser_supported(backend);
     let start = |action| move |s: &mut State| s.curator_sign_in.start(backend, action, s.wake.clone());
     let primary = primary_label(backend);
@@ -409,14 +433,14 @@ mod tests {
         tx.send(Status::Connected(Some("alex@example.com · Plus".into()))).unwrap();
         assert!(sign_in.poll());
         assert!(sign_in.active.is_none());
-        assert!(matches!(sign_in.status, Some((Backend::Codex, Status::Connected(_)))));
+        assert!(matches!(sign_in.status.get(&Backend::Codex), Some(Status::Connected(_))));
         assert_eq!(
             sign_in.scanned.get(&Backend::Codex),
             Some(&AccountStatus { status: ConnectionStatus::Connected, label: Some("alex@example.com · Plus".into()) })
         );
 
         sign_in.begin_run();
-        assert!(sign_in.status.is_none());
+        assert!(sign_in.status.is_empty());
     }
 
     #[test]

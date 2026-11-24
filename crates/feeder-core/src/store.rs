@@ -4,7 +4,7 @@ use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use rusqlite::{Connection, OptionalExtension, Row, params};
+use rusqlite::{Connection, OptionalExtension, Row, Transaction, TransactionBehavior, params};
 
 use crate::{DetectedProject, Error, Orb, Result, now_ms, parse_attention, slugify, validate_body};
 
@@ -282,6 +282,8 @@ pub struct Store {
     pub(crate) dir: PathBuf,
 }
 
+const SCHEMA_VERSION: i64 = 1;
+
 impl Store {
     pub fn open_default() -> Result<Store> {
         Store::open(&data_dir())
@@ -298,84 +300,21 @@ impl Store {
         }
         let conn = Connection::open(dir.join("feeder.db"))?;
         conn.busy_timeout(Duration::from_secs(5))?;
-        conn.pragma_update(None, "journal_mode", "WAL")?;
         conn.pragma_update(None, "foreign_keys", "ON")?;
-        conn.execute_batch(
-            "CREATE TABLE IF NOT EXISTS projects (
-                id INTEGER PRIMARY KEY,
-                slug TEXT NOT NULL UNIQUE,
-                name TEXT NOT NULL,
-                path TEXT UNIQUE,
-                orb TEXT NOT NULL,
-                created_at INTEGER NOT NULL,
-                archived INTEGER NOT NULL DEFAULT 0,
-                seen_at INTEGER,
-                pinned INTEGER NOT NULL DEFAULT 0,
-                brief TEXT
-            );
-            CREATE TABLE IF NOT EXISTS updates (
-                id INTEGER PRIMARY KEY,
-                project_id INTEGER NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
-                agent TEXT NOT NULL,
-                body TEXT NOT NULL,
-                screenshot TEXT,
-                media_w INTEGER,
-                media_h INTEGER,
-                branch TEXT,
-                created_at INTEGER NOT NULL,
-                diff_stat TEXT,
-                commit_sha TEXT,
-                attention_dismissed_at INTEGER,
-                via TEXT
-            );
-            CREATE INDEX IF NOT EXISTS updates_by_project ON updates(project_id, created_at DESC, id DESC);
-            CREATE TABLE IF NOT EXISTS update_media (
-                id INTEGER PRIMARY KEY,
-                update_id INTEGER NOT NULL REFERENCES updates(id) ON DELETE CASCADE,
-                position INTEGER NOT NULL DEFAULT 0,
-                path TEXT NOT NULL,
-                width INTEGER,
-                height INTEGER,
-                caption TEXT
-            );
-            CREATE INDEX IF NOT EXISTS update_media_by_update ON update_media(update_id, position ASC, id ASC);
-            CREATE TABLE IF NOT EXISTS replies (
-                id INTEGER PRIMARY KEY,
-                update_id INTEGER NOT NULL REFERENCES updates(id) ON DELETE CASCADE,
-                project_id INTEGER NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
-                author TEXT NOT NULL,
-                from_human INTEGER NOT NULL DEFAULT 1,
-                body TEXT NOT NULL,
-                created_at INTEGER NOT NULL,
-                read_at INTEGER
-            );
-            CREATE INDEX IF NOT EXISTS replies_by_update ON replies(update_id, created_at ASC, id ASC);
-            CREATE INDEX IF NOT EXISTS replies_unread ON replies(project_id, read_at);
-            CREATE TABLE IF NOT EXISTS pulses (
-                project_id INTEGER NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
-                agent TEXT NOT NULL,
-                branch TEXT,
-                status TEXT NOT NULL,
-                updated_at INTEGER NOT NULL,
-                expires_at INTEGER NOT NULL,
-                PRIMARY KEY (project_id, agent)
-            );
-            CREATE TABLE IF NOT EXISTS todos (
-                id INTEGER PRIMARY KEY,
-                project_id INTEGER NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
-                title TEXT NOT NULL,
-                done INTEGER NOT NULL DEFAULT 0,
-                position INTEGER NOT NULL DEFAULT 0,
-                created_at INTEGER NOT NULL,
-                completed_at INTEGER
-            );
-            CREATE INDEX IF NOT EXISTS todos_by_project ON todos(project_id, position ASC, id ASC);",
-        )?;
-        migrate_projects(&conn)?;
-        migrate_updates(&conn, dir)?;
-        crate::notebook::migrate(&conn)?;
-        crate::knowledge::migrate(&conn)?;
-        crate::gardener::migrate(&conn)?;
+        let version: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0))?;
+        if version < SCHEMA_VERSION {
+            conn.pragma_update(None, "journal_mode", "WAL")?;
+            let tx = Transaction::new_unchecked(&conn, TransactionBehavior::Immediate)?;
+            let current: i64 = tx.query_row("PRAGMA user_version", [], |r| r.get(0))?;
+            if current < SCHEMA_VERSION {
+                migrate_core(&tx, dir)?;
+                crate::notebook::migrate(&tx)?;
+                crate::knowledge::migrate(&tx)?;
+                crate::gardener::migrate(&tx)?;
+                tx.pragma_update(None, "user_version", SCHEMA_VERSION)?;
+            }
+            tx.commit()?;
+        }
         Ok(Store { conn, dir: dir.to_path_buf() })
     }
 
@@ -454,6 +393,12 @@ impl Store {
         self.one(&format!("SELECT {PROJECT_COLS} FROM projects WHERE id = ?1"), params![id])
     }
 
+    pub fn project_names(&self) -> Result<HashMap<i64, String>> {
+        let mut stmt = self.conn.prepare("SELECT id, name FROM projects")?;
+        let rows = stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?;
+        Ok(rows.collect::<rusqlite::Result<_>>()?)
+    }
+
     pub fn find_project(&self, query: &str) -> Result<Option<Project>> {
         let trimmed = query.trim();
         if trimmed.is_empty() {
@@ -484,30 +429,40 @@ impl Store {
         if name.is_empty() {
             return Err(Error::Invalid("a project needs a name".into()));
         }
+        let tx = Transaction::new_unchecked(&self.conn, TransactionBehavior::Immediate)?;
         if let Some(p) = self.find_project(name)? {
             if p.path.is_none()
                 && let Some(path) = path
                 && self.project_at_path(path)?.is_none()
             {
-                self.conn.execute("UPDATE projects SET path = ?1 WHERE id = ?2", params![path_str(path), p.id])?;
+                tx.execute("UPDATE projects SET path = ?1 WHERE id = ?2", params![path_str(path), p.id])?;
+                tx.commit()?;
                 return Ok(Project { path: Some(path.to_path_buf()), ..p });
             }
+            tx.commit()?;
             return Ok(p);
         }
-        self.create_project(name, path)
+        let project = self.create_project(name, path)?;
+        tx.commit()?;
+        Ok(project)
     }
 
     pub fn project_at(&self, detected: &DetectedProject) -> Result<Project> {
+        let tx = Transaction::new_unchecked(&self.conn, TransactionBehavior::Immediate)?;
         if let Some(p) = self.project_at_path(&detected.path)? {
+            tx.commit()?;
             return Ok(p);
         }
         if let Some(p) = self.find_project(&detected.name)?
             && p.path.is_none()
         {
-            self.conn.execute("UPDATE projects SET path = ?1 WHERE id = ?2", params![path_str(&detected.path), p.id])?;
+            tx.execute("UPDATE projects SET path = ?1 WHERE id = ?2", params![path_str(&detected.path), p.id])?;
+            tx.commit()?;
             return Ok(Project { path: Some(detected.path.clone()), ..p });
         }
-        self.create_project(&detected.name, Some(&detected.path))
+        let project = self.create_project(&detected.name, Some(&detected.path))?;
+        tx.commit()?;
+        Ok(project)
     }
 
     pub fn find_detected(&self, detected: &DetectedProject) -> Result<Option<Project>> {
@@ -667,6 +622,7 @@ impl Store {
             let rows = stmt.query_map(params![id], |r| r.get(0))?;
             rows.collect::<rusqlite::Result<_>>()?
         };
+        self.conn.execute("DELETE FROM updates WHERE id = ?1", params![id])?;
         let mut to_remove = std::collections::HashSet::new();
         if let Some(rel) = shot {
             to_remove.insert(rel);
@@ -677,24 +633,23 @@ impl Store {
         for rel in to_remove {
             std::fs::remove_file(self.dir.join(rel)).ok();
         }
-        self.conn.execute("DELETE FROM updates WHERE id = ?1", params![id])?;
         Ok(())
     }
 
     pub fn remove_project(&self, id: i64) -> Result<()> {
-        for u in self.feed(id, usize::MAX, None)? {
-            let mut seen = std::collections::HashSet::new();
-            if let Some(shot) = u.screenshot {
-                seen.insert(shot);
-            }
-            for item in u.media {
-                seen.insert(item.path);
-            }
-            for path in seen {
-                std::fs::remove_file(path).ok();
-            }
-        }
+        let media_paths: Vec<String> = {
+            let mut stmt = self.conn.prepare(
+                "SELECT screenshot FROM updates WHERE project_id = ?1 AND screenshot IS NOT NULL
+                 UNION
+                 SELECT m.path FROM update_media m JOIN updates u ON u.id = m.update_id WHERE u.project_id = ?1",
+            )?;
+            let rows = stmt.query_map(params![id], |r| r.get(0))?;
+            rows.collect::<rusqlite::Result<_>>()?
+        };
         self.conn.execute("DELETE FROM projects WHERE id = ?1", params![id])?;
+        for rel in media_paths {
+            std::fs::remove_file(self.dir.join(rel)).ok();
+        }
         Ok(())
     }
 
@@ -1040,6 +995,7 @@ impl Store {
         let branch = branch.map(str::trim).filter(|b| !b.is_empty()).map(str::to_string);
         let updated_at = now_ms();
         let expires_at = updated_at + ttl_ms.clamp(5_000, 3_600_000);
+        self.conn.execute("DELETE FROM pulses WHERE expires_at <= ?1", params![updated_at])?;
         self.conn.execute(
             "INSERT INTO pulses (project_id, agent, branch, status, updated_at, expires_at)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6)
@@ -1290,6 +1246,86 @@ fn fts_query(query: &str) -> Option<String> {
     let terms: Vec<String> =
         query.split(|c: char| !c.is_alphanumeric()).filter(|t| !t.is_empty()).map(|t| format!("\"{}\"*", t.replace('"', "\"\""))).collect();
     (!terms.is_empty()).then(|| terms.join(" "))
+}
+
+fn migrate_core(conn: &Connection, dir: &Path) -> Result<()> {
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS projects (
+            id INTEGER PRIMARY KEY,
+            slug TEXT NOT NULL UNIQUE,
+            name TEXT NOT NULL,
+            path TEXT UNIQUE,
+            orb TEXT NOT NULL,
+            created_at INTEGER NOT NULL,
+            archived INTEGER NOT NULL DEFAULT 0,
+            seen_at INTEGER,
+            pinned INTEGER NOT NULL DEFAULT 0,
+            brief TEXT
+        );
+        CREATE TABLE IF NOT EXISTS updates (
+            id INTEGER PRIMARY KEY,
+            project_id INTEGER NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+            agent TEXT NOT NULL,
+            body TEXT NOT NULL,
+            screenshot TEXT,
+            media_w INTEGER,
+            media_h INTEGER,
+            branch TEXT,
+            created_at INTEGER NOT NULL,
+            diff_stat TEXT,
+            commit_sha TEXT,
+            attention_dismissed_at INTEGER,
+            via TEXT
+        );
+        CREATE INDEX IF NOT EXISTS updates_by_project ON updates(project_id, created_at DESC, id DESC);
+        CREATE INDEX IF NOT EXISTS updates_by_time ON updates(created_at DESC, id DESC);
+        CREATE TABLE IF NOT EXISTS update_media (
+            id INTEGER PRIMARY KEY,
+            update_id INTEGER NOT NULL REFERENCES updates(id) ON DELETE CASCADE,
+            position INTEGER NOT NULL DEFAULT 0,
+            path TEXT NOT NULL,
+            width INTEGER,
+            height INTEGER,
+            caption TEXT
+        );
+        CREATE INDEX IF NOT EXISTS update_media_by_update ON update_media(update_id, position ASC, id ASC);
+        CREATE TABLE IF NOT EXISTS replies (
+            id INTEGER PRIMARY KEY,
+            update_id INTEGER NOT NULL REFERENCES updates(id) ON DELETE CASCADE,
+            project_id INTEGER NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+            author TEXT NOT NULL,
+            from_human INTEGER NOT NULL DEFAULT 1,
+            body TEXT NOT NULL,
+            created_at INTEGER NOT NULL,
+            read_at INTEGER
+        );
+        CREATE INDEX IF NOT EXISTS replies_by_update ON replies(update_id, created_at ASC, id ASC);
+        CREATE INDEX IF NOT EXISTS replies_unread ON replies(project_id, read_at);
+        CREATE TABLE IF NOT EXISTS pulses (
+            project_id INTEGER NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+            agent TEXT NOT NULL,
+            branch TEXT,
+            status TEXT NOT NULL,
+            updated_at INTEGER NOT NULL,
+            expires_at INTEGER NOT NULL,
+            PRIMARY KEY (project_id, agent)
+        );
+        CREATE INDEX IF NOT EXISTS pulses_by_expiry ON pulses(expires_at);
+        CREATE TABLE IF NOT EXISTS todos (
+            id INTEGER PRIMARY KEY,
+            project_id INTEGER NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+            title TEXT NOT NULL,
+            done INTEGER NOT NULL DEFAULT 0,
+            position INTEGER NOT NULL DEFAULT 0,
+            created_at INTEGER NOT NULL,
+            completed_at INTEGER
+        );
+        CREATE INDEX IF NOT EXISTS todos_by_project ON todos(project_id, position ASC, id ASC);",
+    )?;
+    migrate_projects(conn)?;
+    migrate_updates(conn, dir)?;
+    conn.execute("CREATE INDEX IF NOT EXISTS updates_by_commit ON updates(project_id, commit_sha) WHERE commit_sha IS NOT NULL", [])?;
+    Ok(())
 }
 
 fn migrate_projects(conn: &Connection) -> Result<()> {

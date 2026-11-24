@@ -154,14 +154,20 @@ fn looks_signed_out(message: &str) -> bool {
     [
         "not logged in",
         "please run /login",
-        "log in",
-        "login",
-        "sign in",
+        "please sign in",
+        "sign in to",
+        "log in to",
+        "401 unauthorized",
+        "http 401",
+        "status 401",
         "unauthorized",
-        "401",
         "invalid api key",
-        "authentication",
+        "invalid_api_key",
+        "authentication failed",
+        "authentication_error",
         "connect a provider",
+        "credentials expired",
+        "token expired",
     ]
     .iter()
     .any(|needle| m.contains(needle))
@@ -220,6 +226,9 @@ mod tests {
         let other = json!({ "type": "result", "is_error": true, "result": "Overloaded" });
         let (events, _) = feed(&[other], claude_line);
         assert_eq!(events, [Event::Failed("Overloaded".into())]);
+        let login_file = json!({ "type": "result", "is_error": true, "result": "failed to parse login.ts line 401" });
+        let (events, _) = feed(&[login_file], claude_line);
+        assert_eq!(events, [Event::Failed("failed to parse login.ts line 401".into())]);
     }
 
     #[test]

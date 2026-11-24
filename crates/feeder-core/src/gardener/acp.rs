@@ -16,7 +16,7 @@ pub(super) fn check_version(backend: Backend, status: Option<ExitStatus>, versio
     };
     if !status.is_some_and(|status| status.success()) || !supported_version(version, minimum) {
         let (major, minor, patch) = minimum;
-        return Err(Error::Invalid(format!("Update {} to {major}.{minor}.{patch} or a later {major}.x release.", backend.label())));
+        return Err(Error::Invalid(format!("Update {} to {major}.{minor}.{patch} or later.", backend.label())));
     }
     Ok(())
 }
@@ -55,11 +55,12 @@ pub(super) fn command(
 
 fn supported_version(stdout: &str, minimum: (u32, u32, u32)) -> bool {
     let parse = |word: &str| {
-        let mut parts = word.trim_start_matches('v').split('.');
+        let cleaned = word.trim_start_matches('v').split(['-', '+']).next()?;
+        let mut parts = cleaned.split('.');
         let version = (parts.next()?.parse().ok()?, parts.next()?.parse().ok()?, parts.next()?.parse().ok()?);
         if parts.next().is_none() { Some(version) } else { None }
     };
-    stdout.split_whitespace().find_map(parse).is_some_and(|version| version.0 == minimum.0 && version >= minimum)
+    stdout.split_whitespace().find_map(parse).is_some_and(|version| version >= minimum)
 }
 
 fn opencode_config(mode: SessionMode, model: Option<&str>, server: &Value) -> Value {
@@ -123,18 +124,25 @@ fn opencode_config(mode: SessionMode, model: Option<&str>, server: &Value) -> Va
 
 fn inherited_opencode_mcp_names() -> Vec<String> {
     let Some(home) = std::env::var_os("HOME") else { return Vec::new() };
-    let path = std::path::PathBuf::from(home).join(".config/opencode/opencode.json");
-    let Ok(bytes) = std::fs::read(path) else { return Vec::new() };
-    let Ok(parsed) = serde_json::from_slice::<Value>(&bytes) else { return Vec::new() };
-    let Some(mcp) = parsed["mcp"].as_object() else { return Vec::new() };
+    let dir = std::path::PathBuf::from(home).join(".config/opencode");
     let mut names = Vec::new();
-    for (key, val) in mcp {
-        if key == "servers" {
-            if let Some(servers) = val.as_object() {
-                names.extend(servers.keys().cloned());
+    for file in ["opencode.json", "opencode.jsonc"] {
+        let Ok(raw) = std::fs::read_to_string(dir.join(file)) else { continue };
+        let cleaned = crate::setup::strip_jsonc_comments(&raw);
+        let Ok(parsed) = serde_json::from_str::<Value>(&cleaned) else { continue };
+        let Some(mcp) = parsed["mcp"].as_object() else { continue };
+        for (key, val) in mcp {
+            if key == "servers" {
+                if let Some(servers) = val.as_object() {
+                    for k in servers.keys() {
+                        if !names.contains(k) {
+                            names.push(k.clone());
+                        }
+                    }
+                }
+            } else if !names.contains(key) {
+                names.push(key.clone());
             }
-        } else {
-            names.push(key.clone());
         }
     }
     names
@@ -170,7 +178,7 @@ fn configure_antigravity(data: &Path, mode: SessionMode, server: &Value) -> Resu
     let agents = profile.join("agents");
     std::fs::create_dir_all(&agents)?;
     let agent = format!(
-        "---\nname: feeder-curator\ndescription: Feeder Notebook Curator\ntools: []\nmainAgent: true\nsubagent: false\ncommandExecutionPolicy: off\n---\n{}",
+        "---\nname: feeder-curator\ndescription: Feeder Library Curator\ntools: []\nmainAgent: true\nsubagent: false\ncommandExecutionPolicy: off\n---\n{}",
         mode.instructions()
     );
     std::fs::write(agents.join("feeder-curator.md"), agent)?;
@@ -200,6 +208,7 @@ pub(super) struct State {
     pending: Option<u64>,
     pending_model: Option<u64>,
     pending_effort: Option<u64>,
+    pending_opening: Option<String>,
     next: u64,
     tools: HashSet<String>,
     pending_tools: HashMap<String, &'static str>,
@@ -236,7 +245,21 @@ impl State {
     }
 
     pub(super) fn ready(&self) -> bool {
-        self.session.is_some() && self.pending.is_none()
+        self.session.is_some()
+            && self.pending.is_none()
+            && self.pending_model.is_none()
+            && self.pending_effort.is_none()
+            && self.pending_opening.is_none()
+    }
+
+    fn maybe_flush_opening(&mut self, actions: &mut Vec<Action>) -> Result<()> {
+        if self.pending_model.is_none()
+            && self.pending_effort.is_none()
+            && let Some(opening) = self.pending_opening.take()
+        {
+            actions.push(Action::Send(self.prompt(&opening)?));
+        }
+        Ok(())
     }
 
     pub(super) fn receive(&mut self, message: Value, mode: SessionMode, cwd: &Path, server: &Value, opening: &str) -> Result<Vec<Action>> {
@@ -253,11 +276,15 @@ impl State {
         let Some(id) = message["id"].as_u64() else { return Ok(Vec::new()) };
         if self.pending_model == Some(id) {
             self.pending_model = None;
-            return check_config_response(&message);
+            let mut actions = check_config_response(&message)?;
+            self.maybe_flush_opening(&mut actions)?;
+            return Ok(actions);
         }
         if self.pending_effort == Some(id) {
             self.pending_effort = None;
-            return check_config_response(&message);
+            let mut actions = check_config_response(&message)?;
+            self.maybe_flush_opening(&mut actions)?;
+            return Ok(actions);
         }
         if !matches!(id, 1 | 2) && self.pending != Some(id) {
             return Ok(Vec::new());
@@ -312,7 +339,11 @@ impl State {
                         )));
                     }
                 }
-                actions.push(Action::Send(self.prompt(opening)?));
+                if self.pending_model.is_none() && self.pending_effort.is_none() {
+                    actions.push(Action::Send(self.prompt(opening)?));
+                } else {
+                    self.pending_opening = Some(opening.to_string());
+                }
                 Ok(actions)
             }
             _ => {
@@ -609,17 +640,16 @@ mod tests {
         state.receive(json!({ "id": 1, "result": { "protocolVersion": 1 } }), mode, cwd, &tools, "hi").unwrap();
         let actions = state.receive(json!({ "id": 2, "result": { "sessionId": "s" } }), mode, cwd, &tools, "hi").unwrap();
         let sent: Vec<&Value> = actions.iter().filter_map(|a| if let Action::Send(m) = a { Some(m) } else { None }).collect();
+        assert_eq!(sent.len(), 1);
         assert_eq!(sent[0]["id"], 3);
         assert_eq!(sent[0]["method"], "session/set_model");
         assert_eq!(sent[0]["params"]["modelId"], "gemini-4-neon-high");
-        assert_eq!(sent[1]["id"], 4);
-        assert_eq!(sent[1]["method"], "session/prompt");
-        assert!(
-            state
-                .receive(json!({ "id": 3, "error": { "code": -32601, "message": "not implemented" } }), mode, cwd, &tools, "hi")
-                .unwrap()
-                .is_empty()
-        );
+        let after =
+            state.receive(json!({ "id": 3, "error": { "code": -32601, "message": "not implemented" } }), mode, cwd, &tools, "hi").unwrap();
+        let prompt_sent: Vec<&Value> = after.iter().filter_map(|a| if let Action::Send(m) = a { Some(m) } else { None }).collect();
+        assert_eq!(prompt_sent.len(), 1);
+        assert_eq!(prompt_sent[0]["id"], 4);
+        assert_eq!(prompt_sent[0]["method"], "session/prompt");
     }
 
     #[test]
@@ -646,15 +676,13 @@ mod tests {
             )
             .unwrap();
         let sent: Vec<&Value> = actions.iter().filter_map(|a| if let Action::Send(m) = a { Some(m) } else { None }).collect();
-        assert_eq!(sent.len(), 3);
+        assert_eq!(sent.len(), 2);
         assert_eq!(sent[0]["id"], 3);
         assert_eq!(sent[0]["method"], "session/set_config_option");
         assert_eq!(sent[0]["params"], json!({ "sessionId": "s", "configId": "model", "value": "openai/gpt-6-sol" }));
         assert_eq!(sent[1]["id"], 4);
         assert_eq!(sent[1]["method"], "session/set_config_option");
         assert_eq!(sent[1]["params"], json!({ "sessionId": "s", "configId": "effort", "value": "high" }));
-        assert_eq!(sent[2]["id"], 5);
-        assert_eq!(sent[2]["method"], "session/prompt");
         assert!(state.receive(json!({ "id": 3, "result": {} }), mode, cwd, &tools, "hi").unwrap().is_empty());
         let err = state
             .receive(
@@ -666,5 +694,7 @@ mod tests {
             )
             .unwrap_err();
         assert!(err.to_string().contains("effort not found"));
+        assert!(supported_version("opencode 3.0.0-beta.1", (2, 3, 2)));
+        assert!(!supported_version("opencode 2.3.1", (2, 3, 2)));
     }
 }

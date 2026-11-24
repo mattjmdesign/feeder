@@ -129,7 +129,17 @@ pub fn format_shortstat(raw: &str) -> Option<String> {
 }
 
 fn git_output(dir: &Path, args: &[&str]) -> Option<String> {
-    let out = std::process::Command::new("git").arg("-C").arg(dir).args(args).output().ok()?;
+    let out = std::process::Command::new("git")
+        .arg("-C")
+        .arg(dir)
+        .arg("--no-optional-locks")
+        .args(args)
+        .env_remove("GIT_DIR")
+        .env_remove("GIT_WORK_TREE")
+        .env_remove("GIT_COMMON_DIR")
+        .env_remove("GIT_INDEX_FILE")
+        .output()
+        .ok()?;
     if !out.status.success() {
         return None;
     }
