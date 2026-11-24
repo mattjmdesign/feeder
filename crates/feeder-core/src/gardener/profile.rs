@@ -8,7 +8,7 @@ use std::time::{Duration, Instant};
 
 use serde_json::{Value, json};
 
-use super::{Backend, session};
+use super::Backend;
 use crate::{Error, Result};
 
 pub(super) fn command(backend: Backend, binary: &Path, data: &Path) -> Result<Command> {
@@ -48,7 +48,7 @@ struct ChildGuard(Child);
 
 impl Drop for ChildGuard {
     fn drop(&mut self) {
-        let _ = session::terminate_child(&mut self.0);
+        let _ = crate::process::terminate_group(&mut self.0);
     }
 }
 

@@ -229,7 +229,7 @@ impl Store {
         let rows = stmt.query_map([], |r| Ok((run_row(r)?, r.get::<_, Option<i64>>(10)?)))?;
         for row in rows {
             let (run, owner) = row?;
-            if owner.is_some_and(process_alive) {
+            if owner.is_some_and(crate::process::is_alive) {
                 return Ok(Some(run));
             }
         }
@@ -301,12 +301,6 @@ impl Store {
         )?;
         Ok(())
     }
-}
-
-pub(crate) fn process_alive(pid: i64) -> bool {
-    let Ok(pid) = libc::pid_t::try_from(pid) else { return false };
-    let rc = unsafe { libc::kill(pid, 0) };
-    rc == 0 || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
 }
 
 pub(crate) fn clip(s: &str, max: usize) -> String {

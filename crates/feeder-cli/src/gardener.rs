@@ -519,15 +519,7 @@ impl StopSignals {
         INTERRUPTED.store(false, Ordering::Relaxed);
         let mut guard = Self(Vec::new());
         for signal in [libc::SIGINT, libc::SIGTERM] {
-            let (mut action, mut previous): (libc::sigaction, libc::sigaction) = unsafe { std::mem::zeroed() };
-            action.sa_sigaction = stop_signal as *const () as usize;
-            if unsafe {
-                libc::sigemptyset(&mut action.sa_mask);
-                libc::sigaction(signal, &action, &mut previous)
-            } != 0
-            {
-                return Err(std::io::Error::last_os_error());
-            }
+            let previous = swap_signal_handler(signal, stop_signal)?;
             guard.0.push((signal, previous));
         }
         Ok(guard)
@@ -537,10 +529,25 @@ impl StopSignals {
 impl Drop for StopSignals {
     fn drop(&mut self) {
         for (signal, previous) in &self.0 {
-            unsafe {
-                libc::sigaction(*signal, previous, std::ptr::null_mut());
-            }
+            restore_signal_action(*signal, previous);
         }
+    }
+}
+
+fn swap_signal_handler(signal: libc::c_int, handler: extern "C" fn(libc::c_int)) -> std::io::Result<libc::sigaction> {
+    let mut action: libc::sigaction = unsafe { std::mem::zeroed() };
+    let mut previous: libc::sigaction = unsafe { std::mem::zeroed() };
+    action.sa_sigaction = handler as libc::sighandler_t;
+    let rc = unsafe {
+        libc::sigemptyset(&mut action.sa_mask);
+        libc::sigaction(signal, &action, &mut previous)
+    };
+    if rc == 0 { Ok(previous) } else { Err(std::io::Error::last_os_error()) }
+}
+
+fn restore_signal_action(signal: libc::c_int, previous: &libc::sigaction) {
+    unsafe {
+        libc::sigaction(signal, previous, std::ptr::null_mut());
     }
 }
 

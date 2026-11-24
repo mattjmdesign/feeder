@@ -52,8 +52,20 @@ pnpm --dir site dev
 
 - **Never write comments in code.** No `//`, `///`, `//!`, `/* ... */`, `#` comments in scripts or config, or `<!-- ... -->` in templates. Write clear names and small functions instead, put CLI help strings in `clap` `#[command(about = ...)]` / `#[arg(help = ...)]` attributes, and put project docs in Markdown files (`AGENTS.md`, `README.md`).
 - `scripts/no-comments.sh` enforces this across all owned code files (only `#!` shebangs, vendored `site/src/stageshow/`, and generated `assets/ThirdPartyLicenses.html` / `site/public/licenses.html` are exempt).
-- **Unsafe code can't carry a `// SAFETY:` comment**, so avoid it when a safe call exists (`/bin/kill` instead of `libc::kill`, for example). When it can't be avoided, put it in a small function named for its one job and record why it's sound here:
-  - `setup::start_in_new_session` calls `setsid` in `pre_exec`. Between fork and exec only async-signal-safe calls are allowed; `setsid` is one, and the closure doesn't allocate. The shell-PATH probe needs its own session: an interactive login shell started from a terminal otherwise grabs that terminal and stalls until the probe times out. Std's safe `CommandExt::setsid` is still unstable.
+- **Unsafe code can't carry a `// SAFETY:` comment**, so its reasoning lives in the register below. Use std or a safe call when one exists. Otherwise keep each `unsafe` block in a small function named for its one job, expose a safe signature, and add the function here. Process control goes in `feeder-core/src/process.rs`; don't call `libc::kill` or `waitid` anywhere else.
+
+#### Unsafe register
+
+| Function | Why it's sound |
+| --- | --- |
+| `process::start_in_new_session` | `setsid` in `pre_exec`. Only async-signal-safe calls are allowed between fork and exec; `setsid` is one, and the closure doesn't allocate. The shell-PATH probe needs its own session, or an interactive login shell started from a terminal grabs that terminal and stalls. Std's safe `CommandExt::setsid` is still unstable. |
+| `process::is_alive` | `kill(pid, 0)` sends no signal; it only checks the PID. Out-of-range PIDs are rejected before the call. |
+| `process::wait_without_reaping` | `waitid` writes into a zeroed `siginfo_t` that we own (all-zero is valid for this plain C struct); `si_pid` is read only after a successful call. `WNOWAIT` leaves the child unreaped, so its PID can't be reused before `terminate_group` signals it. |
+| `process::terminate_group` | `kill(-pgid, SIGKILL)` takes no pointers. Callers spawn the child as a group leader (`process_group(0)` or `start_in_new_session`) and check exit only through `has_exited`/`wait_for_exit`, so the group ID is still ours when we signal it. |
+| `file_preview::open_component` | `openat` gets a `BorrowedFd` that outlives the call and a `CStr` with no interior NUL. A non-negative result is a new descriptor nobody else owns, so wrapping it in `OwnedFd` is the single owner. |
+| `time::local_calendar` | `localtime_r` is the thread-safe form and writes into a zeroed `tm` we own (null `tm_zone` is valid). The result is used only when the call returns non-null. |
+| `feeder-cli` `swap_signal_handler` / `restore_signal_action` | `sigaction` reads and writes `sigaction` structs we own. The installed `stop_signal` handler only stores to an `AtomicBool`, which is async-signal-safe. |
+| `feeder-app` `notify::*`, `updater::start`, `updater::native_snapshot`, `updater::advance` | Calls into our own Objective-C (`notify.m`, `updater.m`) with no preconditions beyond valid C strings. `feeder_notify` copies its strings into `NSString`s before returning. `native_snapshot` copies the `UTF8String` buffers right away on the main thread; they stay valid until the autorelease pool drains, and `updater.m` only changes them on the main thread. |
 
 ### Privacy
 

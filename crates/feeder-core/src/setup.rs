@@ -1,9 +1,8 @@
 use std::ffi::OsString;
 use std::io::Read;
 use std::os::unix::fs::PermissionsExt;
-use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, Stdio};
+use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Mutex, PoisonError};
 use std::time::{Duration, Instant};
@@ -186,20 +185,6 @@ fn probe_login_shell_path() -> Vec<PathBuf> {
         .unwrap_or_default()
 }
 
-fn start_in_new_session(cmd: &mut Command) {
-    unsafe {
-        cmd.pre_exec(|| if libc::setsid() == -1 { Err(std::io::Error::last_os_error()) } else { Ok(()) });
-    }
-}
-
-fn kill_session(child: &mut Child) {
-    let group = format!("-{}", child.id());
-    let _ =
-        Command::new("/bin/kill").args(["-KILL", "--", &group]).stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null()).status();
-    let _ = child.kill();
-    let _ = child.wait();
-}
-
 fn run_path_probe(shell: &Path, args: &[&str], timeout: Duration) -> Option<Vec<PathBuf>> {
     let mut cmd = Command::new(shell);
     cmd.args(args)
@@ -209,7 +194,7 @@ fn run_path_probe(shell: &Path, args: &[&str], timeout: Duration) -> Option<Vec<
         .env("TERM", "dumb")
         .env("NO_COLOR", "1")
         .env("ZSH_TMUX_AUTOSTART", "false");
-    start_in_new_session(&mut cmd);
+    crate::process::start_in_new_session(&mut cmd);
     let mut child = cmd.spawn().ok()?;
     let stdout = child.stdout.take()?;
     let (tx, rx) = std::sync::mpsc::sync_channel(1);
@@ -236,32 +221,27 @@ fn run_path_probe(shell: &Path, args: &[&str], timeout: Duration) -> Option<Vec<
         })
         .is_err()
     {
-        kill_session(&mut child);
+        let _ = crate::process::terminate_group(&mut child);
         return None;
     }
 
     let start = Instant::now();
-    let status = loop {
-        match child.try_wait() {
-            Ok(Some(status)) => break Some(status),
-            Ok(None) if start.elapsed() < timeout => std::thread::sleep(Duration::from_millis(15)),
-            Ok(None) | Err(_) => {
-                kill_session(&mut child);
-                break None;
+    loop {
+        match crate::process::has_exited(child.id()) {
+            Ok(true) => break,
+            Ok(false) if start.elapsed() < timeout => std::thread::sleep(Duration::from_millis(15)),
+            Ok(false) | Err(_) => {
+                let _ = crate::process::terminate_group(&mut child);
+                return None;
             }
         }
-    }?;
+    }
+    let output = rx.recv_timeout(Duration::from_millis(100));
+    let status = crate::process::terminate_group(&mut child).ok()?;
     if !status.success() {
         return None;
     }
-    let bytes = match rx.recv_timeout(Duration::from_millis(100)) {
-        Ok(bytes) => bytes,
-        Err(_) => {
-            kill_session(&mut child);
-            return None;
-        }
-    };
-    parse_path_probe(&String::from_utf8_lossy(&bytes))
+    parse_path_probe(&String::from_utf8_lossy(&output.ok()?))
 }
 
 fn parse_path_probe(output: &str) -> Option<Vec<PathBuf>> {
@@ -1123,6 +1103,26 @@ mod tests {
         let survived = child_alive();
         std::fs::remove_dir_all(&dir).ok();
         assert!(!survived, "the probe's background child {pid} outlived the timeout");
+    }
+
+    #[test]
+    fn path_probe_success_still_stops_children_the_shell_left_behind() {
+        let dir = std::env::temp_dir().join(format!("feeder-probe-ok-{}-{:08x}", std::process::id(), fastrand::u32(..)));
+        std::fs::create_dir_all(&dir).unwrap();
+        let pid_file = dir.join("child.pid");
+        let script =
+            format!("sleep 30 >/dev/null 2>&1 & echo $! > '{}'; printf '{PATH_PROBE_START}/probe/c{PATH_PROBE_END}'", pid_file.display());
+        let dirs = run_path_probe(Path::new("/bin/sh"), &["-c", &script], Duration::from_secs(5));
+        let pid = std::fs::read_to_string(&pid_file).unwrap().trim().to_string();
+        let child_alive = || Command::new("/bin/kill").args(["-0", &pid]).stderr(Stdio::null()).status().is_ok_and(|s| s.success());
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while child_alive() && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        let survived = child_alive();
+        std::fs::remove_dir_all(&dir).ok();
+        assert_eq!(dirs, Some(vec![PathBuf::from("/probe/c")]));
+        assert!(!survived, "the probe left background child {pid} running");
     }
 
     #[test]

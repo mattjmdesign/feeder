@@ -22,14 +22,16 @@ pub fn ago(then_ms: i64, now_ms: i64) -> String {
     if t == "just now" { t } else { format!("{t} ago") }
 }
 
+fn local_calendar(secs: libc::time_t) -> Option<libc::tm> {
+    let mut tm: libc::tm = unsafe { std::mem::zeroed() };
+    let filled = unsafe { !libc::localtime_r(&secs, &mut tm).is_null() };
+    filled.then_some(tm)
+}
+
 fn local_ymd(ms: i64) -> (i32, u8, u8, u8) {
-    let secs = ms.div_euclid(1000) as libc::time_t;
-    #[cfg(unix)]
-    unsafe {
-        let mut tm: libc::tm = std::mem::zeroed();
-        if !libc::localtime_r(&secs, &mut tm).is_null() {
-            return (tm.tm_year + 1900, (tm.tm_mon + 1).clamp(1, 12) as u8, tm.tm_mday.clamp(1, 31) as u8, tm.tm_wday.clamp(0, 6) as u8);
-        }
+    let secs: libc::time_t = ms.div_euclid(1000);
+    if let Some(tm) = local_calendar(secs) {
+        return (tm.tm_year + 1900, (tm.tm_mon + 1).clamp(1, 12) as u8, tm.tm_mday.clamp(1, 31) as u8, tm.tm_wday.clamp(0, 6) as u8);
     }
     let days = secs.div_euclid(86_400);
     let (y, m, d) = civil_from_days(days);

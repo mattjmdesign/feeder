@@ -6,6 +6,7 @@ mod guide;
 mod knowledge;
 mod notebook;
 mod orb;
+mod process;
 mod settings;
 pub mod setup;
 mod store;

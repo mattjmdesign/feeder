@@ -1,7 +1,7 @@
 use std::ffi::CString;
 use std::fs::{File, OpenOptions};
 use std::io::{self, Read};
-use std::os::fd::{AsRawFd, FromRawFd, RawFd};
+use std::os::fd::{AsFd, AsRawFd, BorrowedFd, FromRawFd, OwnedFd};
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Component, Path};
@@ -63,7 +63,7 @@ fn open_project_file(root: &Path, path: &Path) -> io::Result<File> {
         };
         let name = CString::new(name.as_bytes())?;
         let is_dir = parts.peek().is_some();
-        let next = open_component(dir.as_raw_fd(), &name, is_dir)?;
+        let next = open_component(dir.as_fd(), &name, is_dir)?;
         if !is_dir {
             return Ok(next);
         }
@@ -72,16 +72,16 @@ fn open_project_file(root: &Path, path: &Path) -> io::Result<File> {
     Err(io::Error::new(io::ErrorKind::InvalidInput, "Expected a file path"))
 }
 
-fn open_component(directory: RawFd, name: &std::ffi::CStr, is_dir: bool) -> io::Result<File> {
+fn open_component(directory: BorrowedFd<'_>, name: &std::ffi::CStr, is_dir: bool) -> io::Result<File> {
     let mut flags = libc::O_RDONLY | libc::O_CLOEXEC | libc::O_NOFOLLOW | libc::O_NONBLOCK;
     if is_dir {
         flags |= libc::O_DIRECTORY;
     }
-    let fd = unsafe { libc::openat(directory, name.as_ptr(), flags) };
+    let fd = unsafe { libc::openat(directory.as_raw_fd(), name.as_ptr(), flags) };
     if fd < 0 {
         return Err(io::Error::last_os_error());
     }
-    Ok(unsafe { File::from_raw_fd(fd) })
+    Ok(File::from(unsafe { OwnedFd::from_raw_fd(fd) }))
 }
 
 #[cfg(test)]

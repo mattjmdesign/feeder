@@ -9,7 +9,7 @@ use std::time::{Duration, Instant};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-use super::{Backend, profile, session};
+use super::{Backend, profile};
 use crate::{Error, Result};
 
 const FILE: &str = "curator.json";
@@ -223,14 +223,14 @@ fn read_command_stdout(cmd: &mut Command, timeout: Duration) -> io::Result<(std:
         });
         let start = Instant::now();
         let exited = loop {
-            match session::child_exited(child.id()) {
+            match crate::process::has_exited(child.id()) {
                 Ok(true) => break Ok(()),
                 Ok(false) if start.elapsed() < timeout => std::thread::sleep(Duration::from_millis(25)),
                 Ok(false) => break Err(io::Error::new(io::ErrorKind::TimedOut, "model list timed out")),
                 Err(error) => break Err(error),
             }
         };
-        let status = session::terminate_child(&mut child);
+        let status = crate::process::terminate_group(&mut child);
         let text = reader.join().unwrap_or_default();
         exited?;
         Ok((status?, text))

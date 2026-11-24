@@ -6,7 +6,7 @@ use std::time::{Duration, Instant};
 
 use serde_json::Value;
 
-use super::{Backend, profile, session};
+use super::{Backend, profile};
 
 const CODEX_ACCOUNT_TIMEOUT: Duration = Duration::from_secs(3);
 
@@ -175,14 +175,14 @@ fn read_output(cmd: &mut Command, timeout: Duration) -> io::Result<(ExitStatus, 
         let stderr = scope.spawn(move || read_bounded(stderr));
         let start = Instant::now();
         let exited = loop {
-            match session::child_exited(child.id()) {
+            match crate::process::has_exited(child.id()) {
                 Ok(true) => break Ok(()),
                 Ok(false) if start.elapsed() < timeout => std::thread::sleep(Duration::from_millis(20)),
                 Ok(false) => break Err(io::Error::new(io::ErrorKind::TimedOut, "provider status check timed out")),
                 Err(error) => break Err(error),
             }
         };
-        let status = session::terminate_child(&mut child);
+        let status = crate::process::terminate_group(&mut child);
         exited?;
         let stdout = stdout.join().map_err(|_| io::Error::other("couldn't read provider status"))??;
         let stderr = stderr.join().map_err(|_| io::Error::other("couldn't read provider status"))??;

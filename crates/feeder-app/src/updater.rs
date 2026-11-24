@@ -35,6 +35,17 @@ pub fn start() {
     unsafe { feeder_start_updater(wake) }
 }
 
+fn native_snapshot() -> (NativeSnapshot, [String; 3]) {
+    let native = unsafe { feeder_update_snapshot() };
+    let copy = |s: *const c_char| if s.is_null() { String::new() } else { unsafe { CStr::from_ptr(s) }.to_string_lossy().into_owned() };
+    let strings = [copy(native.version), copy(native.notes), copy(native.message)];
+    (native, strings)
+}
+
+fn advance() {
+    unsafe { feeder_update_advance() }
+}
+
 extern "C" fn wake() {
     let _ = std::panic::catch_unwind(|| {
         if let Some(waker) = WAKE.get() {
@@ -111,12 +122,7 @@ pub struct Updates {
 }
 
 pub fn poll(s: &mut State) -> bool {
-    let (native, [version, notes, message]) = unsafe {
-        let native = feeder_update_snapshot();
-        let copy = |s: *const c_char| if s.is_null() { String::new() } else { CStr::from_ptr(s).to_string_lossy().into_owned() };
-        let strings = [copy(native.version), copy(native.notes), copy(native.message)];
-        (native, strings)
-    };
+    let (native, [version, notes, message]) = native_snapshot();
     let phase = Phase::try_from(native.phase).unwrap_or(Phase::Idle);
     let snapshot = Snapshot {
         phase,
@@ -242,14 +248,10 @@ pub fn view(s: &State, p: &style::Palette, k: &Kit, layer: &mut Vec<El>) {
     };
     if let Some(label) = action {
         content = content.child(
-            row().w_full().justify_end().child(
-                Button::new(label)
-                    .variant(ButtonVariant::Contrast)
-                    .on_press(|_: &mut State| {
-                        unsafe { feeder_update_advance() };
-                    })
-                    .build(k),
-            ),
+            row()
+                .w_full()
+                .justify_end()
+                .child(Button::new(label).variant(ButtonVariant::Contrast).on_press(|_: &mut State| advance()).build(k)),
         );
     }
     layer.push(scrim("feeder-update-dismiss", |s: &mut State| s.updates.open = false));

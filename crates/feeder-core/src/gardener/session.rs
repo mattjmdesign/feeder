@@ -644,7 +644,7 @@ impl Inner {
     fn monitor(&self, id: u32, timeout: Option<Duration>) -> std::io::Result<Option<ExitStatus>> {
         let Some(limit) = timeout else {
             loop {
-                match wait_child_exit(id) {
+                match crate::process::wait_for_exit(id) {
                     Ok(()) => break,
                     Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {
                         if self.stopping.load(Ordering::Acquire) {
@@ -657,7 +657,7 @@ impl Inner {
             }
             let mut slot = lock(&self.child);
             let Some(child) = slot.as_mut().filter(|child| child.id() == id) else { return Ok(None) };
-            let status = terminate_child(child);
+            let status = crate::process::terminate_group(child);
             *slot = None;
             return status.map(Some);
         };
@@ -667,12 +667,12 @@ impl Inner {
                 let mut slot = lock(&self.child);
                 let Some(child) = slot.as_mut().filter(|child| child.id() == id) else { return Ok(None) };
                 if started.elapsed() >= limit {
-                    let _ = terminate_child(child);
+                    let _ = crate::process::terminate_group(child);
                     *slot = None;
                     return Err(std::io::Error::new(std::io::ErrorKind::TimedOut, "provider startup timed out"));
                 }
-                if child_exited(id)? {
-                    let status = terminate_child(child);
+                if crate::process::has_exited(id)? {
+                    let status = crate::process::terminate_group(child);
                     *slot = None;
                     return status.map(Some);
                 }
@@ -685,7 +685,7 @@ impl Inner {
         {
             let mut slot = lock(&self.child);
             if let Some(child) = slot.as_mut() {
-                let _ = terminate_child(child);
+                let _ = crate::process::terminate_group(child);
                 *slot = None;
             }
         }
@@ -711,32 +711,6 @@ impl Inner {
 
 fn process_status(monitor: ProcessMonitor) -> std::io::Result<Option<ExitStatus>> {
     monitor.join().map_err(|_| std::io::Error::other("provider monitor stopped unexpectedly"))?
-}
-
-fn wait_child_exit(id: u32) -> std::io::Result<()> {
-    let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
-    let result = unsafe { libc::waitid(libc::P_PID, id, &mut info, libc::WEXITED | libc::WNOWAIT) };
-    if result == 0 { Ok(()) } else { Err(std::io::Error::last_os_error()) }
-}
-
-pub(super) fn child_exited(id: u32) -> std::io::Result<bool> {
-    let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
-    let result = unsafe { libc::waitid(libc::P_PID, id, &mut info, libc::WEXITED | libc::WNOHANG | libc::WNOWAIT) };
-    if result == 0 {
-        return Ok(unsafe { info.si_pid() } != 0);
-    }
-    let error = std::io::Error::last_os_error();
-    if error.kind() == std::io::ErrorKind::Interrupted { Ok(false) } else { Err(error) }
-}
-
-pub(super) fn terminate_child(child: &mut Child) -> std::io::Result<ExitStatus> {
-    if let Ok(group) = libc::pid_t::try_from(child.id())
-        && group > 0
-    {
-        unsafe { libc::kill(-group, libc::SIGKILL) };
-    }
-    let _ = child.kill();
-    child.wait()
 }
 
 fn stderr_tail(mut reader: impl Read) -> String {
@@ -813,7 +787,7 @@ fn sweep_orphans() {
     for entry in entries.flatten() {
         let name = entry.file_name();
         let owner = name.to_str().and_then(|n| n.strip_prefix(SCRATCH_PREFIX)).and_then(|rest| rest.split('-').next()?.parse::<i64>().ok());
-        if owner.is_some_and(|pid| !super::process_alive(pid)) {
+        if owner.is_some_and(|pid| !crate::process::is_alive(pid)) {
             let _ = std::fs::remove_dir_all(entry.path());
         }
     }
@@ -887,24 +861,5 @@ mod tests {
         assert_eq!(acp_error_message(&closed, "401 Unauthorized\n"), "401 Unauthorized");
         let specific = Error::Invalid("Unknown model ID: bad".into());
         assert_eq!(acp_error_message(&specific, "noisy debug log\n"), "Unknown model ID: bad");
-    }
-
-    #[test]
-    fn reaping_the_provider_closes_pipes_held_by_its_children() {
-        let mut child = Command::new("/bin/sh")
-            .args(["-c", "/bin/sleep 5 & printf 'provider finished\\n'"])
-            .process_group(0)
-            .stdout(Stdio::piped())
-            .spawn()
-            .unwrap();
-        let started = Instant::now();
-        while !child_exited(child.id()).unwrap() && started.elapsed() < Duration::from_secs(2) {
-            std::thread::sleep(Duration::from_millis(10));
-        }
-        assert!(terminate_child(&mut child).unwrap().success());
-        let mut output = String::new();
-        child.stdout.take().unwrap().read_to_string(&mut output).unwrap();
-        assert_eq!(output, "provider finished\n");
-        assert!(started.elapsed() < Duration::from_secs(3));
     }
 }

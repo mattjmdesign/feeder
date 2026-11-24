@@ -8,7 +8,7 @@ use std::time::{Duration, Instant};
 
 use serde_json::{Value, json};
 
-use super::{Backend, profile, session};
+use super::{Backend, profile};
 use crate::{Error, Result};
 
 const LOGIN_TIMEOUT: Duration = Duration::from_secs(300);
@@ -40,7 +40,7 @@ impl Backend {
                 });
                 loop {
                     check_login(cancel, deadline)?;
-                    if session::child_exited(child.child.id())? {
+                    if crate::process::has_exited(child.child.id())? {
                         let status = child.finish()?;
                         let detail = stderr.and_then(|t| t.join().ok()).unwrap_or_default();
                         return if status.success() {
@@ -76,7 +76,7 @@ impl LoginChild {
 
     fn finish(&mut self) -> io::Result<std::process::ExitStatus> {
         self.reaped = true;
-        session::terminate_child(&mut self.child)
+        crate::process::terminate_group(&mut self.child)
     }
 }
 
