@@ -187,11 +187,12 @@ fn start_copy_image_to_clipboard(s: &mut State, path: std::path::PathBuf) {
 }
 
 pub fn menu(s: &State, p: &Palette, k: &Kit, layer: &mut Vec<El>) -> El {
+    let label = if s.open.is_some() { "Project actions and settings" } else { "Settings and more" };
     let trigger = row()
         .key("menu-button")
         .role("button")
-        .label("Settings and more")
-        .help("Settings and more")
+        .label(label)
+        .help(label)
         .focusable(true)
         .size(30.0, 28.0)
         .center()

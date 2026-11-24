@@ -65,7 +65,7 @@ pub fn view(s: &State, p: &Palette, k: &Kit, layer: &mut Vec<El>) -> El {
     }
 
     let filter_bar = filter_row(s, p);
-    let waiting = unfiltered.then(|| needs_you_now(s, p)).flatten();
+    let waiting = unfiltered.then(|| needs_you_now(s, p, k)).flatten();
     let live = unfiltered.then(|| working_now(s, p, k)).flatten();
     let watcher = s.watcher.clone();
     let asked = s.timeline_asked.clone();
@@ -271,47 +271,51 @@ fn strip_label(label: &str, p: &Palette) -> El {
     text(label.to_uppercase()).font(style::LABEL).color(p.text_3).pb(2.0)
 }
 
-fn needs_you_now(s: &State, p: &Palette) -> Option<El> {
+fn needs_you_now(s: &State, p: &Palette, k: &Kit) -> Option<El> {
     let waiting: Vec<&ProjectSummary> = s.projects.iter().filter(|p| !p.project.archived && p.needs_you).collect();
     if waiting.is_empty() {
         return None;
     }
-    let action = |key: String, label: &str, a11y: String| {
-        row()
-            .key(key)
-            .role("button")
-            .label(a11y)
-            .focusable(true)
-            .h(24.0)
-            .px(8.0)
-            .center_y()
-            .radius(6.0)
-            .border(1.0, p.hairline)
-            .hover(p.hover)
-            .cursor(Cursor::Pointer)
-            .child(text(label.to_string()).font(style::META).color(p.text_2))
-    };
     let mut rows = col().key("needs-you-now").w_full().gap(6.0).pb(4.0).child(strip_label("Needs you", p));
     for summary in waiting {
         let id = summary.project.id;
         let name = summary.project.name.clone();
         let question = crate::home::needs_you_question(summary).unwrap_or_else(|| "Waiting for your reply".into());
         let mut actions = row().gap(4.0).center_y();
-        if let Some(uid) = summary.last_update_id {
+        let update_id = summary.last_update_id;
+        if let Some(uid) = update_id {
             actions = actions
-                .child(action(format!("needs-reply-{id}"), "Reply", format!("Reply to {name}")).on_press_tx(
-                    move |s: &mut State, tx: &mut Tx| {
-                        s.open_project_at(id, Some(uid));
-                        s.start_reply(uid, tx);
-                    },
-                ))
                 .child(
-                    action(format!("needs-dismiss-{id}"), "Dismiss", format!("Dismiss Needs you for {name}"))
-                        .on_press(move |s: &mut State| s.dismiss_attention(uid)),
+                    Button::new("Reply")
+                        .variant(ButtonVariant::Contrast)
+                        .control_size(ControlSize::Small)
+                        .on_press_tx(move |s: &mut State, tx: &mut Tx| {
+                            s.open_project_at(id, Some(uid));
+                            s.start_reply(uid, tx);
+                        })
+                        .build(k)
+                        .label(format!("Reply to {name}"))
+                        .key(format!("needs-reply-{id}")),
+                )
+                .child(
+                    Button::new("Dismiss")
+                        .variant(ButtonVariant::GhostMuted)
+                        .control_size(ControlSize::Small)
+                        .on_press(move |s: &mut State| s.dismiss_attention(uid))
+                        .build(k)
+                        .label(format!("Dismiss Needs You for {name}"))
+                        .key(format!("needs-dismiss-{id}")),
                 );
         }
-        actions = actions
-            .child(action(format!("needs-open-{id}"), "Open", format!("Open {name}")).on_press(move |s: &mut State| s.open_project(id)));
+        actions = actions.child(
+            Button::new("Open")
+                .variant(ButtonVariant::Outline)
+                .control_size(ControlSize::Small)
+                .on_press(move |s: &mut State| s.open_project_at(id, update_id))
+                .build(k)
+                .label(format!("Open the update in {name}"))
+                .key(format!("needs-open-{id}")),
+        );
         rows = rows.child(
             row()
                 .key(format!("needs-{id}"))

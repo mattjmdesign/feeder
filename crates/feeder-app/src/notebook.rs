@@ -23,7 +23,7 @@ use crate::{CopyTarget, State, ToastItem, ToastKind, agents, chrome, feed};
 pub(crate) const INDEX_MAX_W: f32 = 720.0;
 const CARD_MIN_W: f32 = 408.0;
 const CARD_H: f32 = 112.0;
-const TILE: f32 = CARD_H - 2.0 * CARD_PAD;
+const TILE: f32 = 64.0;
 const CARD_PAD: f32 = 8.0;
 pub(crate) const INDEX_PAD: f32 = 32.0;
 const CARD_GAP: f32 = 12.0;
@@ -632,7 +632,7 @@ pub fn view(s: &State, p: &Palette, k: &Kit, inset: f32, reduced_motion: bool, l
         .instant_changes()
         .child(scroll_area);
 
-    let toolbar = Toolbar::new().leading(toolbar_breadcrumb(nb, p, k)).trailing(chrome::tabs(s, k)).trailing(chrome::curator_button(s, p));
+    let toolbar = Toolbar::new().leading(toolbar_breadcrumb(s, p, k)).trailing(chrome::tabs(s, k)).trailing(chrome::curator_button(s, p));
 
     SplitView::new(main_area)
         .sidebar(&nb.pane, |s: &mut State| &mut s.notebook.pane, sidebar_view(s, p, k))
@@ -647,7 +647,9 @@ pub fn view(s: &State, p: &Palette, k: &Kit, inset: f32, reduced_motion: bool, l
 
 pub(crate) const CRUMB_PAD: f32 = 10.0;
 
-fn toolbar_breadcrumb(nb: &Notebook, p: &Palette, k: &Kit) -> El {
+fn toolbar_breadcrumb(s: &State, p: &Palette, k: &Kit) -> El {
+    const COMPACT_BREADCRUMB_WIDTH: f32 = 880.0;
+    let nb = &s.notebook;
     let sep = || text("/").font(style::META).color(p.text_3).px(2.0);
     let crumb_btn = |key: &str, label: &str, active: bool| {
         let btn = Button::new(label.to_string())
@@ -657,6 +659,14 @@ fn toolbar_breadcrumb(nb: &Notebook, p: &Palette, k: &Kit) -> El {
     };
 
     let mut row_el = row().key("nb-breadcrumb").gap(2.0).center_y().shrink().min_w(0.0).instant_changes();
+    if s.window_size[0] < COMPACT_BREADCRUMB_WIDTH {
+        let library = if nb.editor.is_none() && nb.open.is_none() && nb.shelf == Shelf::All {
+            text("Library").key("nb-bc-root").font(k.ty.ui_compact).color(p.text).pl(CRUMB_PAD)
+        } else {
+            crumb_btn("nb-bc-root", "Library", false).on_press(|s: &mut State| s.notebook_shelf(Shelf::All))
+        };
+        return row_el.child(library);
+    }
     if let Some(ed) = &nb.editor {
         let title_crumb = if ed.title.text.trim().is_empty() {
             if ed.id.is_some() { "Edit note".to_string() } else { "New note".to_string() }
@@ -905,7 +915,7 @@ fn index_card(s: &State, page: &Page, rank: usize, p: &Palette) -> El {
         .pt(1.0)
         .pr(8.0)
         .child(text(page.title.clone()).font(style::NAME).color(p.text).w_full().h(style::NAME.line_height * 2.0).wrap().max_lines(2))
-        .child(text(page.excerpt(240)).font(style::META).color(p.text_2).w_full().h(style::META.line_height * 2.0).max_lines(2))
+        .child(text(page.preview(240)).font(style::META).color(p.text_2).w_full().h(style::META.line_height * 2.0).max_lines(2))
         .child(text(ago(page.updated_at, s.now)).font(style::META).color(p.text_3));
     row()
         .key(format!("nb-page-{id}"))
@@ -916,6 +926,7 @@ fn index_card(s: &State, page: &Page, rank: usize, p: &Palette) -> El {
         .h(CARD_H)
         .padding(CARD_PAD)
         .gap(14.0)
+        .center_y()
         .radius(14.0)
         .fill(p.card)
         .border(1.0, p.hairline)

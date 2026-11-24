@@ -272,6 +272,10 @@ impl Page {
         markdown_excerpt(&self.body, max_chars)
     }
 
+    pub fn preview(&self, max_chars: usize) -> String {
+        preview_excerpt(&self.body, max_chars)
+    }
+
     pub fn to_markdown(&self, project: Option<&str>, now: i64) -> String {
         let mut meta = vec![self.topic_label()];
         if self.kind != Kind::Note {
@@ -661,6 +665,45 @@ pub fn normalize_tags(raw: &[String]) -> Vec<String> {
         .filter(|t| TAG_CHARS.contains(&t.chars().count()))
         .filter(|t| seen.insert(t.clone()))
         .collect()
+}
+
+fn preview_excerpt(md: &str, max_chars: usize) -> String {
+    takeaway_section(md)
+        .map(|section| markdown_excerpt(section, max_chars))
+        .filter(|excerpt| !excerpt.is_empty())
+        .unwrap_or_else(|| markdown_excerpt(md, max_chars))
+}
+
+fn takeaway_section(md: &str) -> Option<&str> {
+    let mut offset = 0;
+    let mut takeaway = None;
+    let mut fence = None;
+    for raw in md.split_inclusive('\n') {
+        let start = offset;
+        offset += raw.len();
+        let line = raw.trim();
+        if let Some(&marker @ (b'`' | b'~')) = line.as_bytes().first() {
+            let count = line.bytes().take_while(|&byte| byte == marker).count();
+            match fence {
+                Some((open, len)) if marker == open && count >= len && line[count..].trim().is_empty() => fence = None,
+                None if count >= 3 => fence = Some((marker, count)),
+                _ => {}
+            }
+        }
+        if fence.is_some() || !is_atx_heading(line) {
+            continue;
+        }
+        let title = line.trim_start_matches('#');
+        let level = line.len() - title.len();
+        if let Some((body_start, section_level)) = takeaway {
+            if level <= section_level {
+                return Some(&md[body_start..start]);
+            }
+        } else if title.trim().trim_end_matches('#').trim_end().eq_ignore_ascii_case("takeaway") {
+            takeaway = Some((offset, level));
+        }
+    }
+    takeaway.map(|(start, _)| &md[start..])
 }
 
 pub fn markdown_excerpt(md: &str, max_chars: usize) -> String {
@@ -1343,6 +1386,14 @@ mod tests {
         assert!(md.contains("Agents & MCP · Decision"));
         assert!(md.contains("Ship **stdio** only."));
         assert!(page.excerpt(80).contains("Considered an HTTP transport"));
+    }
+
+    #[test]
+    fn preview_uses_the_takeaway_and_keeps_unstructured_notes_readable() {
+        let body = "## What happened\n\nThe server timed out.\n\n```md\n## Takeaway\nIgnore this example.\n```\n\n## Takeaway\n\n### For requests\n\nUse a **short timeout**.\n\n## Sources\n\nA test run.";
+        assert_eq!(preview_excerpt(body, 100), "Use a short timeout.");
+        assert_eq!(preview_excerpt("An older note.\n\n## Takeaway\n\n## Sources", 100), "An older note.");
+        assert_eq!(preview_excerpt("An older note.", 100), "An older note.");
     }
 
     #[test]

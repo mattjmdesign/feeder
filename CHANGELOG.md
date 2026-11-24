@@ -3,6 +3,14 @@
 What changed in each version of Feeder, newest first. Each section is copied from
 `release-notes/<version>.md` by `scripts/changelog.sh`; edit those files, not this one.
 
+## 0.5.14
+
+- Library cards give titles more room and show the takeaway when a note has one. Breadcrumbs fit alongside the tabs in smaller windows.
+- Open an update directly from its Needs You badge on Home. In Feed, Reply is easier to spot.
+- Project actions for renaming and archiving moved to the bottom-left menu. Copy Context stays in the toolbar.
+- Setup keeps its buttons visible while the tool list scrolls and confirms your first update when it arrives.
+- Curator opens with a simpler chat screen. The proposal card shows the edit, and replies focus on evidence and open questions.
+
 ## 0.5.13
 
 - Feeder preserves your custom agent guides and existing command line tools. Uninstall removes the unedited guides and command line links Feeder installed.

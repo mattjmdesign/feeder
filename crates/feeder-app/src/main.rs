@@ -82,9 +82,8 @@ pub enum HomeFilter {
     Working,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum OnboardingStep {
-    #[default]
     Connect,
     FirstUpdate,
     Curator,
@@ -185,7 +184,7 @@ pub struct State {
     pub limit: usize,
     pub hovered: Option<i64>,
     pub home_filter: HomeFilter,
-    pub onboarding_step: OnboardingStep,
+    pub onboarding_step: Option<OnboardingStep>,
     pub home_selected: Option<i64>,
     pub feed_selected: Option<i64>,
     pub timeline_selected: Option<i64>,
@@ -273,7 +272,7 @@ impl State {
             limit: PAGE,
             hovered: None,
             home_filter: HomeFilter::All,
-            onboarding_step: OnboardingStep::Connect,
+            onboarding_step: None,
             home_selected: None,
             feed_selected: None,
             timeline_selected: None,
@@ -865,11 +864,15 @@ impl State {
         }
     }
 
-    pub fn set_onboarding_skipped(&mut self, skipped: bool) {
-        self.settings.onboarding_skipped = skipped;
-        if !skipped {
-            self.onboarding_step = OnboardingStep::Connect;
-        }
+    pub fn start_onboarding(&mut self) {
+        self.settings.onboarding_skipped = false;
+        self.onboarding_step = Some(OnboardingStep::Connect);
+        self.save_settings();
+    }
+
+    pub fn finish_onboarding(&mut self) {
+        self.settings.onboarding_skipped = true;
+        self.onboarding_step = None;
         self.save_settings();
     }
 
@@ -1223,12 +1226,7 @@ fn poll(s: &mut State, clock: f64, tx: &mut Tx) -> bool {
     }
     s.sync_search();
     changed |= s.notebook.chat.drain();
-    let onboarding_curator = s.loaded
-        && s.projects.is_empty()
-        && !s.settings.onboarding_skipped
-        && s.open.is_none()
-        && s.tab == Tab::Home
-        && s.onboarding_step == OnboardingStep::Curator;
+    let onboarding_curator = s.loaded && s.open.is_none() && s.tab == Tab::Home && s.onboarding_step == Some(OnboardingStep::Curator);
     s.curator_sign_in.follow_accounts(
         ((s.settings_open && s.settings_page == chrome::SettingsPage::Curator) || onboarding_curator)
             && s.notebook.preview_backends.is_none(),
@@ -1361,6 +1359,9 @@ fn poll(s: &mut State, clock: f64, tx: &mut Tx) -> bool {
             s.seen_max_update_id = max_id;
         } else if !was_loaded {
             s.seen_max_update_id = max_id;
+        }
+        if snap.error.is_none() && snap.projects.is_empty() && !s.settings.onboarding_skipped && s.onboarding_step.is_none() {
+            s.onboarding_step = Some(OnboardingStep::Connect);
         }
         s.projects = snap.projects;
         s.timeline = snap.timeline;
@@ -1603,15 +1604,15 @@ fn main() {
             ("app-icon", |s| s.icon = true),
             ("onboarding-connect", |s| {
                 s.settings.onboarding_skipped = false;
-                s.onboarding_step = OnboardingStep::Connect;
+                s.onboarding_step = Some(OnboardingStep::Connect);
             }),
             ("onboarding-first-update", |s| {
                 s.settings.onboarding_skipped = false;
-                s.onboarding_step = OnboardingStep::FirstUpdate;
+                s.onboarding_step = Some(OnboardingStep::FirstUpdate);
             }),
             ("onboarding-curator", |s| {
                 s.settings.onboarding_skipped = false;
-                s.onboarding_step = OnboardingStep::Curator;
+                s.onboarding_step = Some(OnboardingStep::Curator);
             }),
             ("onboarding-skipped", |s| s.settings.onboarding_skipped = true),
             ("toast-update", |s| {
@@ -1721,7 +1722,6 @@ fn main() {
                 s.tab = Tab::Curator;
                 let events = vec![
                     Event::Started,
-                    Event::Text("Flag 2 says the busy timeout and writer rule are missing, so I'm proposing an update to the SQLite note.".into()),
                     Event::ToolStarted(ToolCall {
                         id: "w".into(),
                         name: "write_page".into(),
@@ -1732,7 +1732,6 @@ fn main() {
                         output: r#"{"proposal_id":1,"status":"pending","action":"revised","page_id":1}"#.into(),
                         failed: false,
                     },
-                    Event::Text("I've proposed adding the 5,000 ms `busy_timeout` and single-writer rule to [SQLite returns SQLITE_BUSY under parallel writes](feeder://library/1). Click **Apply** above to save it.".into()),
                     Event::TurnFinished,
                 ];
                 gardener::replay(&mut s.notebook.chat, feeder_core::gardener::Backend::OpenCode, events);
@@ -2277,13 +2276,13 @@ mod tests {
         assert_eq!(OnboardingStep::Curator.next(), None);
 
         let mut s = State::new();
-        s.onboarding_step = OnboardingStep::Curator;
-        s.set_onboarding_skipped(true);
+        s.onboarding_step = Some(OnboardingStep::Curator);
+        s.finish_onboarding();
         assert!(s.settings.onboarding_skipped);
-        assert_eq!(s.onboarding_step, OnboardingStep::Curator);
+        assert_eq!(s.onboarding_step, None);
 
-        s.set_onboarding_skipped(false);
+        s.start_onboarding();
         assert!(!s.settings.onboarding_skipped);
-        assert_eq!(s.onboarding_step, OnboardingStep::Connect);
+        assert_eq!(s.onboarding_step, Some(OnboardingStep::Connect));
     }
 }

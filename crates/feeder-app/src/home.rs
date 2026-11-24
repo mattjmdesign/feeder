@@ -13,8 +13,10 @@ pub fn view(s: &State, p: &Palette, k: &Kit, reduced_motion: bool, layer: &mut V
         message(p, "Can't open the store", err)
     } else if !s.loaded {
         el().key("loading").grow(1.0)
+    } else if let Some(step) = s.onboarding_step {
+        onboarding(s, step, p, k)
     } else if s.projects.is_empty() {
-        empty(s, p, k)
+        centered_scroll(s, k, "empty-scroll-area", "home-empty-skipped", 32.0, 64.0, skipped_empty(s, p, k))
     } else {
         shelf(s, p, k, reduced_motion, layer)
     };
@@ -243,37 +245,29 @@ fn tile(s: &State, summary: &ProjectSummary, p: &Palette, k: &Kit, reduced_motio
         name_row = name_row.child(text("★").font(style::META).color(p.text_3));
     }
 
-    let mut words = col().items_center().gap(5.0).child(name_row).child(meta);
+    let words = col().items_center().gap(5.0).child(name_row).child(meta);
     let status_text =
         |line: String, color| text(line).font(style::META).color(color).align(rune::Align::Center).max_lines(2).max_w(width - 4.0);
-    if !archived && let Some(pulse) = &summary.active_pulse {
-        words = words.child(status_text(format!("Working · {}", pulse.status), p.live));
-    } else if !archived && summary.needs_you {
-        words = words
-            .child(el().px(6.0).py(1.0).radius(5.0).fill(p.amber.alpha(0.14)).child(text("Needs you").font(style::META).color(p.text)));
-        if let Some(question) = needs_you_question(summary) {
-            words = words.child(status_text(question, p.text_2));
-        }
-    }
-    if s.settings.show_folders
-        && summary.project.renamed()
-        && let Some(folder) = summary.project.folder()
-    {
-        words = words.child(text(folder).font(style::PATH).color(p.text_3.alpha(0.85)).truncate().max_w(width - 4.0));
-    }
-
-    let card = col()
-        .key(format!("tile-{id}"))
+    let project_button = col()
+        .key(format!("project-open-{id}"))
         .role("button")
         .label(label)
         .focusable(true)
-        .w(width)
+        .w_full()
         .items_center()
         .gap(16.0)
-        .py(12.0)
         .cursor(Cursor::Pointer)
         .press_scale(0.97)
         .motion(motion::DEFAULT)
+        .on_press(move |s: &mut State| s.open_project(id))
+        .child(sphere)
+        .child(words);
+    let mut card = col()
+        .key(format!("tile-{id}"))
+        .w(width)
+        .items_center()
+        .gap(5.0)
+        .py(12.0)
         .on_hover_change(move |s: &mut State, on: bool, _tx: &mut Tx| {
             if on {
                 s.hovered = Some(id);
@@ -281,10 +275,34 @@ fn tile(s: &State, summary: &ProjectSummary, p: &Palette, k: &Kit, reduced_motio
                 s.hovered = None;
             }
         })
-        .on_press(move |s: &mut State| s.open_project(id))
         .on_secondary_press(move |s: &mut State, ptr, _| s.orb_menu = Some((id, ptr)))
-        .child(sphere)
-        .child(words);
+        .child(project_button);
+
+    if !archived
+        && summary.needs_you
+        && let Some(update_id) = summary.last_update_id
+    {
+        card = card.child(
+            Button::new("Needs You")
+                .variant(ButtonVariant::Outline)
+                .control_size(ControlSize::Small)
+                .on_press(move |s: &mut State| s.open_project_at(id, Some(update_id)))
+                .build(k)
+                .label(format!("Open the update that needs you in {}", summary.project.name))
+                .key(format!("home-needs-{id}")),
+        );
+        if let Some(question) = needs_you_question(summary) {
+            card = card.child(status_text(question, p.text_2));
+        }
+    } else if !archived && let Some(pulse) = &summary.active_pulse {
+        card = card.child(status_text(format!("Working · {}", pulse.status), p.live));
+    }
+    if s.settings.show_folders
+        && summary.project.renamed()
+        && let Some(folder) = summary.project.folder()
+    {
+        card = card.child(text(folder).font(style::PATH).color(p.text_3.alpha(0.85)).truncate().max_w(width - 4.0));
+    }
 
     let point = s.orb_menu.and_then(|(mid, ptr)| (mid == id).then_some(ptr));
     let mut ctx =
@@ -345,6 +363,7 @@ fn all_archived(p: &Palette, size: f32, count: usize) -> El {
 
 const WELCOME_ORB: feeder_core::Orb =
     feeder_core::Orb { seed: 3, hues: [220.0, 265.0, 195.0], chroma: 0.14, angle: 0.9, pattern: feeder_core::Pattern::Pearl };
+const ONBOARDING_WIDTH: f32 = 440.0;
 
 fn grouped_list(p: &Palette, rows: Vec<El>) -> El {
     let mut list = col().w_full().radius(12.0).fill(p.card).border(1.0, p.hairline).clip_rounded(12.0);
@@ -383,7 +402,7 @@ fn step_indicator(current: OnboardingStep, p: &Palette, k: &Kit) -> El {
                 .center()
                 .cursor(Cursor::Pointer)
                 .label(format!("Step {}: {}", idx + 1, step.label()))
-                .on_press(move |s: &mut State| s.onboarding_step = step)
+                .on_press(move |s: &mut State| s.onboarding_step = Some(step))
                 .child(el().w(28.0).h(3.0).radius(1.5).fill(fill)),
         );
     }
@@ -396,7 +415,7 @@ fn step_header(orb_spec: &feeder_core::Orb, title: &str, subtitle: &str, p: &Pal
         .gap(8.0)
         .child(orb::orb(orb_spec, 48.0))
         .child(text(title.to_string()).font(style::DISPLAY).color(p.text).align(rune::Align::Center).mt(8.0))
-        .child(text(subtitle.to_string()).font(style::BODY).color(p.text_2).wrap().max_w(440.0).align(rune::Align::Center))
+        .child(text(subtitle.to_string()).font(style::BODY).color(p.text_2).wrap().max_w(ONBOARDING_WIDTH).align(rune::Align::Center))
 }
 
 fn onboarding_tool_row(s: &State, p: &Palette, k: &Kit, tool: feeder_core::setup::Tool, link: &Link) -> El {
@@ -517,27 +536,6 @@ fn connect_step(s: &State, p: &Palette, k: &Kit) -> El {
                 .key("home-rescan"),
         );
 
-    let footer = row()
-        .w_full()
-        .center_y()
-        .child(
-            Button::new("Skip")
-                .variant(ButtonVariant::GhostMuted)
-                .control_size(ControlSize::Regular)
-                .on_press(|s: &mut State| s.set_onboarding_skipped(true))
-                .build(k)
-                .key("home-onboarding-skip"),
-        )
-        .child(rune::spacer())
-        .child(
-            Button::new("Continue")
-                .variant(ButtonVariant::Contrast)
-                .control_size(ControlSize::Regular)
-                .on_press(|s: &mut State| s.onboarding_step = OnboardingStep::FirstUpdate)
-                .build(k)
-                .key("home-onboarding-next"),
-        );
-
     col()
         .w_full()
         .items_center()
@@ -549,7 +547,6 @@ fn connect_step(s: &State, p: &Palette, k: &Kit) -> El {
             p,
         ))
         .child(col().w_full().gap(8.0).child(grouped_list(p, rows)).child(utility))
-        .child(footer)
 }
 
 pub fn starter_prompt(s: &State, p: &Palette, k: &Kit, fill: Color, key: &'static str) -> El {
@@ -579,45 +576,11 @@ pub fn starter_prompt(s: &State, p: &Palette, k: &Kit, fill: Color, key: &'stati
 }
 
 fn first_update_step(s: &State, p: &Palette, k: &Kit) -> El {
-    let waiting = row()
-        .gap(8.0)
-        .center_y()
-        .child(el().size(6.0, 6.0).radius(3.0).fill(p.live.alpha(0.75)))
-        .child(text("Waiting for an update. Projects appear here automatically.").font(style::META).color(p.text_3));
+    if s.projects.iter().any(|project| project.updates > 0) {
+        return step_header(&WELCOME_ORB, "First update received", "Your project is ready on Home.", p);
+    }
 
-    let footer = row()
-        .w_full()
-        .center_y()
-        .child(
-            Button::new("Back")
-                .variant(ButtonVariant::GhostMuted)
-                .control_size(ControlSize::Regular)
-                .on_press(|s: &mut State| s.onboarding_step = OnboardingStep::Connect)
-                .build(k)
-                .key("home-onboarding-back"),
-        )
-        .child(rune::spacer())
-        .child(
-            row()
-                .gap(8.0)
-                .center_y()
-                .child(
-                    Button::new("Skip")
-                        .variant(ButtonVariant::GhostMuted)
-                        .control_size(ControlSize::Regular)
-                        .on_press(|s: &mut State| s.set_onboarding_skipped(true))
-                        .build(k)
-                        .key("home-onboarding-skip"),
-                )
-                .child(
-                    Button::new("Continue")
-                        .variant(ButtonVariant::Contrast)
-                        .control_size(ControlSize::Regular)
-                        .on_press(|s: &mut State| s.onboarding_step = OnboardingStep::Curator)
-                        .build(k)
-                        .key("home-onboarding-next"),
-                ),
-        );
+    let waiting = text("Waiting for an update…").role("status").font(style::META).color(p.text_3);
 
     col()
         .w_full()
@@ -625,7 +588,6 @@ fn first_update_step(s: &State, p: &Palette, k: &Kit) -> El {
         .gap(24.0)
         .child(step_header(&WELCOME_ORB, "Ask for your first update", "Restart connected tools, then send this prompt in any project.", p))
         .child(col().w_full().items_center().gap(12.0).child(starter_prompt(s, p, k, p.card, "home-copy-prompt")).child(waiting))
-        .child(footer)
 }
 
 fn curator_step(s: &State, p: &Palette, k: &Kit) -> El {
@@ -706,28 +668,6 @@ fn curator_step(s: &State, p: &Palette, k: &Kit) -> El {
                 .key("home-curator-rescan"),
         );
 
-    let done_label = if crate::curator_settings::selected(s).is_some() { "Done" } else { "Skip for Now" };
-    let footer = row()
-        .w_full()
-        .center_y()
-        .child(
-            Button::new("Back")
-                .variant(ButtonVariant::GhostMuted)
-                .control_size(ControlSize::Regular)
-                .on_press(|s: &mut State| s.onboarding_step = OnboardingStep::FirstUpdate)
-                .build(k)
-                .key("home-onboarding-back"),
-        )
-        .child(rune::spacer())
-        .child(
-            Button::new(done_label)
-                .variant(ButtonVariant::Contrast)
-                .control_size(ControlSize::Regular)
-                .on_press(|s: &mut State| s.set_onboarding_skipped(true))
-                .build(k)
-                .key("home-onboarding-done"),
-        );
-
     col()
         .w_full()
         .items_center()
@@ -739,7 +679,6 @@ fn curator_step(s: &State, p: &Palette, k: &Kit) -> El {
             p,
         ))
         .child(col().w_full().gap(8.0).child(grouped_list(p, rows)).child(utility))
-        .child(footer)
 }
 
 fn skipped_empty(s: &State, p: &Palette, k: &Kit) -> El {
@@ -759,7 +698,7 @@ fn skipped_empty(s: &State, p: &Palette, k: &Kit) -> El {
         Button::new("Set Up Tools")
             .variant(variant)
             .control_size(ControlSize::Small)
-            .on_press(|s: &mut State| s.set_onboarding_skipped(false))
+            .on_press(State::start_onboarding)
             .build(k)
             .key("home-skipped-setup")
     };
@@ -786,25 +725,70 @@ fn skipped_empty(s: &State, p: &Palette, k: &Kit) -> El {
         .child(actions)
 }
 
-fn empty(s: &State, p: &Palette, k: &Kit) -> El {
-    let (scroll_key, stage) = if s.settings.onboarding_skipped {
-        ("home-empty-skipped".to_string(), skipped_empty(s, p, k))
-    } else {
-        let stage = col()
-            .key(format!("onboarding-{}", s.onboarding_step.key()))
-            .w_full()
-            .max_w(440.0)
-            .items_center()
-            .gap(24.0)
-            .child(step_indicator(s.onboarding_step, p, k))
-            .child(match s.onboarding_step {
+fn onboarding(s: &State, step: OnboardingStep, p: &Palette, k: &Kit) -> El {
+    let stage =
+        col().key(format!("onboarding-{}", step.key())).w_full().items_center().gap(16.0).pb(8.0).child(step_indicator(step, p, k)).child(
+            match step {
                 OnboardingStep::Connect => connect_step(s, p, k),
                 OnboardingStep::FirstUpdate => first_update_step(s, p, k),
                 OnboardingStep::Curator => curator_step(s, p, k),
-            });
-        (format!("home-empty-{}", s.onboarding_step.key()), stage)
+            },
+        );
+    let viewport = col().shrink().min_h(0.0).w_full().child(stage).scroll(ScrollSpec { stick_bottom: false }).scroll_edge_fade(16.0);
+    let body = scroll_bar(k, "onboarding-scroll-area", step.key(), viewport).w_full().shrink().min_h(0.0);
+
+    col()
+        .w_full()
+        .grow(1.0)
+        .min_h(0.0)
+        .center()
+        .px(48.0)
+        .pt(16.0)
+        .pb(36.0)
+        .child(col().w_full().max_w(ONBOARDING_WIDTH).shrink().min_h(0.0).gap(12.0).child(body).child(onboarding_footer(s, step, k)))
+}
+
+fn onboarding_footer(s: &State, step: OnboardingStep, k: &Kit) -> El {
+    let mut footer = row().key("onboarding-footer").w_full().gap(8.0).center_y();
+    if let Some(prev) = step.prev() {
+        footer = footer.child(
+            Button::new("Back")
+                .variant(ButtonVariant::GhostMuted)
+                .on_press(move |s: &mut State| s.onboarding_step = Some(prev))
+                .build(k)
+                .key("home-onboarding-back"),
+        );
+    }
+    let finish_label = match step {
+        OnboardingStep::Connect => "Skip",
+        OnboardingStep::Curator if crate::curator_settings::selected(s).is_none() => "Skip for Now",
+        _ => "Finish Setup",
     };
-    centered_scroll(s, k, "empty-scroll-area", &scroll_key, 32.0, 64.0, stage)
+    let next = step.next();
+    if step != OnboardingStep::Connect {
+        footer = footer.child(rune::spacer());
+    }
+    footer = footer.child(
+        Button::new(finish_label)
+            .variant(if next.is_some() { ButtonVariant::GhostMuted } else { ButtonVariant::Contrast })
+            .on_press(State::finish_onboarding)
+            .build(k)
+            .key("home-onboarding-finish"),
+    );
+    if step == OnboardingStep::Connect {
+        footer = footer.child(rune::spacer());
+    }
+    if let Some(next) = next {
+        let label = if next == OnboardingStep::Curator { "Set Up Curator" } else { "Continue" };
+        footer = footer.child(
+            Button::new(label)
+                .variant(ButtonVariant::Contrast)
+                .on_press(move |s: &mut State| s.onboarding_step = Some(next))
+                .build(k)
+                .key("home-onboarding-next"),
+        );
+    }
+    footer
 }
 
 fn message(p: &Palette, title: &str, detail: &str) -> El {

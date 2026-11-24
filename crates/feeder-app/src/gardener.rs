@@ -3,8 +3,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 use feeder_core::gardener::{
-    Backend, CHECK_UPDATES_OPENING, ChatOpening, ChatSummary, Event, OPENING, RunConfig, RunStatus, Scope, Session, SessionEnv,
-    SessionMode, StoredEvent, ToolCall,
+    Backend, ChatOpening, ChatSummary, Event, OPENING, RunConfig, RunStatus, Scope, Session, SessionEnv, SessionMode, StoredEvent, ToolCall,
 };
 use feeder_core::{Change, ChangeAction, Flag, ProposalStatus, ago};
 use rune::{Cursor, El, Icon, Key, KeyEvent, ScrollSpec, TextEdit, Transition, Tx, Waker, col, el, icon, row, text};
@@ -465,17 +464,9 @@ impl State {
             self.gardener_start(scope, SessionMode::Review, OPENING.to_string(), Some(REVIEW_JOB));
         }
     }
-
-    fn gardener_check_recent_updates(&mut self) {
-        if matches!(self.notebook.chat.phase, Phase::Idle | Phase::Ended) && self.notebook.chat.viewing.is_none() {
-            let scope = self.notebook.chat.scope;
-            self.gardener_start(scope, SessionMode::Review, CHECK_UPDATES_OPENING.to_string(), Some(CHECK_UPDATES_JOB));
-        }
-    }
 }
 
 const REVIEW_JOB: &str = "Review flagged lessons";
-const CHECK_UPDATES_JOB: &str = "Check recent Feed updates";
 
 pub fn scoped_flags(s: &State) -> Vec<&Flag> {
     let scope = s.notebook.chat.scope;
@@ -595,69 +586,16 @@ fn intro(s: &State, p: &Palette, k: &Kit) -> El {
     }
 
     let waiting = scoped_flags(s);
-    let n = waiting.len();
-    let ready = s.notebook.gardener.running.is_none();
-    let sub = if n == 1 {
-        "1 flagged lesson is waiting for review.".to_string()
-    } else if n > 1 {
-        format!("{n} flagged lessons are waiting for review.")
-    } else if s.projects.is_empty() {
-        "Connect a coding tool and post a project update so Curator can turn lessons into Library notes.".to_string()
-    } else {
-        "It turns flagged lessons and Feed updates into notes your agents read next time.".to_string()
-    };
-    let words = col()
+    let mut root = col()
+        .key("gardener-intro")
+        .w_full()
         .items_center()
-        .gap(4.0)
-        .max_w(440.0)
-        .child(text("Ask about anything across your Library and Feed.").font(style::BODY).color(p.text_2).align(rune::Align::Center))
-        .child(text(sub).font(style::BODY).color(p.text_3).wrap().align(rune::Align::Center))
-        .child(
-            text("Curator sends your message and the sources it reads to the selected model provider.")
-                .font(style::META)
-                .color(p.text_2)
-                .wrap()
-                .align(rune::Align::Center),
-        );
-    let mut actions = row().gap(8.0).center_y();
-    let mut has_actions = false;
-    if n > 0 {
-        let label = if n == 1 { "Review 1 Flagged Lesson".to_string() } else { format!("Review {n} Flagged Lessons") };
-        actions = actions.child(
-            Button::new(label)
-                .variant(ButtonVariant::Outline)
-                .control_size(ControlSize::Small)
-                .disabled(!ready)
-                .on_press(|s: &mut State| s.gardener_review_flags())
-                .build(k)
-                .key("gardener-review-flags"),
-        );
-        has_actions = true;
-    }
-    if !s.projects.is_empty() {
-        actions = actions.child(
-            Button::new("Check Recent Feed Updates")
-                .variant(ButtonVariant::Outline)
-                .control_size(ControlSize::Small)
-                .disabled(!ready)
-                .on_press(|s: &mut State| s.gardener_check_recent_updates())
-                .build(k)
-                .key("gardener-check-updates"),
-        );
-        has_actions = true;
-    } else if !s.tools_connected() {
-        actions = actions.child(
-            Button::new("Connect Your Tools")
-                .variant(ButtonVariant::Outline)
-                .control_size(ControlSize::Small)
-                .on_press_tx(chrome::open_agent_setup)
-                .build(k)
-                .key("gardener-connect-tools"),
-        );
-        has_actions = true;
-    }
+        .gap(14.0)
+        .px(24.0)
+        .pb(16.0)
+        .child(orb_wrap)
+        .child(text("Ask about your work").font(style::DISPLAY).color(p.text).wrap().align(rune::Align::Center));
 
-    let mut root = col().key("gardener-intro").items_center().gap(14.0).pb(24.0).child(orb_wrap).child(words);
     if !waiting.is_empty() {
         let mut preview = col().w_full().max_w(460.0).gap(6.0);
         for flag in waiting.iter().take(3) {
@@ -675,10 +613,26 @@ fn intro(s: &State, p: &Palette, k: &Kit) -> El {
                     .child(text(flag.note.clone()).font(style::META).color(p.text_2).truncate().grow(1.0).min_w(0.0)),
             );
         }
-        root = root.child(preview);
-    }
-    if has_actions {
-        root = root.child(actions);
+        let n = waiting.len();
+        let label = if n == 1 { "Review 1 Flagged Lesson".to_string() } else { format!("Review {n} Flagged Lessons") };
+        root = root.child(preview).child(
+            Button::new(label)
+                .variant(ButtonVariant::Outline)
+                .control_size(ControlSize::Small)
+                .disabled(s.notebook.gardener.running.is_some())
+                .on_press(|s: &mut State| s.gardener_review_flags())
+                .build(k)
+                .key("gardener-review-flags"),
+        );
+    } else if s.projects.is_empty() && !s.tools_connected() {
+        root = root.child(
+            Button::new("Connect Your Tools")
+                .variant(ButtonVariant::Outline)
+                .control_size(ControlSize::Small)
+                .on_press_tx(chrome::open_agent_setup)
+                .build(k)
+                .key("gardener-connect-tools"),
+        );
     }
     root
 }
@@ -835,7 +789,7 @@ pub fn composer(s: &State, p: &Palette, k: &Kit, max_w: f32, layer: &mut Vec<El>
     let placeholder = match chat.phase {
         Phase::Working => "Working…",
         Phase::Ready | Phase::Ended => "Ask a follow-up…",
-        Phase::Idle => "Ask Curator…",
+        Phase::Idle => "Ask a question…",
     };
     let disabled = backend.is_none() || chat.phase == Phase::Working;
     let mut field = rune::text_input(&chat.input, style::BODY)

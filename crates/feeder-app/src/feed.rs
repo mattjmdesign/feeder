@@ -61,10 +61,7 @@ pub fn bar_chrome(s: &State, id: i64, p: &Palette, k: &Kit) -> (El, Option<El>) 
             .build(k)
             .mr(8.0),
     );
-    if compact_toolbar(s) {
-        return (back, Some(actions));
-    }
-    if !archived {
+    if !archived && !compact_toolbar(s) {
         actions = actions.child(
             chrome::bar_button("project-curator-btn", "Update Notes", p)
                 .label("Run Curator for this project")
@@ -77,12 +74,9 @@ pub fn bar_chrome(s: &State, id: i64, p: &Palette, k: &Kit) -> (El, Option<El>) 
             copy_project_context(s, id, tx);
         }));
     }
-    actions = actions
-        .child(chrome::bar_button("rename-button", if s.editing.is_some() { "Done" } else { "Rename" }, p).on_press_tx(rename_project))
-        .child(
-            chrome::bar_button("archive-button", if archived { "Unarchive" } else { "Archive" }, p)
-                .on_press(move |s: &mut State| s.set_archived(id, !archived)),
-        );
+    if s.editing.is_some() {
+        actions = actions.child(chrome::bar_button("rename-button", "Done", p).on_press_tx(rename_project));
+    }
     (back, Some(actions))
 }
 
@@ -91,28 +85,23 @@ fn compact_toolbar(s: &State) -> bool {
 }
 
 pub fn project_menu(s: &State, mut menu: Menu) -> Menu {
-    let Some(id) = s.open.filter(|_| compact_toolbar(s)) else { return menu };
+    let Some(id) = s.open else { return menu };
     let Some(summary) = s.summary(id) else { return menu };
     let archived = summary.project.archived;
-    if !archived {
+    if !archived && compact_toolbar(s) {
         menu = menu.item(MenuItem::new("Update Notes").on_select_tx(move |s: &mut State, tx: &mut Tx| {
             s.menu_open = false;
             s.start_project_curator(id, tx);
         }));
     }
-    if s.feed_for == Some(id) && !s.feed.is_empty() {
-        menu = menu.item(MenuItem::new("Copy Context").on_select_tx(move |s: &mut State, tx: &mut Tx| {
+    let archive = if archived { "Unarchive" } else { "Archive" };
+    if s.editing.is_none() {
+        menu = menu.item(MenuItem::new("Rename").on_select_tx(|s: &mut State, tx: &mut Tx| {
             s.menu_open = false;
-            copy_project_context(s, id, tx);
+            rename_project(s, tx);
         }));
     }
-    let rename = if s.editing.is_some() { "Done Renaming" } else { "Rename" };
-    let archive = if archived { "Unarchive" } else { "Archive" };
-    menu.item(MenuItem::new(rename).on_select_tx(|s: &mut State, tx: &mut Tx| {
-        s.menu_open = false;
-        rename_project(s, tx);
-    }))
-    .item(MenuItem::new(archive).on_select(move |s: &mut State| {
+    menu.item(MenuItem::new(archive).on_select(move |s: &mut State| {
         s.menu_open = false;
         s.set_archived(id, !archived);
     }))
