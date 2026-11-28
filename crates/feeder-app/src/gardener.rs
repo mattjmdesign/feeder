@@ -641,11 +641,6 @@ pub fn selected_backend(s: &State) -> Option<Backend> {
     crate::curator_settings::selected(s)
 }
 
-fn provider_picker(s: &State, p: &Palette, k: &Kit, layer: &mut Vec<El>) -> Option<El> {
-    let current = selected_backend(s)?;
-    Some(crate::curator_settings::picker(s, current, p, k, layer))
-}
-
 fn working_status(chat: &Chat) -> String {
     match chat.items.iter().rev().find(|i| !matches!(i, Item::You(_))) {
         Some(Item::Tool { call, result: None, .. }) => live_label(call),
@@ -829,8 +824,8 @@ pub fn composer(s: &State, p: &Palette, k: &Kit, max_w: f32, layer: &mut Vec<El>
 
     let mut toolbar = row().w_full().gap(6.0).center_y();
     toolbar = toolbar.child(rune::spacer());
-    if let Some(picker) = provider_picker(s, p, k, layer) {
-        toolbar = toolbar.child(picker);
+    if let Some(backend) = backend {
+        toolbar = toolbar.child(crate::curator_settings::picker(s, backend, p, k, layer));
     } else if !s.notebook.gardener.backends.is_empty() && !is_empty_idle(s) {
         toolbar = toolbar.child(
             Button::new("Choose Subscription…")
@@ -843,6 +838,14 @@ pub fn composer(s: &State, p: &Palette, k: &Kit, max_w: f32, layer: &mut Vec<El>
     }
     let card = col()
         .key("gardener-composer")
+        .on_layout_tx(|s: &mut State, [_, _, width, _], tx| {
+            let compact = width < COMPOSER_PICKER_LABEL_MIN_W;
+            if width > 0.0 && compact != s.curator.picker_compact {
+                s.curator.picker_compact = compact;
+            } else {
+                tx.live_only();
+            }
+        })
         .w_full()
         .max_w(max_w.min(CHAT_MAX_W))
         .gap(8.0)
@@ -859,6 +862,7 @@ pub fn composer(s: &State, p: &Palette, k: &Kit, max_w: f32, layer: &mut Vec<El>
 }
 
 const COMPOSER_RADIUS: f32 = 12.0;
+const COMPOSER_PICKER_LABEL_MIN_W: f32 = 400.0;
 
 pub(crate) static SEND_ICON: Icon = Icon {
     name: "curator-send",

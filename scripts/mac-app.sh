@@ -218,7 +218,29 @@ if [[ "$MODE" == "--package" ]]; then
 fi
 
 echo "› installing to $DEST"
-osascript -e "tell application id \"$BUNDLE_ID\" to quit" >/dev/null 2>&1 || true
+APP_BIN="$DEST/Contents/MacOS/$APP_NAME"
+running_dest_pids() {
+  ps -ax -o pid= -o comm= | awk -v bin="$APP_BIN" '{ pid = $1; sub(/^[[:space:]]*[0-9]+[[:space:]]+/, ""); if ($0 == bin) print pid }'
+}
+if [[ -n "$(running_dest_pids)" ]]; then
+  osascript -e "tell application id \"$BUNDLE_ID\" to quit" >/dev/null 2>&1 || true
+  for _ in $(seq 1 50); do
+    [[ -z "$(running_dest_pids)" ]] && break
+    sleep 0.1
+  done
+  PIDS="$(running_dest_pids)"
+  if [[ -n "$PIDS" ]]; then
+    kill -TERM $PIDS >/dev/null 2>&1 || true
+    for _ in $(seq 1 30); do
+      [[ -z "$(running_dest_pids)" ]] && break
+      sleep 0.1
+    done
+  fi
+  if [[ -n "$(running_dest_pids)" ]]; then
+    echo "$APP_NAME is still running; quit it before replacing $DEST." >&2
+    exit 1
+  fi
+fi
 mkdir -p "$HOME/Applications"
 rm -rf "$DEST"
 mv "$STAGE" "$DEST"

@@ -31,6 +31,7 @@ pub struct Curator {
     nicknames: HashMap<Backend, TextEdit>,
     pub open_select: Option<String>,
     pub picker_open: bool,
+    pub picker_compact: bool,
     model_search: TextEdit,
     picker_search: TextEdit,
 }
@@ -46,6 +47,7 @@ impl Default for Curator {
             nicknames: HashMap::new(),
             open_select: None,
             picker_open: false,
+            picker_compact: false,
             model_search: TextEdit::new(""),
             picker_search: TextEdit::new(""),
         }
@@ -581,8 +583,10 @@ pub fn picker(s: &State, current: Backend, p: &Palette, k: &Kit, layer: &mut Vec
     if let Some(effort) = prefs.get(current).effort {
         summary = format!("{summary} · {}", effort_label(&effort));
     }
-    let chip = row()
+    let icon = agents::mark(current.label(), p, 14.0, s.agent_icon(current.label())).help("").a11y_hidden();
+    let mut chip = row()
         .key("curator-picker-chip")
+        .shrink()
         .gap(6.0)
         .center_y()
         .px(8.0)
@@ -591,16 +595,21 @@ pub fn picker(s: &State, current: Backend, p: &Palette, k: &Kit, layer: &mut Vec
         .role("button")
         .expanded(c.picker_open)
         .label(format!("Curator model: {summary}"))
-        .help("Changes apply to the next message")
         .focusable(true)
         .focus_ring(2.0, 1.0, k.c.border_focus)
         .hover(p.hover)
         .on_press_tx(toggle_picker)
-        .child(agents::mark(current.label(), p, 14.0, s.agent_icon(current.label())))
-        .child(text(summary).font(style::AGENT).color(p.text).truncate().max_w(320.0));
+        .child(icon);
+    if c.picker_compact {
+        chip = chip.help(summary);
+    } else {
+        chip = chip
+            .help("Changes apply to the next message")
+            .child(text(summary.clone()).font(style::AGENT).color(p.text).truncate().max_w(320.0).shrink().help_when_truncated(summary));
+    }
 
     let anchor_key = "curator-picker-trigger";
-    let trigger = row().key(anchor_key).child(chip);
+    let trigger = row().key(anchor_key).shrink().child(chip);
     if !c.picker_open {
         return trigger;
     }

@@ -3,6 +3,12 @@
 What changed in each version of Feeder, newest first. Each section is copied from
 `release-notes/<version>.md` by `scripts/changelog.sh`; edit those files, not this one.
 
+## 0.5.16
+
+- Feed now frames the stream with vertical side dividers, a live activity summary at the top, full-row hover highlights, and always-visible Copy, Reply, and menu actions.
+- Curator's model picker switches to a compact logo chip in narrow windows so the send button stays inside the composer.
+- In-app update errors now tell you clearly when Feeder was replaced on disk while running, and local installs wait for Feeder to quit before replacing the app bundle.
+
 ## 0.5.15
 
 - Library cards get their full-height two-tone artwork back: denser dot patterns, Rust keeps its checker, and each category keeps one consistent design.

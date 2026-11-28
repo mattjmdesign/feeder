@@ -1,5 +1,7 @@
 #import <AppKit/AppKit.h>
 #import <Sparkle/Sparkle.h>
+#import <libproc.h>
+#import <unistd.h>
 
 typedef enum : uint32_t {
     Idle = 0,
@@ -121,8 +123,34 @@ static void (*wakeFeeder)(void);
     acknowledge();
 }
 
+- (BOOL)executableReplaced {
+    char live[PROC_PIDPATHINFO_MAXSIZE];
+    int len = proc_pidpath(getpid(), live, sizeof(live));
+    if (len <= 0) {
+        return YES;
+    }
+    NSString *livePath = [[NSFileManager defaultManager] stringWithFileSystemRepresentation:live length:(NSUInteger)len];
+    if (![NSFileManager.defaultManager fileExistsAtPath:livePath]) {
+        return YES;
+    }
+    NSString *bundleExec = NSBundle.mainBundle.executablePath.stringByResolvingSymlinksInPath;
+    if (bundleExec.length > 0 && ![livePath.stringByResolvingSymlinksInPath isEqualToString:bundleExec]) {
+        return YES;
+    }
+    return NO;
+}
+
 - (void)showUpdaterError:(NSError *)error acknowledgement:(void (^)(void))acknowledge {
-    self.message = error.localizedDescription;
+    if ([self executableReplaced]) {
+        self.message = @"Feeder was replaced on disk while running. Quit and reopen Feeder.";
+    } else {
+        NSString *reason = error.localizedFailureReason;
+        if (reason.length > 0 && ![error.localizedDescription containsString:reason]) {
+            self.message = [NSString stringWithFormat:@"%@ %@", error.localizedDescription, reason];
+        } else {
+            self.message = error.localizedDescription;
+        }
+    }
     [self show:Problem];
     acknowledge();
 }

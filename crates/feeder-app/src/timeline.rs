@@ -103,23 +103,32 @@ pub fn view(s: &State, p: &Palette, k: &Kit, layer: &mut Vec<El>) -> El {
         }
     };
 
-    let mut content = col().w_full().max_w(COLUMN).gap(16.0).child(filter_bar);
+    let header = feed_header(s, p, total, filter_bar);
+    let mut content = col().w_full().grow(1.0).min_w(0.0).child(header).child(Divider::horizontal().build(k));
     if let Some(waiting) = waiting {
-        content = content.child(waiting);
+        content = content.child(col().w_full().px(16.0).py(12.0).child(waiting)).child(Divider::horizontal().build(k));
     }
     if let Some(live) = live {
-        content = content.child(live);
+        content = content.child(col().w_full().px(16.0).py(12.0).child(live)).child(Divider::horizontal().build(k));
     }
     if !visible.is_empty() {
         content = content.child(posts(s, p, k, &visible, layer));
     }
-    content = content.child(el().h(12.0)).child(footer.self_center());
+    content = content.child(Divider::horizontal().build(k)).child(col().w_full().items_center().py(20.0).pb(56.0).child(footer));
+
+    let column = row()
+        .key("timeline-column")
+        .w_full()
+        .max_w(COLUMN)
+        .child(el().w(1.0).fill(p.hairline))
+        .child(content)
+        .child(el().w(1.0).fill(p.hairline));
 
     let viewport = col()
         .w_full()
         .grow(1.0)
         .min_h(0.0)
-        .child(col().w_full().items_center().px(24.0).pt(12.0).pb(72.0).child(content))
+        .child(col().w_full().items_center().px(16.0).child(column))
         .scroll(ScrollSpec { stick_bottom: false })
         .scroll_edge_fade(20.0)
         .on_scroll_offset(near_end);
@@ -161,9 +170,17 @@ fn posts(s: &State, p: &Palette, k: &Kit, visible: &[(&FeedUpdate, &ProjectSumma
                 let Some(u) = source.iter().find(|u| u.id == id) else { return el() };
                 let Some(summary) = s.summary(u.project_id) else { return el() };
                 let divider = if starts_day {
-                    feed::day_divider(day_label(u.created_at, s.now), &p, i > 0)
+                    let mut section = col().w_full();
+                    if i > 0 {
+                        section = section.child(Divider::horizontal().build(&k));
+                    }
+                    section.child(col().w_full().px(16.0).pt(if i == 0 { 10.0 } else { 0.0 }).child(feed::day_divider(
+                        day_label(u.created_at, s.now),
+                        &p,
+                        i > 0,
+                    )))
                 } else {
-                    Divider::horizontal().build(&k).pl(AVATAR + GUTTER)
+                    Divider::horizontal().build(&k)
                 };
                 let menu_trigger = menu.as_ref().filter(|(menu_id, _)| *menu_id == id).map(|(_, trigger)| trigger.clone());
                 col().w_full().child(divider).child(post(s, (&p, &k, &md), u, summary, menu_trigger))
@@ -176,6 +193,36 @@ fn posts(s: &State, p: &Palette, k: &Kit, visible: &[(&FeedUpdate, &ProjectSumma
             }
             false
         })
+}
+
+fn feed_summary(s: &State, total: i64) -> String {
+    let active = s.projects.iter().filter(|p| !p.project.archived);
+    let working = active.clone().filter(|p| p.active_pulse.is_some()).count();
+    let waiting = active.clone().filter(|p| p.needs_you).count();
+    let projects = active.filter(|p| p.updates > 0).count();
+    let mut parts = Vec::new();
+    if working > 0 {
+        parts.push(format!("{working} working"));
+    }
+    if waiting > 0 {
+        parts.push(format!("{waiting} needs you"));
+    }
+    let updates_label = if total == 1 { "1 update".to_string() } else { format!("{total} updates") };
+    if projects > 1 {
+        parts.push(format!("{updates_label} across {projects} projects"));
+    } else if total > 0 {
+        parts.push(updates_label);
+    }
+    parts.join(" · ")
+}
+
+fn feed_header(s: &State, p: &Palette, total: i64, filter_bar: El) -> El {
+    let summary = feed_summary(s, total);
+    let mut title_block = col().w_full().gap(2.0).child(text("What are your agents working on?").font(style::SECTION_TITLE).color(p.text));
+    if !summary.is_empty() {
+        title_block = title_block.child(text(summary).font(style::META).color(p.text_3));
+    }
+    col().key("feed-header").w_full().px(16.0).pt(16.0).pb(14.0).gap(12.0).child(title_block).child(filter_bar)
 }
 
 fn filter_row(s: &State, p: &Palette) -> El {
@@ -403,7 +450,7 @@ fn post(s: &State, (p, k, md): (&Palette, &Kit, &MarkdownStyle), u: &FeedUpdate,
         .child(text(u.agent.clone()).font(style::META).color(p.text_2).truncate().shrink())
         .child(action_dot(p))
         .child(text(ago(u.created_at, s.now)).font(style::META).color(p.text_3));
-    header = header.child(rune::spacer()).child(post_actions(s, p, u, selected, menu_trigger));
+    header = header.child(rune::spacer()).child(post_actions(s, p, u, menu_trigger));
 
     let mut words = col().grow(1.0).min_w(0.0).gap(8.0).child(header);
     let mut attention = feed::card_attention_tags(s, p, u);
@@ -420,7 +467,7 @@ fn post(s: &State, (p, k, md): (&Palette, &Kit, &MarkdownStyle), u: &FeedUpdate,
     } else {
         memo(format!("t-body-{uid}"), (p.dark, &u.body), || post_body(p, md, u))
     });
-    if let Some(media) = feed::media_view(s, p, u, COLUMN - AVATAR - GUTTER) {
+    if let Some(media) = feed::media_view(s, p, u, COLUMN - 34.0 - AVATAR - GUTTER) {
         words = words.child(media);
     }
     if let Some(footer) = post_footer(s, p, u) {
@@ -431,12 +478,10 @@ fn post(s: &State, (p, k, md): (&Palette, &Kit, &MarkdownStyle), u: &FeedUpdate,
         .w_full()
         .gap(GUTTER)
         .items_start()
-        .px(12.0)
+        .px(16.0)
         .py(14.0)
-        .mx(-12.0)
-        .radius(12.0)
         .fill(if selected { p.hover } else { p.hover.alpha(0.0) })
-        .hover_group()
+        .hover(p.hover)
         .child(avatar)
         .child(words)
 }
@@ -494,7 +539,7 @@ fn more_action(uid: i64, p: &Palette) -> El {
         .on_press(move |s: &mut State| s.post_menu = if s.post_menu == Some(uid) { None } else { Some(uid) })
 }
 
-fn post_actions(s: &State, p: &Palette, u: &FeedUpdate, selected: bool, menu_trigger: Option<El>) -> El {
+fn post_actions(s: &State, p: &Palette, u: &FeedUpdate, menu_trigger: Option<El>) -> El {
     let uid = u.id;
     let project_id = u.project_id;
     let body = u.body.clone();
@@ -512,9 +557,8 @@ fn post_actions(s: &State, p: &Palette, u: &FeedUpdate, selected: bool, menu_tri
             s.start_reply(uid, tx);
         },
     );
-    let shown = selected || copied || menu_trigger.is_some();
     let more = menu_trigger.unwrap_or_else(|| more_action(uid, p));
-    row().gap(2.0).center_y().group_opacity(if shown { 1.0 } else { 0.0 }, 1.0).child(copy).child(reply).child(more)
+    row().gap(2.0).center_y().child(copy).child(reply).child(more)
 }
 
 fn post_menu(s: &State, uid: i64, p: &Palette, k: &Kit, layer: &mut Vec<El>) -> El {
