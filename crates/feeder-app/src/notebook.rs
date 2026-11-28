@@ -23,8 +23,8 @@ use crate::{CopyTarget, State, ToastItem, ToastKind, agents, chrome, feed};
 pub(crate) const INDEX_MAX_W: f32 = 720.0;
 const CARD_MIN_W: f32 = 408.0;
 const CARD_H: f32 = 112.0;
-const TILE: f32 = 64.0;
 const CARD_PAD: f32 = 8.0;
+const TILE: f32 = CARD_H - 2.0 * CARD_PAD;
 pub(crate) const INDEX_PAD: f32 = 32.0;
 const CARD_GAP: f32 = 12.0;
 const DOC_MAX_W: f32 = 720.0;
@@ -926,7 +926,6 @@ fn index_card(s: &State, page: &Page, rank: usize, p: &Palette) -> El {
         .h(CARD_H)
         .padding(CARD_PAD)
         .gap(14.0)
-        .center_y()
         .radius(14.0)
         .fill(p.card)
         .border(1.0, p.hairline)
@@ -967,12 +966,73 @@ fn topic_slot(topic: &str) -> usize {
     CANONICAL_TOPICS.iter().position(|t| t.slug == topic).unwrap_or_else(|| CANONICAL_TOPICS.len() + (topic_seed(topic) % 12) as usize)
 }
 
-fn pattern_dots(seed: u64, rank: usize, palette: CategoryDuotone, w: f32, h: f32) -> Shape {
-    const PITCH: f32 = 6.0;
-    const DOT: f32 = 2.0;
-    const PAD: f32 = 7.0;
-    let inner_w = (w - PAD * 2.0).max(DOT);
-    let inner_h = (h - PAD * 2.0).max(DOT);
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+enum PatternKind {
+    Fade,
+    Bands,
+    Rings,
+    Wave,
+    Checker,
+    Scatter,
+}
+
+impl PatternKind {
+    const ALL: [Self; 6] = [Self::Fade, Self::Bands, Self::Rings, Self::Wave, Self::Checker, Self::Scatter];
+
+    fn for_topic(topic: &str, rank: usize) -> Self {
+        match topic {
+            "nextjs" | "data" => Self::Rings,
+            "react-native" | "tooling" | "general" => Self::Bands,
+            "react" | "agents" => Self::Wave,
+            "rust" => Self::Checker,
+            "swift" | "taste" => Self::Scatter,
+            "typescript" | "design" => Self::Fade,
+            _ => Self::ALL[rank % Self::ALL.len()],
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PatternSurface {
+    Tile,
+    Banner,
+}
+
+impl PatternSurface {
+    const fn size(self) -> [f32; 2] {
+        match self {
+            Self::Tile => [TILE, TILE],
+            Self::Banner => [DOC_MAX_W, BANNER_H],
+        }
+    }
+
+    const fn pad(self) -> f32 {
+        match self {
+            Self::Tile => 0.0,
+            Self::Banner => 7.0,
+        }
+    }
+
+    const fn key_tag(self) -> &'static str {
+        match self {
+            Self::Tile => "tile",
+            Self::Banner => "banner",
+        }
+    }
+}
+
+const PATTERN_PITCH: f32 = 6.0;
+const PATTERN_DOT: f32 = 2.0;
+
+fn pattern_grid_dims([w, h]: [f32; 2], pad: f32) -> (usize, usize) {
+    let inner_w = (w - pad * 2.0).max(PATTERN_DOT);
+    let inner_h = (h - pad * 2.0).max(PATTERN_DOT);
+    let nx = (inner_w / PATTERN_PITCH).floor().max(2.0) as usize;
+    let ny = (inner_h / PATTERN_PITCH).floor().max(2.0) as usize;
+    (nx, ny)
+}
+
+fn pattern_dots(seed: u64, kind: PatternKind, palette: CategoryDuotone, [w, h]: [f32; 2], pad: f32) -> Shape {
     let mut rng = seed | 1;
     let mut next = move || {
         rng ^= rng << 13;
@@ -980,13 +1040,11 @@ fn pattern_dots(seed: u64, rank: usize, palette: CategoryDuotone, w: f32, h: f32
         rng ^= rng << 17;
         (rng >> 11) as f32 / (1u64 << 53) as f32
     };
-    let kind = rank % 6;
     let (freq, phase, angle, cx, cy) = (2.0 + next() * 4.0, next() * std::f32::consts::TAU, next() * std::f32::consts::PI, next(), next());
     let flip = next() < 0.5;
-    let nx = (inner_w / PITCH).floor().max(2.0) as usize;
-    let ny = (inner_h / PITCH).floor().max(2.0) as usize;
-    let inset_x = PAD + (inner_w - (nx as f32 - 1.0) * PITCH - DOT) / 2.0;
-    let inset_y = PAD + (inner_h - (ny as f32 - 1.0) * PITCH - DOT) / 2.0;
+    let (nx, ny) = pattern_grid_dims([w, h], pad);
+    let inset_x = (w - (nx as f32 - 1.0) * PATTERN_PITCH) / 2.0;
+    let inset_y = (h - (ny as f32 - 1.0) * PATTERN_PITCH) / 2.0;
     let aspect = (nx - 1) as f32 / (ny - 1) as f32;
     let cx = cx * aspect;
     let dir = (seed >> 3) % 4;
@@ -1001,7 +1059,7 @@ fn pattern_dots(seed: u64, rank: usize, palette: CategoryDuotone, w: f32, h: f32
             }
             let r = next();
             let on = match kind {
-                0 => {
+                PatternKind::Fade => {
                     let t = match dir {
                         0 => v,
                         1 => 1.0 - v,
@@ -1010,30 +1068,32 @@ fn pattern_dots(seed: u64, rank: usize, palette: CategoryDuotone, w: f32, h: f32
                     };
                     r < t.powf(1.3)
                 }
-                1 => ((u * angle.cos() + v * angle.sin()) * freq + phase).rem_euclid(1.0) < 0.45,
-                2 => (((u - cx).hypot(v - cy)) * freq * 1.5).rem_euclid(1.0) < 0.5,
-                3 => v > 0.5 + 0.28 * (u * freq * 1.2 + phase).sin() - r * 0.08,
-                4 => (((u * freq * 1.5) as i32 + (v * freq * 1.5) as i32) % 2 == 0) && r < 0.9,
-                _ => r < 0.36,
+                PatternKind::Bands => ((u * angle.cos() + v * angle.sin()) * freq + phase).rem_euclid(1.0) < 0.45,
+                PatternKind::Rings => (((u - cx).hypot(v - cy)) * freq * 1.5).rem_euclid(1.0) < 0.5,
+                PatternKind::Wave => v > 0.5 + 0.28 * (u * freq * 1.2 + phase).sin() - r * 0.08,
+                PatternKind::Checker => (((u * freq * 1.5) as i32 + (v * freq * 1.5) as i32) % 2 == 0) && r < 0.9,
+                PatternKind::Scatter => r < 0.36,
             };
             if !on {
                 continue;
             }
             let tone = if next() < 0.55 { palette.bright } else { palette.dim };
-            let centre = [inset_x + col_i as f32 * PITCH + DOT / 2.0, inset_y + row_i as f32 * PITCH + DOT / 2.0];
-            shape = shape.line(centre, centre, DOT, LineCap::Round, tone);
+            let centre = [inset_x + col_i as f32 * PATTERN_PITCH, inset_y + row_i as f32 * PATTERN_PITCH];
+            shape = shape.line(centre, centre, PATTERN_DOT, LineCap::Round, tone);
         }
     }
     shape
 }
 
-fn pattern_field(topic: &str, rank: usize, dark: bool, w: f32, h: f32) -> El {
+fn pattern_field(topic: &str, rank: usize, dark: bool, surface: PatternSurface) -> El {
     let seed = topic_seed(topic);
-    memo(format!("nb-pattern-{topic}-{w}x{h}"), (seed, rank, dark), || {
+    let [w, h] = surface.size();
+    memo(format!("nb-pattern-{}-{topic}", surface.key_tag()), (seed, rank, dark), || {
+        let kind = PatternKind::for_topic(topic, rank);
         let palette = category_duotone(seed, rank, dark);
         el().size(w, h)
             .fill(palette.ground)
-            .child(canvas(pattern_dots(seed, rank, palette, w, h)).size(w, h).absolute(0.0, 0.0))
+            .child(canvas(pattern_dots(seed, kind, palette, [w, h], surface.pad())).size(w, h).absolute(0.0, 0.0))
             .a11y_hidden()
     })
 }
@@ -1045,7 +1105,7 @@ fn pattern_tile(topic: &str, rank: usize, dark: bool) -> El {
         .clip_rounded(8.0)
         .fill(palette.ground)
         .border(1.0, palette.border)
-        .child(pattern_field(topic, rank, dark, TILE, TILE))
+        .child(pattern_field(topic, rank, dark, PatternSurface::Tile))
         .a11y_hidden()
 }
 
@@ -1058,7 +1118,7 @@ fn pattern_banner(topic: &str, rank: usize, dark: bool) -> El {
         .clip_rounded(12.0)
         .fill(palette.ground)
         .border(1.0, palette.border)
-        .child(pattern_field(topic, rank, dark, DOC_MAX_W, BANNER_H))
+        .child(pattern_field(topic, rank, dark, PatternSurface::Banner))
         .a11y_hidden()
 }
 
@@ -2604,5 +2664,26 @@ mod tests {
             chunks[1],
             ArticleChunk::Callout { kind: CalloutKind::Note, title: "Note".into(), body: "- [x] Second task".into(), task_offset: 1 }
         );
+    }
+
+    #[test]
+    fn pattern_tiles_fill_card_height_and_spread_canonical_kinds() {
+        assert_eq!(TILE, CARD_H - 2.0 * CARD_PAD);
+        assert_eq!(pattern_grid_dims(PatternSurface::Tile.size(), PatternSurface::Tile.pad()), (16, 16));
+        assert_eq!(pattern_grid_dims(PatternSurface::Banner.size(), PatternSurface::Banner.pad()), (117, 19));
+        assert_eq!(pattern_grid_dims([8.0, 8.0], 10.0), (2, 2));
+
+        assert_eq!(PatternKind::for_topic("rust", topic_slot("rust")), PatternKind::Checker);
+        assert_eq!(PatternKind::for_topic("nextjs", topic_slot("nextjs")), PatternKind::Rings);
+        assert_eq!(PatternKind::for_topic("design", topic_slot("design")), PatternKind::Fade);
+        assert_eq!(PatternKind::for_topic("general", topic_slot("general")), PatternKind::Bands);
+
+        let first_six: std::collections::HashSet<PatternKind> =
+            CANONICAL_TOPICS[..6].iter().map(|t| PatternKind::for_topic(t.slug, topic_slot(t.slug))).collect();
+        assert_eq!(first_six.len(), 6, "first six canonical topics should cover all pattern kinds");
+
+        let rest: std::collections::HashSet<PatternKind> =
+            CANONICAL_TOPICS[6..].iter().map(|t| PatternKind::for_topic(t.slug, topic_slot(t.slug))).collect();
+        assert_eq!(rest.len(), CANONICAL_TOPICS.len() - 6, "remaining canonical topics should not collide");
     }
 }

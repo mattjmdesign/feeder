@@ -3,6 +3,11 @@
 What changed in each version of Feeder, newest first. Each section is copied from
 `release-notes/<version>.md` by `scripts/changelog.sh`; edit those files, not this one.
 
+## 0.5.15
+
+- Library cards get their full-height two-tone artwork back: denser dot patterns, Rust keeps its checker, and each category keeps one consistent design.
+- Card layouts stay compact, so the grid still shows plenty of notes at once.
+
 ## 0.5.14
 
 - Library cards give titles more room and show the takeaway when a note has one. Breadcrumbs fit alongside the tabs in smaller windows.
